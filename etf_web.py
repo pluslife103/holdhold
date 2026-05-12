@@ -205,7 +205,7 @@ def _fetch_history(ticker: str, period: str = "3m") -> list[dict]:
 
 # ── 日/週/月超越（支援任意歷史日期）──────────────────────────────────────────
 
-_OVERTAKE_DAYS = {"day": 1, "week": 5, "month": 21}
+_OVERTAKE_DAYS = {"day": 1, "week": 7, "month": 30}  # 週用7曆日，月用30曆日
 
 def _compute_overtakes_v2(date_str: str, mode: str) -> dict:
     """
@@ -612,32 +612,105 @@ function fmtAum(v){
 
 function modeLabel(m){ return {day:'日',week:'週',month:'月'}[m]||m; }
 
+// 週序號（方便週統計標題）
+function isoWeek(d){
+  const dt=new Date(d), jan4=new Date(dt.getFullYear(),0,4);
+  return Math.ceil(((dt-jan4)/864e5+jan4.getDay()+1)/7);
+}
+
+// 月份末日
+function monthEnd(y,m){ return new Date(y,m,0).toISOString().slice(0,10); }
+
+// 顯示期間標題
+function periodLabel(data){
+  const d=data.date, m=data.mode;
+  if(m==='day'){
+    return d===todayStr() ? `${d}（今日）日統計` : `${d} 日統計`;
+  }
+  if(m==='week'){
+    const start=addDays(d,-6);
+    const wn=isoWeek(d);
+    return `${d.slice(0,4)} 第${wn}週 · ${start.slice(5).replace('-','/')} ～ ${d.slice(5).replace('-','/')} 週統計`;
+  }
+  if(m==='month'){
+    const dt=new Date(d);
+    return `${dt.getFullYear()} 年 ${dt.getMonth()+1} 月統計`;
+  }
+  return `${d} ${modeLabel(m)}統計`;
+}
+
 // ── Date select population ───────────────────────────────────────────────────
 function buildDateSel(){
-  const sel = $('dateSel'), today = todayStr();
-  const opts = [];
-  for(let i=0;i<=90;i++){
-    const d = addDays(today,-i);
-    const label = i===0 ? `${d} (今日)` : d;
-    opts.push(`<option value="${d}"${d===_date?' selected':''}>${label}</option>`);
+  const sel=$('dateSel'), today=todayStr();
+  const opts=[];
+  if(_mode==='day'){
+    for(let i=0;i<=90;i++){
+      const d=addDays(today,-i);
+      opts.push(`<option value="${d}"${d===_date?' selected':''}>${i===0?d+' (今日)':d}</option>`);
+    }
+  } else if(_mode==='week'){
+    // 顯示最近 13 週
+    for(let i=0;i<=12;i++){
+      const end=addDays(today,-i*7);
+      const start=addDays(end,-6);
+      const lbl=(i===0?'本週':'第'+isoWeek(end)+'週')+` ${start.slice(5).replace('-','/')}～${end.slice(5).replace('-','/')}`;
+      opts.push(`<option value="${end}"${end===_date?' selected':''}>${lbl}</option>`);
+    }
+  } else {
+    // month：顯示最近 13 個月末日
+    for(let i=0;i<=12;i++){
+      const dt=new Date(today); dt.setDate(1); dt.setMonth(dt.getMonth()-i);
+      const end=monthEnd(dt.getFullYear(),dt.getMonth()+1);
+      const lbl=(i===0?'本月':'')+`${dt.getFullYear()}年${dt.getMonth()+1}月`;
+      opts.push(`<option value="${end}"${end===_date?' selected':''}>${lbl}</option>`);
+    }
   }
-  sel.innerHTML = opts.join('');
+  sel.innerHTML=opts.join('');
 }
 
 function onDateSel(){ _date=$('dateSel').value; loadEvents(); }
-function prevDate(){ _date=addDays(_date,-(MODE_STEP[_mode]||1)); buildDateSel(); loadEvents(); }
-function nextDate(){ const n=addDays(_date,MODE_STEP[_mode]||1); if(n>todayStr())return; _date=n; buildDateSel(); loadEvents(); }
-function gotoToday(){ _date=todayStr(); buildDateSel(); loadEvents(); }
+
+function prevDate(){
+  if(_mode==='week'){      _date=addDays(_date,-7);
+  } else if(_mode==='month'){
+    const dt=new Date(_date); dt.setDate(1); dt.setMonth(dt.getMonth()-1);
+    _date=monthEnd(dt.getFullYear(),dt.getMonth()+1);
+  } else { _date=addDays(_date,-1); }
+  buildDateSel(); loadEvents();
+}
+
+function nextDate(){
+  const today=todayStr(); let next;
+  if(_mode==='week'){      next=addDays(_date,7);
+  } else if(_mode==='month'){
+    const dt=new Date(_date); dt.setDate(1); dt.setMonth(dt.getMonth()+1);
+    next=monthEnd(dt.getFullYear(),dt.getMonth()+1);
+  } else { next=addDays(_date,1); }
+  if(next>today) return;
+  _date=next; buildDateSel(); loadEvents();
+}
+
+function gotoToday(){
+  const today=todayStr();
+  if(_mode==='week'){      _date=today;
+  } else if(_mode==='month'){
+    const dt=new Date(today);
+    _date=monthEnd(dt.getFullYear(),dt.getMonth()+1);
+  } else { _date=today; }
+  buildDateSel(); loadEvents();
+}
+
 function setMode(m){
   _mode=m;
   document.querySelectorAll('.mode-tab').forEach(b=>b.classList.toggle('on',b.dataset.m===m));
-  loadEvents();
+  gotoToday();   // 切模式時重設到今日/本週/本月
 }
 function refresh(){ loadEvents(true); }
 
 // ── Load & render ─────────────────────────────────────────────────────────────
 async function loadEvents(force=false){
-  $('wrap').innerHTML=`<div class="empty"><span class="loading-dot">批次抓取 ${_date} 附近價格歷史…</span></div>`;
+  const loadMsg = {day:'日統計：抓取昨日與今日價格…', week:'週統計：抓取本週與上週價格…', month:'月統計：抓取本月與上月價格…'}[_mode]||'計算中…';
+  $('wrap').innerHTML=`<div class="empty"><span class="loading-dot">${loadMsg}</span></div>`;
   const url=`/api/overtake_events?date=${_date}&mode=${_mode}${force?'&force=1':''}`;
   const res=await fetch(url);
   if(!res.ok){ $('wrap').innerHTML=`<div class="err-msg">API 錯誤 ${res.status}</div>`; return; }
@@ -651,7 +724,7 @@ function render(data){
   const tcounts  = data.ticker_counts || {};
   const wrap     = $('wrap');
 
-  const period = `${data.date} ${modeLabel(data.mode)}統計`;
+  const period = periodLabel(data);
 
   if(!events.length){
     wrap.innerHTML=`
