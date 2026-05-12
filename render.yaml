@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: etf-aag87uqu
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn etf_web:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: RENDER
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.11.0"

@@ -1,0 +1,6 @@
+cloudflared.exe
+__pycache__/
+*.pyc
+*.pyo
+.env
+etf_result*.csv
