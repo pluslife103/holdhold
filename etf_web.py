@@ -976,6 +976,19 @@ td{padding:8px 10px;}
 .htd-chg-pos{color:var(--green);}
 .htd-chg-neg{color:var(--red);}
 
+/* ── 成長曲線欄 ── */
+.spark-cell{white-space:nowrap;padding:5px 8px!important;}
+.spark-wrap{display:inline-flex;align-items:center;gap:5px;}
+.spark-pct{font-size:.68rem;font-variant-numeric:tabular-nums;min-width:42px;}
+.spark-pct.up{color:var(--green);}
+.spark-pct.dn{color:var(--red);}
+.spark-pct.flat{color:var(--muted);}
+.spark-loading{color:var(--muted);font-size:.65rem;letter-spacing:.05em;}
+.spark-hdr{display:flex;align-items:center;gap:3px;}
+.spk-btn{width:auto;padding:1px 6px;font-size:.63rem;border-radius:3px;
+  background:var(--border);color:var(--muted);border:none;cursor:pointer;}
+.spk-btn.on{background:var(--accent2);color:#fff;}
+
 /* ── tier 分級 ── */
 .tier-badge{display:inline-flex;align-items:center;justify-content:center;
   width:22px;height:22px;border-radius:5px;font-size:.72rem;font-weight:800;flex-shrink:0;}
@@ -1195,10 +1208,18 @@ td{padding:8px 10px;}
         <th onclick="sortCol('expense_ratio')" id="th_expense_ratio">費用率 <span class="si">↕</span></th>
         <th onclick="sortCol('ytd_return')" id="th_ytd_return">YTD <span class="si">↕</span></th>
         <th onclick="sortCol('three_yr_avg')" id="th_three_yr_avg">3Y 報酬 <span class="si">↕</span></th>
+        <th>
+          <div class="spark-hdr">
+            成長曲線
+            <button class="spk-btn on" data-sp="1m" onclick="setSparkPeriod('1m')">1M</button>
+            <button class="spk-btn"    data-sp="3m" onclick="setSparkPeriod('3m')">3M</button>
+            <button class="spk-btn"    data-sp="6m" onclick="setSparkPeriod('6m')">6M</button>
+          </div>
+        </th>
         <th>類別</th>
       </tr></thead>
       <tbody id="tbody">
-        <tr><td colspan="9" class="empty">請先點擊「載入 ETF 資料」</td></tr>
+        <tr><td colspan="11" class="empty">請先點擊「載入 ETF 資料」</td></tr>
       </tbody>
     </table>
   </div>
@@ -1449,7 +1470,7 @@ function renderOvPanel() {
 
 // ── 渲染表格 ─────────────────────────────────────────────────────────────────
 function renderEmpty(msg) {
-  $('tbody').innerHTML = `<tr><td colspan="9" class="empty">${msg}</td></tr>`;
+  $('tbody').innerHTML = `<tr><td colspan="11" class="empty">${msg}</td></tr>`;
   $('resultInfo').textContent = '—';
 }
 
@@ -1478,14 +1499,103 @@ function renderTable(rows) {
       <td class="num">${fmtEr(r.expense_ratio)}</td>
       <td class="num">${fmtPct(r.ytd_return)}</td>
       <td class="num">${fmtPct(r.three_yr_avg)}</td>
+      <td class="spark-cell" data-ticker="${r.ticker}"><span class="spark-loading">…</span></td>
       <td><span class="cat" title="${escHtml(r.category)}">${r.category||'—'}</span></td>
     </tr>`;
   }).join('');
   $('tbody').innerHTML = html;
+  // 觀察可見的 spark cells，懶載入
+  document.querySelectorAll('.spark-cell').forEach(el => _sparkObs?.observe(el));
 }
 
 function tierLabel(g) {
   return {S:'超大型 ≥$100B',A:'大型 $10B–$100B',B:'中型 $1B–$10B',C:'小型 $100M–$1B',D:'微型 <$100M'}[g]||g;
+}
+
+// ── 成長曲線（Sparkline）────────────────────────────────────────────────────
+let _sparkPeriod = '1m';
+const _sparkCache = {};   // "ticker_period" -> {svg, pct}
+let _sparkObs = null;
+
+function initSparkObs() {
+  if (_sparkObs) _sparkObs.disconnect();
+  _sparkObs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        _sparkObs.unobserve(e.target);
+        loadSparkCell(e.target);
+      }
+    });
+  }, { rootMargin: '60px' });
+}
+
+async function loadSparkCell(el) {
+  const ticker = el.dataset.ticker;
+  if (!ticker) return;
+  const key = `${ticker}_${_sparkPeriod}`;
+  if (_sparkCache[key]) { el.innerHTML = _sparkCache[key]; return; }
+
+  const res  = await fetch(`/api/history/${ticker}?period=${_sparkPeriod}`);
+  if (!res.ok) { el.innerHTML = '<span class="spark-loading" style="color:var(--muted)">—</span>'; return; }
+  const data = await res.json();
+  const html = buildSparkHTML(data);
+  _sparkCache[key] = html;
+  // 確認元素仍屬同一 ticker（表格可能已重繪）
+  if (el.dataset.ticker === ticker) el.innerHTML = html;
+}
+
+function buildSparkHTML(data) {
+  if (!data?.length) return '<span class="spark-loading">—</span>';
+  const vals = data.map(d => d.aum);
+  const first = vals[0], last = vals[vals.length - 1];
+  if (!first) return '—';
+  const pctRaw = (last / first - 1) * 100;
+  const pct    = pctRaw.toFixed(2);
+  const pctCls = pctRaw > 0.05 ? 'up' : pctRaw < -0.05 ? 'dn' : 'flat';
+  const pctTxt = pctRaw > 0 ? `+${pct}%` : `${pct}%`;
+
+  // 畫 SVG 折線
+  const W = 64, H = 24, pad = 2;
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const rng = max - min || max * 0.001 || 1;
+  const pts = vals.map((v, i) => {
+    const x = pad + (i / (vals.length - 1)) * (W - pad * 2);
+    const y = H - pad - ((v - min) / rng) * (H - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const color = pctCls === 'up' ? '#3dd68c' : pctCls === 'dn' ? '#f55' : '#666c85';
+  const gradId = `sg_${Math.random().toString(36).slice(2,7)}`;
+  const svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="vertical-align:middle;overflow:visible">
+    <defs>
+      <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${color}" stop-opacity=".25"/>
+        <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <polygon points="${pts} ${(W-pad).toFixed(1)},${H} ${pad},${H}" fill="url(#${gradId})"/>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.6" stroke-linejoin="round"/>
+  </svg>`;
+
+  const dateRange = data.length > 1
+    ? `${data[0].date} → ${data[data.length-1].date}&#10;起始：${fmtAum(first)}&#10;結束：${fmtAum(last)}`
+    : '';
+
+  return `<div class="spark-wrap" title="${dateRange}">
+    ${svg}
+    <span class="spark-pct ${pctCls}">${pctTxt}</span>
+  </div>`;
+}
+
+function setSparkPeriod(p) {
+  _sparkPeriod = p;
+  document.querySelectorAll('[data-sp]').forEach(b =>
+    b.classList.toggle('on', b.dataset.sp === p)
+  );
+  // 清除現有 spark cells，重新懶載入
+  document.querySelectorAll('.spark-cell').forEach(el => {
+    el.innerHTML = '<span class="spark-loading">…</span>';
+    _sparkObs?.observe(el);
+  });
 }
 
 function buildOvBadge(ticker) {
@@ -1954,6 +2064,7 @@ function exportCSV() {
 // ── 初始化 ───────────────────────────────────────────────────────────────────
 (async () => {
   initSearch();
+  initSparkObs();
   const st = await fetch('/api/status').then(r=>r.json());
   if (st.loaded) {
     $('statusDot').className = 'status-dot ok';
