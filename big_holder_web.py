@@ -1,0 +1,1603 @@
+"""
+big_holder_web.py
+=================
+千張大戶分析網站
+
+啟動：  python big_holder_web.py
+瀏覽：  http://localhost:8001
+"""
+
+import io, json, sys, time, threading, logging, warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+import uvicorn
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from scipy import stats
+
+warnings.filterwarnings("ignore")
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+# ── 設定 ──────────────────────────────────────────────────────────────────
+FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
+BIG_BRACKET  = "more than 1,000,001"
+TOKEN_PATH   = Path(__file__).parent / "finmind_chip_screener" / ".env"
+CACHE_TTL_H  = 12
+PORT         = 8001
+DEFAULT_YEARS  = 2
+MAX_LAG        = 8
+GRADE_WORKERS  = 8      # concurrent API requests (lower on cloud free tier)
+
+# ── 規模分層 & 波動等級 ────────────────────────────────────────────────────
+# 市值單位：億 NTD
+TIERS = [
+    ("mega",  10_000, "超大型", "🏢"),   # > 1 兆
+    ("large",  1_000, "大型",   "🏗"),   # 1000億–1兆
+    ("mid",      100, "中型",   "🏬"),   # 100億–1000億
+    ("small",     20, "小型",   "🏪"),   # 20億–100億
+    ("micro",      0, "微型",   "🏠"),   # < 20億
+]
+TIER_ORDER = {t[0]: i for i, t in enumerate(TIERS)}
+
+# 波動等級（同規模內 std(bpct_chg) 的百分位分布）
+GRADES = [
+    ("S", 0.90, "極高波動", "#ef4444"),  # top 10%
+    ("A", 0.70, "高波動",   "#f97316"),  # 70-90%
+    ("B", 0.30, "中波動",   "#eab308"),  # 30-70%
+    ("C", 0.10, "低波動",   "#60a5fa"),  # 10-30%
+    ("D", 0.00, "極低波動", "#6b7280"),  # bottom 10%
+]
+GRADE_COLORS = {g[0]: g[3] for g in GRADES}
+GRADE_LABELS = {g[0]: g[2] for g in GRADES}
+
+# ── Token ─────────────────────────────────────────────────────────────────
+_TOKEN: str = ""
+
+def _load_token() -> str:
+    import os
+    # 1. 直接讀環境變數（Render / Railway / Docker 部署）
+    t = os.getenv("FINMIND_TOKEN", "")
+    if t:
+        return t
+    # 2. 退回讀本地 .env 檔（開發環境）
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(TOKEN_PATH)
+        t = os.getenv("FINMIND_TOKEN", "")
+    except Exception:
+        pass
+    if not t:
+        raise RuntimeError(
+            "請設定 FINMIND_TOKEN 環境變數，或在 "
+            f"{TOKEN_PATH} 建立 .env 檔"
+        )
+    return t
+
+
+# ── 記憶體快取 ────────────────────────────────────────────────────────────
+_CACHE: dict = {}
+_CLOCK = threading.Lock()
+
+
+def _cset(key: str, val) -> None:
+    with _CLOCK:
+        _CACHE[key] = (val, time.time())
+
+
+def _cget(key: str, ttl_h: float = CACHE_TTL_H):
+    with _CLOCK:
+        if key not in _CACHE:
+            return None
+        val, ts = _CACHE[key]
+        if time.time() - ts > ttl_h * 3600:
+            del _CACHE[key]
+            return None
+        return val
+
+
+# ── FinMind API ────────────────────────────────────────────────────────────
+def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataFrame:
+    if not end:
+        end = datetime.now().strftime("%Y-%m-%d")
+    key = f"{dataset}|{sid}|{start}|{end}"
+    cached = _cget(key)
+    if cached is not None:
+        return cached
+
+    params: dict = {"dataset": dataset, "token": _TOKEN}
+    if sid:    params["data_id"] = sid
+    if start:  params["start_date"] = start
+    if end:    params["end_date"] = end
+
+    for attempt in range(3):
+        try:
+            r = requests.get(FINMIND_BASE, params=params, timeout=60)
+            r.raise_for_status()
+            body = r.json()
+            if body.get("status") == 200:
+                df = pd.DataFrame(body.get("data", []))
+                _cset(key, df)
+                return df
+            print(f"  FinMind [{dataset}][{sid}]: {body.get('msg','')}")
+            return pd.DataFrame()
+        except Exception as exc:
+            if attempt == 2:
+                print(f"  FinMind error [{dataset}][{sid}]: {exc}")
+            time.sleep(1.5 ** attempt)
+    return pd.DataFrame()
+
+
+# ── 股票清單 ──────────────────────────────────────────────────────────────
+_STOCKS: list[dict] = []
+_STOCK_MAP: dict[str, str] = {}   # id -> name
+
+
+def _load_stocks() -> None:
+    global _STOCKS, _STOCK_MAP
+    df = _fm("TaiwanStockInfo")
+    if df.empty:
+        return
+    df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
+    df = df[["stock_id", "stock_name", "type"]].drop_duplicates("stock_id")
+    _STOCKS = df.to_dict(orient="records")
+    _STOCK_MAP = dict(zip(df["stock_id"], df["stock_name"]))
+    print(f"  股票清單：{len(_STOCKS)} 支")
+
+
+# ── 分級計算 ──────────────────────────────────────────────────────────────
+_GRADING: dict[str, dict] = {}   # stock_id -> graded dict
+_GRADE_PROG = {"done": 0, "total": 0, "running": False, "error": ""}
+
+
+def _tier_of(cap_億: float) -> str:
+    for name, min_cap, *_ in TIERS:
+        if cap_億 >= min_cap:
+            return name
+    return "micro"
+
+
+def _assign_grades_inplace(rows: list[dict]) -> None:
+    """Assign grade S/A/B/C/D within each tier based on volatility percentile."""
+    from collections import defaultdict
+    tier_vols: dict[str, list] = defaultdict(list)
+    for r in rows:
+        tier_vols[r["tier"]].append(r["volatility"])
+
+    tier_cuts: dict[str, dict] = {}
+    for tier, vols in tier_vols.items():
+        sv = sorted(vols)
+        n  = len(sv)
+        tier_cuts[tier] = {g: sv[min(n - 1, max(0, int(n * p) - 1))]
+                           for g, p, *_ in GRADES}
+
+    for r in rows:
+        cuts = tier_cuts[r["tier"]]
+        v    = r["volatility"]
+        r["grade"] = next(
+            (g for g, p, *_ in GRADES if v >= cuts[g]),
+            "D"
+        )
+
+
+def _fetch_one_grading(sid: str) -> dict | None:
+    """Fetch 1-year holding + 30-day price for one stock; return grading metrics."""
+    start_1y = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    start_1m = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    # ── 持股分佈 ────────────────────────────────────────────────────────────
+    hdf = _fm("TaiwanStockHoldingSharesPer", sid, start_1y)
+    if hdf.empty:
+        return None
+    hdf["date"] = pd.to_datetime(hdf["date"])
+
+    # 總股數（total bracket）
+    tot = hdf[hdf["HoldingSharesLevel"] == "total"].sort_values("date")
+    if tot.empty:
+        return None
+    total_shares = pd.to_numeric(tot["unit"].iloc[-1], errors="coerce")
+    if pd.isna(total_shares) or total_shares <= 0:
+        return None
+
+    # 千張大戶波動度
+    big = hdf[hdf["HoldingSharesLevel"] == BIG_BRACKET].copy()
+    if len(big) < 4:
+        return None
+    big["pct"]     = pd.to_numeric(big["percent"], errors="coerce")
+    big["people"]  = pd.to_numeric(big["people"],  errors="coerce")
+    big            = big.sort_values("date")
+    big["chg"]     = big["pct"].diff()
+    volatility     = float(big["chg"].dropna().std())
+    latest_bpct    = float(big["pct"].iloc[-1])
+    latest_bp      = int(big["people"].iloc[-1])
+
+    # ── 最新股價 ────────────────────────────────────────────────────────────
+    pdf = _fm("TaiwanStockPrice", sid, start_1m)
+    if pdf.empty:
+        return None
+    latest_close = pd.to_numeric(
+        pdf.sort_values("date")["close"].iloc[-1], errors="coerce"
+    )
+    if pd.isna(latest_close) or latest_close <= 0:
+        return None
+
+    market_cap_億 = float(latest_close * total_shares / 1e8)
+
+    return {
+        "stock_id":      sid,
+        "stock_name":    _STOCK_MAP.get(sid, sid),
+        "market_cap_億": round(market_cap_億, 1),
+        "tier":          _tier_of(market_cap_億),
+        "volatility":    round(volatility, 4),
+        "latest_bpct":   round(latest_bpct, 2),
+        "bpct_chg":      round(float(big["chg"].iloc[-1]) if not pd.isna(big["chg"].iloc[-1]) else 0, 3),
+        "latest_bp":     latest_bp,
+        "latest_price":  round(float(latest_close), 2),
+        "n_weeks":       len(big),
+    }
+
+
+def _run_grading() -> None:
+    """Background thread: batch-fetch all stocks and compute tier+grade."""
+    global _GRADING, _GRADE_PROG
+
+    # Wait for stock list
+    for _ in range(30):
+        if _STOCKS:
+            break
+        time.sleep(1)
+    if not _STOCKS:
+        _GRADE_PROG["error"] = "股票清單未載入"
+        return
+
+    sids = [s["stock_id"] for s in _STOCKS]
+    _GRADE_PROG.update({"done": 0, "total": len(sids), "running": True, "error": ""})
+    print(f"  開始分級計算：{len(sids)} 支股票，{GRADE_WORKERS} 並發…")
+
+    raw: list[dict] = []
+    with ThreadPoolExecutor(max_workers=GRADE_WORKERS) as ex:
+        futs = {ex.submit(_fetch_one_grading, sid): sid for sid in sids}
+        for fut in as_completed(futs):
+            result = fut.result()
+            if result:
+                raw.append(result)
+            with _CLOCK:
+                _GRADE_PROG["done"] += 1
+
+    _assign_grades_inplace(raw)
+
+    with _CLOCK:
+        _GRADING = {r["stock_id"]: r for r in raw}
+
+    _GRADE_PROG["running"] = False
+    print(f"  分級完成：{len(_GRADING)}/{len(sids)} 支股票")
+
+
+# ── 資料處理 ──────────────────────────────────────────────────────────────
+def _process_stock(sid: str, years: int) -> dict:
+    start = (datetime.now() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
+
+    # 千張大戶
+    hdf = _fm("TaiwanStockHoldingSharesPer", sid, start)
+    if hdf.empty:
+        return {"error": "無持股資料"}
+    hdf["date"] = pd.to_datetime(hdf["date"])
+    big = hdf[hdf["HoldingSharesLevel"] == BIG_BRACKET].copy()
+    if big.empty:
+        return {"error": "無千張大戶資料"}
+    for c in ("people", "percent", "unit"):
+        big[c] = pd.to_numeric(big[c], errors="coerce")
+    big = (big.rename(columns={"people": "bp", "percent": "bpct", "unit": "bu"})
+           [["date", "bp", "bpct", "bu"]].sort_values("date").reset_index(drop=True))
+    big["bpct_chg"] = big["bpct"].diff().round(3)
+    big["bp_chg"]   = big["bp"].diff()
+
+    # 股價（週）
+    pdf = _fm("TaiwanStockPrice", sid, start)
+    if pdf.empty:
+        return {"error": "無股價資料"}
+    pdf["date"]  = pd.to_datetime(pdf["date"])
+    pdf["close"] = pd.to_numeric(pdf["close"], errors="coerce")
+    pw = (pdf.sort_values("date").set_index("date")["close"]
+          .resample("W-FRI").last().dropna().reset_index())
+    pw.columns = ["date", "close"]
+    pw["ret"] = pw["close"].pct_change().round(5)
+
+    # 合併
+    df = pd.merge_asof(big.sort_values("date"), pw.sort_values("date"),
+                       on="date", tolerance=pd.Timedelta("7d"), direction="nearest")
+    df = df.dropna(subset=["close", "bpct"])
+    if len(df) < 4:
+        return {"error": "資料筆數不足"}
+
+    # 未來報酬
+    for lag in range(1, MAX_LAG + 1):
+        df[f"f{lag}"] = df["ret"].shift(-lag)
+
+    # Lead-Lag
+    lags = []
+    for lag in range(-MAX_LAG, MAX_LAG + 1):
+        if lag < 0:
+            x, y, lbl = df["bpct_chg"], df["ret"].shift(lag), f"股價先行{abs(lag)}週"
+        elif lag == 0:
+            x, y, lbl = df["bpct_chg"], df["ret"], "同期"
+        else:
+            col = f"f{lag}"
+            x, y, lbl = df["bpct_chg"], df.get(col, pd.Series(dtype=float)), f"大戶先行{lag}週"
+        valid = pd.concat([x, y], axis=1).dropna()
+        if len(valid) < 8:
+            continue
+        r, p = stats.pearsonr(valid.iloc[:, 0], valid.iloc[:, 1])
+        lags.append({"lag": lag, "label": lbl, "r": round(r, 4), "p": round(p, 4),
+                     "sig": bool(p < 0.05), "n": int(len(valid))})
+
+    # History
+    history = []
+    for _, row in df.iterrows():
+        def _f(v): return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+        def _i(v): return None if (v is None or (isinstance(v, float) and np.isnan(v))) else int(v)
+        history.append({"date": row["date"].strftime("%Y-%m-%d"),
+                        "bpct": _f(row["bpct"]),      "bpct_chg": _f(row["bpct_chg"]),
+                        "bp":   _i(row["bp"]),         "bp_chg":   _i(row["bp_chg"]),
+                        "close": _f(row["close"]),     "ret": _f(row["ret"])})
+
+    latest = df.iloc[-1]
+    def _safe(v, fn=float, dec=2):
+        try: return round(fn(v), dec) if dec else fn(v)
+        except: return None
+
+    return {
+        "stock_id":   sid,
+        "stock_name": _STOCK_MAP.get(sid, sid),
+        "weeks":      int(len(df)),
+        "latest": {
+            "date":        latest["date"].strftime("%Y-%m-%d"),
+            "bpct":        _safe(latest["bpct"]),
+            "bpct_chg":   _safe(latest["bpct_chg"], float, 3),
+            "bp":          _safe(latest["bp"], int, 0),
+            "bp_chg":     _safe(latest["bp_chg"], int, 0),
+            "close":       _safe(latest["close"]),
+        },
+        "history":      history,
+        "lag_analysis": lags,
+    }
+
+
+def _process_compare(sids: list[str], years: int) -> dict:
+    start = (datetime.now() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
+    result = []
+    for sid in sids:
+        hdf = _fm("TaiwanStockHoldingSharesPer", sid, start)
+        if hdf.empty:
+            continue
+        hdf["date"] = pd.to_datetime(hdf["date"])
+        big = hdf[hdf["HoldingSharesLevel"] == BIG_BRACKET].copy()
+        if big.empty:
+            continue
+        big["percent"] = pd.to_numeric(big["percent"], errors="coerce")
+        big["people"]  = pd.to_numeric(big["people"],  errors="coerce")
+        big = (big[["date", "percent", "people"]].sort_values("date").reset_index(drop=True))
+        big["pct_chg"] = big["percent"].diff().round(3)
+
+        pdf = _fm("TaiwanStockPrice", sid, start)
+        if pdf.empty:
+            continue
+        pdf["date"]  = pd.to_datetime(pdf["date"])
+        pdf["close"] = pd.to_numeric(pdf["close"], errors="coerce")
+        pw = (pdf.sort_values("date").set_index("date")["close"]
+              .resample("W-FRI").last().dropna().reset_index())
+        pw.columns = ["date", "close"]
+
+        df = pd.merge_asof(big.sort_values("date"), pw.sort_values("date"),
+                           on="date", tolerance=pd.Timedelta("7d"), direction="nearest")
+        df = df.dropna(subset=["close", "percent"])
+        if df.empty:
+            continue
+
+        first_close = df["close"].iloc[0]
+        df["norm_price"] = (df["close"] / first_close * 100).round(2)
+
+        rows = []
+        for _, row in df.iterrows():
+            def _f(v):
+                return None if (v is None or (isinstance(v, float) and np.isnan(v))) else round(float(v), 3)
+            def _i(v):
+                return None if (v is None or (isinstance(v, float) and np.isnan(v))) else int(v)
+            rows.append({"date": row["date"].strftime("%Y-%m-%d"),
+                         "bpct": _f(row["percent"]), "pct_chg": _f(row["pct_chg"]),
+                         "bp":   _i(row["people"]),  "close": _f(row["close"]),
+                         "norm": _f(row["norm_price"])})
+
+        latest = df.iloc[-1]
+        result.append({
+            "stock_id":   sid,
+            "stock_name": _STOCK_MAP.get(sid, sid),
+            "rows":       rows,
+            "latest_bpct":  round(float(latest["percent"]), 2),
+            "latest_close": round(float(latest["close"]), 2),
+        })
+    return {"stocks": result}
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────
+def _startup_tasks():
+    """Run sequentially in a background thread: load stocks then start grading."""
+    _load_stocks()
+    _run_grading()
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global _TOKEN
+    _TOKEN = _load_token()
+    threading.Thread(target=_startup_tasks, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="千張大戶分析", lifespan=_lifespan)
+
+
+# ── API ────────────────────────────────────────────────────────────────────
+@app.get("/api/stocks")
+def api_stocks(q: str = Query("", description="搜尋關鍵字")):
+    stocks = _STOCKS
+    if q:
+        q = q.upper()
+        stocks = [s for s in stocks if q in s["stock_id"] or q in s["stock_name"]]
+    return {"stocks": stocks, "total": len(stocks)}
+
+
+@app.get("/api/stock/{stock_id}")
+def api_stock(stock_id: str, years: int = Query(DEFAULT_YEARS)):
+    ckey = f"stock|{stock_id}|{years}"
+    cached = _cget(ckey, CACHE_TTL_H)
+    if cached is not None:
+        return cached
+    data = _process_stock(stock_id, years)
+    if "error" not in data:
+        _cset(ckey, data)
+    return data
+
+
+@app.post("/api/compare")
+async def api_compare(request_body: dict):
+    sids  = request_body.get("stocks", [])[:8]
+    years = int(request_body.get("years", DEFAULT_YEARS))
+    if not sids:
+        raise HTTPException(400, "stocks 不可為空")
+    ckey = f"compare|{'_'.join(sorted(sids))}|{years}"
+    cached = _cget(ckey, CACHE_TTL_H)
+    if cached is not None:
+        return cached
+    data = _process_compare(sids, years)
+    _cset(ckey, data)
+    return data
+
+
+@app.get("/api/grading/status")
+def api_grading_status():
+    with _CLOCK:
+        prog = dict(_GRADE_PROG)
+        ready = len(_GRADING)
+    return {**prog, "ready": ready,
+            "pct": round(prog["done"] / prog["total"] * 100, 1) if prog.get("total") else 0}
+
+
+@app.get("/api/grading")
+def api_grading(
+    tier:  str = Query("", description="mega|large|mid|small|micro"),
+    grade: str = Query("", description="S|A|B|C|D"),
+    q:     str = Query("", description="Search code/name"),
+):
+    with _CLOCK:
+        stocks = list(_GRADING.values())
+
+    if tier:
+        stocks = [s for s in stocks if s.get("tier") == tier]
+    if grade:
+        stocks = [s for s in stocks if s.get("grade") == grade]
+    if q:
+        qu = q.upper()
+        stocks = [s for s in stocks
+                  if qu in s["stock_id"] or qu in (s.get("stock_name") or "")]
+
+    stocks.sort(key=lambda s: (
+        TIER_ORDER.get(s.get("tier", "micro"), 99),
+        -s.get("volatility", 0)
+    ))
+
+    # Group by tier
+    grouped: dict[str, list] = {}
+    for s in stocks:
+        t = s.get("tier", "micro")
+        grouped.setdefault(t, []).append(s)
+
+    # Tier metadata
+    tier_meta = []
+    for name, min_cap, label, icon in TIERS:
+        items = grouped.get(name, [])
+        tier_meta.append({
+            "key": name, "label": label, "icon": icon,
+            "count": len(items),
+            "stocks": items,
+        })
+
+    return {
+        "tiers":  [t for t in tier_meta if t["count"] > 0],
+        "total":  len(stocks),
+        "ready":  len(_GRADING),
+        "grades": [{"key": g, "label": GRADE_LABELS[g], "color": GRADE_COLORS[g]}
+                   for g, *_ in GRADES],
+    }
+
+
+@app.post("/api/grading/refresh")
+def api_grading_refresh():
+    if _GRADE_PROG.get("running"):
+        return {"ok": False, "message": "計算中，請稍候"}
+    threading.Thread(target=_run_grading, daemon=True).start()
+    return {"ok": True, "message": "已開始重新計算"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return _HTML
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────
+_HTML = r"""<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>千張大戶分析</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+:root{
+  --bg:#0d1117;--sur:#161b22;--sur2:#21262d;--bor:#30363d;
+  --txt:#e6edf3;--mut:#8b949e;--acc:#3fb950;--red:#f85149;
+  --blu:#58a6ff;--yel:#d29922;--pur:#c084fc;--rad:8px;
+  --topbar-h:52px;--botnav-h:60px;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{height:100%}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:13px;height:100%;display:flex;flex-direction:column;overflow:hidden}
+
+/* ── Top bar ── */
+.topbar{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur)}
+.topbar h1{font-size:1.1rem;font-weight:700;white-space:nowrap}
+.topbar .badge{font-size:10px;padding:2px 7px;border-radius:12px;background:var(--sur2);color:var(--mut)}
+
+/* ── Layout ── */
+.layout{display:flex;flex:1;overflow:hidden}
+
+/* ── Sidebar ── */
+.sidebar{width:240px;flex-shrink:0;border-right:1px solid var(--bor);display:flex;flex-direction:column;background:var(--sur)}
+.sidebar-head{padding:10px;border-bottom:1px solid var(--bor);flex-shrink:0}
+.search{width:100%;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);border-radius:var(--rad);padding:6px 10px;font-size:12px}
+.search:focus{outline:none;border-color:var(--acc)}
+.sort-bar{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
+.sort-btn{font-size:10px;padding:2px 7px;border-radius:12px;border:1px solid var(--bor);background:var(--sur2);color:var(--mut);cursor:pointer}
+.sort-btn.active{background:var(--acc);border-color:var(--acc);color:#000;font-weight:700}
+.stock-count{font-size:10px;color:var(--mut);margin-top:4px}
+.stock-list{flex:1;overflow-y:auto;padding:4px}
+.stock-item{display:flex;align-items:center;padding:7px 8px;border-radius:6px;cursor:pointer;gap:8px;position:relative;border:1px solid transparent;margin-bottom:2px}
+.stock-item:hover{background:var(--sur2)}
+.stock-item.active{background:rgba(63,185,80,.1);border-color:rgba(63,185,80,.3)}
+.stock-item.compare-sel{background:rgba(88,166,255,.08);border-color:rgba(88,166,255,.25)}
+.stock-info{flex:1;min-width:0}
+.stock-code{font-weight:700;font-size:12px;font-family:monospace}
+.stock-name{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stock-metrics{text-align:right;flex-shrink:0;font-size:11px}
+.pct-val{font-weight:700}
+.pct-up{color:var(--acc)}
+.pct-dn{color:var(--red)}
+.pct-chg{font-size:10px;color:var(--mut)}
+.add-compare{width:18px;height:18px;border-radius:50%;border:1px solid var(--bor);background:var(--sur2);color:var(--mut);display:flex;align-items:center;justify-content:center;font-size:13px;line-height:1;flex-shrink:0;opacity:0;transition:.15s}
+.stock-item:hover .add-compare{opacity:1}
+.add-compare.added{opacity:1;background:var(--blu);border-color:var(--blu);color:#fff}
+
+/* ── Main ── */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.tabs{display:flex;gap:0;padding:0 16px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur)}
+.tab{padding:10px 18px;cursor:pointer;border-bottom:2px solid transparent;color:var(--mut);font-size:13px;transition:.15s}
+.tab:hover{color:var(--txt)}
+.tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+.pane{display:none;flex:1;overflow:hidden;flex-direction:column}
+.pane.active{display:flex}
+
+/* ── Single stock pane ── */
+.single-wrap{display:flex;flex-direction:column;flex:1;overflow:hidden;padding:12px 16px;gap:10px}
+.stat-row{display:flex;gap:10px;flex-shrink:0;flex-wrap:wrap}
+.stat-card{background:var(--sur);border:1px solid var(--bor);border-radius:var(--rad);padding:12px 16px;flex:1;min-width:120px}
+.stat-label{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+.stat-val{font-size:1.4rem;font-weight:700;margin-top:4px}
+.stat-sub{font-size:11px;color:var(--mut);margin-top:2px}
+.charts-row{display:flex;gap:10px;flex:1;overflow:hidden;min-height:0}
+.chart-box{background:var(--sur);border:1px solid var(--bor);border-radius:var(--rad);flex:1;overflow:hidden;min-width:0}
+.chart-box.lag-box{flex:0 0 320px}
+.chart-title{font-size:11px;color:var(--mut);padding:8px 12px;border-bottom:1px solid var(--bor);font-weight:600}
+
+/* ── Compare pane ── */
+.compare-wrap{display:flex;flex-direction:column;flex:1;overflow:hidden;padding:12px 16px;gap:10px}
+.compare-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0}
+.compare-chips{display:flex;gap:6px;flex-wrap:wrap;flex:1}
+.chip{display:flex;align-items:center;gap:5px;padding:4px 10px;background:var(--sur2);border:1px solid var(--bor);border-radius:16px;font-size:11px}
+.chip-rm{cursor:pointer;color:var(--mut);font-size:14px;line-height:1}
+.chip-rm:hover{color:var(--red)}
+.years-sel{background:var(--sur2);border:1px solid var(--bor);color:var(--txt);border-radius:var(--rad);padding:4px 8px;font-size:12px}
+.compare-charts{display:flex;gap:10px;flex:1;overflow:hidden;min-height:0;flex-direction:column}
+.compare-charts-row{display:flex;gap:10px;flex:1;min-height:0}
+.compare-table-wrap{flex-shrink:0;overflow-x:auto}
+.ctable{width:100%;border-collapse:collapse;font-size:12px}
+.ctable th{padding:6px 12px;text-align:right;color:var(--mut);font-size:10px;text-transform:uppercase;border-bottom:1px solid var(--bor);white-space:nowrap}
+.ctable th:first-child{text-align:left}
+.ctable td{padding:7px 12px;text-align:right;border-bottom:1px solid var(--bor)}
+.ctable td:first-child{text-align:left;font-weight:700;font-family:monospace}
+.ctable tr:last-child td{border-bottom:none}
+.ctable tr:hover td{background:var(--sur2)}
+
+/* ── Empty state ── */
+.empty{display:flex;align-items:center;justify-content:center;flex-direction:column;flex:1;color:var(--mut);gap:10px}
+.empty svg{opacity:.3}
+.loading{display:flex;align-items:center;justify-content:center;flex:1;flex-direction:column;gap:12px;color:var(--mut)}
+.spinner{width:32px;height:32px;border:3px solid var(--bor);border-top-color:var(--acc);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Plotly dark override */
+.js-plotly-plot .plotly .bg{fill:transparent!important}
+.nsewdrag{fill:transparent!important}
+
+/* scrollbar */
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:var(--sur)}
+::-webkit-scrollbar-thumb{background:var(--bor);border-radius:2px}
+::-webkit-scrollbar-thumb:hover{background:var(--mut)}
+
+/* toast */
+.toast{position:fixed;bottom:80px;right:16px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:10px 16px;border-radius:var(--rad);transform:translateY(60px);opacity:0;transition:.3s;z-index:999;font-size:12px;max-width:280px}
+.toast.show{transform:none;opacity:1}
+.toast.err{border-color:var(--red);color:var(--red)}
+
+/* ─── GRADING ─── */
+.grade-wrap{display:flex;flex-direction:column;flex:1;overflow:hidden;padding:10px 14px;gap:8px}
+.grade-controls{flex-shrink:0;background:var(--sur);border:1px solid var(--bor);border-radius:var(--rad);padding:10px 12px}
+.grade-filter-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.gf-btn{font-size:11px;padding:3px 9px;border-radius:14px;border:1px solid var(--bor);background:var(--sur2);color:var(--mut);cursor:pointer;white-space:nowrap;transition:.15s}
+.gf-btn:hover{background:var(--bor);color:var(--txt)}
+.gf-btn.active{background:var(--acc);border-color:var(--acc);color:#000;font-weight:700}
+.grade-s.active{background:#ef4444;border-color:#ef4444;color:#fff}
+.grade-a.active{background:#f97316;border-color:#f97316;color:#fff}
+.grade-b.active{background:#eab308;border-color:#eab308;color:#000}
+.grade-c.active{background:#60a5fa;border-color:#60a5fa;color:#000}
+.grade-d.active{background:#6b7280;border-color:#6b7280;color:#fff}
+.grade-body{flex:1;overflow-y:auto}
+.tier-section{margin-bottom:14px}
+.tier-header{display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--sur2);border-radius:6px;cursor:pointer;user-select:none;margin-bottom:6px;border:1px solid var(--bor)}
+.tier-header-title{font-weight:700;font-size:13px}
+.tier-cnt{font-size:11px;color:var(--mut);margin-left:4px}
+.tier-toggle{margin-left:auto;color:var(--mut);transition:.2s}
+.tier-section.collapsed .tier-toggle{transform:rotate(-90deg)}
+.tier-section.collapsed .grade-table-wrap{display:none}
+/* grade table */
+.grade-table-wrap{overflow-x:auto;border:1px solid var(--bor);border-radius:var(--rad)}
+.gtable{width:100%;border-collapse:collapse;min-width:580px;font-size:12px}
+.gtable th{padding:7px 10px;text-align:right;color:var(--mut);font-size:10px;text-transform:uppercase;border-bottom:1px solid var(--bor);white-space:nowrap;background:var(--sur2);cursor:pointer;user-select:none}
+.gtable th:first-child,.gtable th:nth-child(2){text-align:left}
+.gtable th:hover{color:var(--txt)}
+.gtable td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--bor)}
+.gtable td:first-child,.gtable td:nth-child(2){text-align:left}
+.gtable tr:last-child td{border-bottom:none}
+.gtable tr:hover td{background:var(--sur2)}
+/* grade badge */
+.gbadge{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;font-size:12px;font-weight:800;color:#fff;flex-shrink:0}
+.gb-S{background:#ef4444}
+.gb-A{background:#f97316}
+.gb-B{background:#ca8a04;color:#000}
+.gb-C{background:#3b82f6}
+.gb-D{background:#6b7280}
+/* tier badge */
+.tier-badge{font-size:10px;padding:1px 7px;border-radius:10px;font-weight:600}
+.tb-mega{background:rgba(168,85,247,.2);color:#c084fc}
+.tb-large{background:rgba(59,130,246,.2);color:#60a5fa}
+.tb-mid{background:rgba(63,185,80,.2);color:#4ade80}
+.tb-small{background:rgba(234,179,8,.2);color:#ca8a04}
+.tb-micro{background:rgba(107,114,128,.2);color:#9ca3af}
+/* sparkline for volatility */
+.vol-bar{display:inline-block;height:6px;border-radius:3px;vertical-align:middle;margin-right:5px;min-width:2px}
+@media(max-width:767px){
+  .grade-wrap{padding:6px}
+  .gtable{min-width:480px}
+  .grade-controls{padding:7px 8px}
+}
+/* ─── DRAWER (mobile stock list) ─── */
+.drawer-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;backdrop-filter:blur(2px)}
+.drawer-overlay.open{display:block}
+.drawer{position:fixed;top:0;left:-100%;width:min(300px,88vw);height:100%;background:var(--sur);border-right:1px solid var(--bor);z-index:201;display:flex;flex-direction:column;transition:left .28s cubic-bezier(.4,0,.2,1);box-shadow:4px 0 24px rgba(0,0,0,.5)}
+.drawer.open{left:0}
+.drawer-header{display:flex;align-items:center;justify-content:space-between;padding:14px 12px;border-bottom:1px solid var(--bor);flex-shrink:0}
+.drawer-close{background:none;border:none;color:var(--mut);font-size:22px;cursor:pointer;padding:4px 8px;border-radius:6px}
+.drawer-close:hover{color:var(--txt);background:var(--sur2)}
+.drawer-content{display:flex;flex-direction:column;flex:1;overflow:hidden}
+
+/* ─── BOTTOM NAV (mobile only, hidden on desktop) ─── */
+.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;height:var(--botnav-h);background:var(--sur);border-top:1px solid var(--bor);z-index:100;align-items:stretch}
+.bnav-btn{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;padding:6px;transition:.15s;position:relative}
+.bnav-btn svg{flex-shrink:0}
+.bnav-btn.active{color:var(--acc)}
+.bnav-btn.active svg{stroke:var(--acc)}
+.bnav-badge{position:absolute;top:6px;right:calc(50% - 18px);background:var(--red);color:#fff;font-size:9px;font-weight:700;border-radius:8px;padding:1px 4px;min-width:14px;text-align:center}
+
+/* ─── ICON BUTTON (topbar) ─── */
+.icon-btn{background:none;border:none;color:var(--mut);cursor:pointer;display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:8px;flex-shrink:0}
+.icon-btn:hover,.icon-btn:active{background:var(--sur2);color:var(--txt)}
+
+/* ─── MOBILE RESPONSIVE ─── */
+@media (max-width:767px){
+  /* hide desktop sidebar */
+  .sidebar{display:none}
+  /* show drawer + bottom nav */
+  .bottom-nav{display:flex}
+  /* main fills screen minus topbar & botnav */
+  .main{padding-bottom:var(--botnav-h)}
+  /* topbar: remove years selector label on mobile */
+  .years-label{display:none}
+  /* stat cards: 2 columns */
+  .stat-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .stat-val{font-size:1.2rem}
+  /* charts stack vertically */
+  .charts-row{flex-direction:column;gap:8px}
+  .chart-box{min-height:260px}
+  .chart-box.lag-box{flex:none!important;min-height:220px}
+  /* compare charts vertical */
+  .compare-charts-row{flex-direction:column}
+  /* tabs hidden on mobile (use bottom nav instead) */
+  .tabs{display:none}
+  /* pane padding smaller */
+  .single-wrap,.compare-wrap{padding:8px}
+  /* toast above botnav */
+  .toast{bottom:calc(var(--botnav-h) + 12px)}
+  /* topbar compact */
+  .topbar{padding:8px 12px}
+  .topbar h1{font-size:1rem}
+}
+@media (min-width:768px){
+  /* desktop: show sidebar, hide drawer+botnav */
+  .drawer-overlay,.drawer,.bottom-nav{display:none!important}
+}
+</style>
+</head>
+<body>
+
+<!-- Drawer overlay -->
+<div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
+
+<!-- Drawer (mobile stock list) -->
+<div class="drawer" id="drawer">
+  <div class="drawer-header">
+    <span style="font-weight:700;font-size:14px">股票清單 <span id="d-badge" style="font-size:11px;color:var(--mut)"></span></span>
+    <button class="drawer-close" onclick="closeDrawer()">✕</button>
+  </div>
+  <div class="drawer-content">
+    <div style="padding:8px">
+      <input class="search" id="search-drawer" placeholder="搜尋代號或名稱..." oninput="filterStocks('drawer')">
+      <div class="sort-bar" style="margin-top:6px">
+        <button class="sort-btn active" onclick="setSort('code',this)">代號</button>
+        <button class="sort-btn" onclick="setSort('bpct',this)">千張%</button>
+        <button class="sort-btn" onclick="setSort('chg',this)">週增減</button>
+        <button class="sort-btn" onclick="setSort('bp',this)">人數</button>
+      </div>
+    </div>
+    <div class="stock-count" id="stock-count-drawer" style="padding:0 8px 4px;font-size:10px;color:var(--mut)"></div>
+    <div class="stock-list" id="stock-list-drawer" style="flex:1;overflow-y:auto;padding:4px"></div>
+  </div>
+</div>
+
+<!-- Top bar -->
+<div class="topbar">
+  <!-- hamburger (mobile only) -->
+  <button class="icon-btn" id="drawer-btn" onclick="openDrawer()" style="margin-right:4px" aria-label="股票清單">
+    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+      <path d="M3 12h18M3 6h18M3 18h18"/>
+    </svg>
+  </button>
+  <h1 style="font-size:clamp(.9rem,3vw,1.1rem)">千張大戶</h1>
+  <span class="badge" id="stock-badge" style="white-space:nowrap">載入中...</span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)">
+    <span class="years-label">分析年數</span>
+    <select id="years-sel" class="years-sel" onchange="onYearsChange()">
+      <option value="1">1年</option>
+      <option value="2" selected>2年</option>
+      <option value="3">3年</option>
+      <option value="5">5年</option>
+    </select>
+  </div>
+</div>
+
+<!-- Layout -->
+<div class="layout">
+
+  <!-- Sidebar (desktop only) -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <input class="search" id="search" placeholder="搜尋代號或名稱..." oninput="filterStocks('sidebar')">
+      <div class="sort-bar">
+        <button class="sort-btn active" onclick="setSort('code',this)">代號</button>
+        <button class="sort-btn" onclick="setSort('bpct',this)">千張%</button>
+        <button class="sort-btn" onclick="setSort('chg',this)">週增減</button>
+        <button class="sort-btn" onclick="setSort('bp',this)">人數</button>
+      </div>
+      <div class="stock-count" id="stock-count"></div>
+    </div>
+    <div class="stock-list" id="stock-list">
+      <div class="loading"><div class="spinner"></div><span>載入股票清單...</span></div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('single')">個股分析</div>
+      <div class="tab" onclick="switchTab('compare')">對比分析 <span id="compare-count" style="font-size:10px;padding:1px 5px;background:var(--sur2);border-radius:8px;margin-left:4px"></span></div>
+      <div class="tab" onclick="switchTab('grade')">分級排行</div>
+    </div>
+
+    <!-- 個股 pane -->
+    <div class="pane active" id="pane-single">
+      <div class="single-wrap" id="single-wrap">
+        <div class="empty">
+          <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+            <path d="M3 3v18h18"/><path d="M7 16l4-4 4 4 4-7"/>
+          </svg>
+          <span>從左側清單選擇股票</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 對比 pane -->
+    <div class="pane" id="pane-compare">
+      <div class="compare-wrap">
+        <div class="compare-head">
+          <span style="color:var(--mut);font-size:12px;white-space:nowrap">已選股票：</span>
+          <div class="compare-chips" id="compare-chips">
+            <span style="color:var(--mut);font-size:11px;font-style:italic">點選股票右側 + 加入比較</span>
+          </div>
+          <select class="years-sel" id="compare-years" onchange="updateCompare()">
+            <option value="1">1 年</option>
+            <option value="2" selected>2 年</option>
+            <option value="3">3 年</option>
+          </select>
+          <button class="sort-btn" onclick="updateCompare()" style="padding:4px 12px">更新</button>
+        </div>
+        <div id="compare-body" style="flex:1;overflow:hidden;display:flex;flex-direction:column;gap:10px;min-height:0">
+          <div class="empty">
+            <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+              <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8M12 8v8"/>
+            </svg>
+            <span>尚無選擇股票</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 分級 pane -->
+    <div class="pane" id="pane-grade">
+      <div class="grade-wrap">
+
+        <!-- 進度條 -->
+        <div id="grade-progress-bar" style="display:none">
+          <div style="font-size:11px;color:var(--mut);margin-bottom:4px">
+            正在計算分級資料… <span id="gp-label"></span>
+          </div>
+          <div style="height:4px;background:var(--bor);border-radius:2px;overflow:hidden">
+            <div id="gp-fill" style="height:100%;background:var(--acc);width:0%;transition:width .5s;border-radius:2px"></div>
+          </div>
+        </div>
+
+        <!-- 控制列 -->
+        <div class="grade-controls">
+          <div class="grade-filter-row">
+            <span style="font-size:11px;color:var(--mut)">規模：</span>
+            <button class="gf-btn active" onclick="setGradeFilter('tier','',this)">全部</button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','mega',this)">🏢 超大型</button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','large',this)">🏗 大型</button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','mid',this)">🏬 中型</button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','small',this)">🏪 小型</button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','micro',this)">🏠 微型</button>
+          </div>
+          <div class="grade-filter-row" style="margin-top:4px">
+            <span style="font-size:11px;color:var(--mut)">等級：</span>
+            <button class="gf-btn active" onclick="setGradeFilter('grade','',this)">全部</button>
+            <button class="gf-btn grade-s" onclick="setGradeFilter('grade','S',this)">S 極高</button>
+            <button class="gf-btn grade-a" onclick="setGradeFilter('grade','A',this)">A 高</button>
+            <button class="gf-btn grade-b" onclick="setGradeFilter('grade','B',this)">B 中</button>
+            <button class="gf-btn grade-c" onclick="setGradeFilter('grade','C',this)">C 低</button>
+            <button class="gf-btn grade-d" onclick="setGradeFilter('grade','D',this)">D 極低</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
+            <input id="grade-search" class="search" placeholder="搜尋代號或名稱…"
+                   style="flex:1;min-width:120px;max-width:260px" oninput="loadGrading()">
+            <span id="grade-count" style="font-size:11px;color:var(--mut)"></span>
+            <button class="sort-btn" onclick="refreshGrading()" style="padding:4px 10px;margin-left:auto">
+              ↺ 重新計算
+            </button>
+          </div>
+        </div>
+
+        <!-- 分級結果 -->
+        <div id="grade-body" class="grade-body">
+          <div class="loading"><div class="spinner"></div><span>等待計算…</span></div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- Bottom navigation (mobile only) -->
+<nav class="bottom-nav" id="bottom-nav">
+  <button class="bnav-btn" id="bnav-list" onclick="openDrawer()">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+    </svg>
+    <span>清單</span>
+  </button>
+  <button class="bnav-btn active" id="bnav-single" onclick="switchTab('single')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M3 3v18h18"/><path d="M7 16l4-4 4 4 4-7"/>
+    </svg>
+    <span>個股</span>
+  </button>
+  <button class="bnav-btn" id="bnav-compare" onclick="switchTab('compare')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="8" height="18" rx="1"/><rect x="13" y="8" width="8" height="13" rx="1"/>
+    </svg>
+    <span>對比</span>
+    <span class="bnav-badge" id="bnav-badge" style="display:none"></span>
+  </button>
+  <button class="bnav-btn" id="bnav-grade" onclick="switchTab('grade')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+    </svg>
+    <span>分級</span>
+  </button>
+</nav>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────
+let allStocks = [];       // [{stock_id, stock_name, type}]
+let stockCache = {};      // id -> processed data
+let compareSel = [];      // list of stock_ids in compare
+let sortKey = 'code';
+let activeId = null;
+let activeYears = 2;
+
+const COLORS = ['#58a6ff','#3fb950','#f85149','#d29922','#c084fc','#79c0ff','#56d364','#ff7b72'];
+
+// ── Drawer (mobile) ──────────────────────────────────────────────────
+function openDrawer() {
+  document.getElementById('drawer').classList.add('open');
+  document.getElementById('drawer-overlay').classList.add('open');
+  document.getElementById('search-drawer').focus();
+}
+function closeDrawer() {
+  document.getElementById('drawer').classList.remove('open');
+  document.getElementById('drawer-overlay').classList.remove('open');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+(async () => {
+  await loadStockList();
+})();
+
+// ── Stock list ────────────────────────────────────────────────────────
+async function loadStockList() {
+  const r = await fetch('/api/stocks');
+  const j = await r.json();
+  allStocks = j.stocks;
+  const total = `${allStocks.length} 支`;
+  document.getElementById('stock-badge').textContent = total;
+  document.getElementById('d-badge').textContent = total;
+  renderList();
+}
+
+function filterStocks(src) {
+  renderList(src);
+}
+
+function setSort(key, btn) {
+  sortKey = key;
+  // sync all sort button groups
+  document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
+  if (btn) {
+    // activate same key in both sidebar and drawer
+    document.querySelectorAll('.sort-btn').forEach(b => {
+      if (b.textContent.trim() === btn.textContent.trim()) b.classList.add('active');
+    });
+  }
+  renderList();
+}
+
+function renderList(src) {
+  // gather query from whichever panel triggered
+  const qSidebar = (document.getElementById('search')?.value ?? '').trim().toUpperCase();
+  const qDrawer  = (document.getElementById('search-drawer')?.value ?? '').trim().toUpperCase();
+  const q = src === 'drawer' ? qDrawer : qSidebar;
+
+  // sync the other input
+  if (src === 'drawer' && document.getElementById('search'))
+    document.getElementById('search').value = document.getElementById('search-drawer').value;
+  if (src === 'sidebar' && document.getElementById('search-drawer'))
+    document.getElementById('search-drawer').value = document.getElementById('search').value;
+
+  const cnt = document.getElementById('stock-count');
+  const cntD = document.getElementById('stock-count-drawer');
+  const el  = document.getElementById('stock-list');
+  const elD = document.getElementById('stock-list-drawer');
+
+  let list = allStocks;
+  if (q) {
+    list = list.filter(s => s.stock_id.includes(q) || s.stock_name.includes(q));
+  }
+
+  // sort
+  if (sortKey === 'bpct') {
+    list = [...list].sort((a, b) => {
+      const av = stockCache[a.stock_id]?.latest?.bpct ?? -Infinity;
+      const bv = stockCache[b.stock_id]?.latest?.bpct ?? -Infinity;
+      return bv - av;
+    });
+  } else if (sortKey === 'chg') {
+    list = [...list].sort((a, b) => {
+      const av = stockCache[a.stock_id]?.latest?.bpct_chg ?? -Infinity;
+      const bv = stockCache[b.stock_id]?.latest?.bpct_chg ?? -Infinity;
+      return bv - av;
+    });
+  } else if (sortKey === 'bp') {
+    list = [...list].sort((a, b) => {
+      const av = stockCache[a.stock_id]?.latest?.bp ?? -Infinity;
+      const bv = stockCache[b.stock_id]?.latest?.bp ?? -Infinity;
+      return bv - av;
+    });
+  } else {
+    list = [...list].sort((a, b) => a.stock_id.localeCompare(b.stock_id));
+  }
+
+  const label = `${list.length} / ${allStocks.length} 支`;
+  if (cnt)  cnt.textContent  = `顯示 ${label}`;
+  if (cntD) cntD.textContent = `顯示 ${label}`;
+
+  const html = list.map(s => {
+    const d = stockCache[s.stock_id];
+    const inCmp = compareSel.includes(s.stock_id);
+    const isAct = s.stock_id === activeId;
+    let metricsHtml = '';
+    if (d && d.latest) {
+      const chg = d.latest.bpct_chg ?? 0;
+      const cls = chg > 0 ? 'pct-up' : chg < 0 ? 'pct-dn' : '';
+      const sign = chg > 0 ? '+' : '';
+      metricsHtml = `
+        <div class="stock-metrics">
+          <div class="pct-val ${cls}">${d.latest.bpct?.toFixed(1) ?? '—'}%</div>
+          <div class="pct-chg ${cls}">${sign}${chg.toFixed(2)}</div>
+        </div>`;
+    }
+    return `<div class="stock-item ${isAct ? 'active' : ''} ${inCmp && !isAct ? 'compare-sel' : ''}"
+              onclick="selectStock('${s.stock_id}')" id="si-${s.stock_id}">
+      <div class="stock-info">
+        <div class="stock-code">${s.stock_id}</div>
+        <div class="stock-name">${s.stock_name}</div>
+      </div>
+      ${metricsHtml}
+      <div class="add-compare ${inCmp ? 'added' : ''}"
+           onclick="toggleCompare(event,'${s.stock_id}')"
+           title="${inCmp ? '移出比較' : '加入比較'}">
+        ${inCmp ? '✓' : '+'}
+      </div>
+    </div>`;
+  }).join('');
+
+  if (el)  el.innerHTML  = html;
+  if (elD) elD.innerHTML = html;
+}
+
+// ── Select single stock ────────────────────────────────────────────────
+async function selectStock(sid) {
+  activeId = sid;
+  closeDrawer();           // close on mobile
+  switchTab('single');
+  renderList();
+
+  const wrap = document.getElementById('single-wrap');
+  wrap.innerHTML = `<div class="loading"><div class="spinner"></div><span>載入 ${sid} 資料中...</span></div>`;
+
+  let data = stockCache[sid];
+  if (!data) {
+    const years = document.getElementById('years-sel').value;
+    const r = await fetch(`/api/stock/${sid}?years=${years}`);
+    data = await r.json();
+    if (data.error) {
+      wrap.innerHTML = `<div class="empty">${data.error}</div>`;
+      return;
+    }
+    stockCache[sid] = data;
+    renderList();
+  }
+  renderSingle(data);
+}
+
+function onYearsChange() {
+  activeYears = parseInt(document.getElementById('years-sel').value);
+  if (activeId) {
+    delete stockCache[activeId];
+    selectStock(activeId);
+  }
+}
+
+// ── Render single stock ─────────────────────────────────────────────────
+function renderSingle(d) {
+  const l = d.latest;
+  const chg = l.bpct_chg ?? 0;
+  const chgCls = chg > 0 ? 'pct-up' : chg < 0 ? 'pct-dn' : '';
+  const sign = chg > 0 ? '+' : '';
+  const bpChg = l.bp_chg ?? 0;
+
+  document.getElementById('single-wrap').innerHTML = `
+    <div class="stat-row">
+      <div class="stat-card">
+        <div class="stat-label">千張大戶持股%</div>
+        <div class="stat-val ${chgCls}">${l.bpct?.toFixed(2) ?? '—'}%</div>
+        <div class="stat-sub ${chgCls}">${sign}${chg.toFixed(3)} pp 週增減</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">千張大戶人數</div>
+        <div class="stat-val">${l.bp?.toLocaleString() ?? '—'}</div>
+        <div class="stat-sub ${bpChg > 0 ? 'pct-up' : bpChg < 0 ? 'pct-dn' : ''}">${bpChg > 0 ? '+' : ''}${bpChg ?? 0} 人/週</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">週收盤價</div>
+        <div class="stat-val" style="color:var(--blu)">${l.close?.toFixed(0) ?? '—'}</div>
+        <div class="stat-sub">${d.stock_id} ${d.stock_name}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">資料期間</div>
+        <div class="stat-val" style="font-size:1rem">${d.weeks} 週</div>
+        <div class="stat-sub">截至 ${l.date}</div>
+      </div>
+    </div>
+    <div class="charts-row">
+      <div class="chart-box" style="flex:2">
+        <div class="chart-title">${d.stock_id} ${d.stock_name}｜千張大戶持股% + 收盤價</div>
+        <div id="chart-main" style="height:calc(100% - 32px)"></div>
+      </div>
+      <div class="chart-box lag-box">
+        <div class="chart-title">Lead-Lag 分析（千張增減 → N週後報酬）</div>
+        <div id="chart-lag" style="height:calc(100% - 32px)"></div>
+      </div>
+    </div>`;
+
+  plotMain(d);
+  plotLag(d);
+}
+
+// ── Plotly: main dual-axis ─────────────────────────────────────────────
+const PLY = {paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+             font:{color:'#8b949e',size:11}, margin:{t:10,r:60,b:40,l:50},
+             xaxis:{gridcolor:'#21262d',zeroline:false},
+             showlegend:true, legend:{bgcolor:'transparent',font:{size:10}}};
+
+function plotMain(d) {
+  const dates = d.history.map(r => r.date);
+  const bpct  = d.history.map(r => r.bpct);
+  const close = d.history.map(r => r.close);
+  const bpchg = d.history.map(r => r.bpct_chg ?? 0);
+
+  const t1 = {x:dates, y:bpct,  name:'千張大戶%', type:'scatter', mode:'lines',
+              line:{color:'#3fb950',width:2}, yaxis:'y', fill:'tozeroy',
+              fillcolor:'rgba(63,185,80,.1)'};
+  const t2 = {x:dates, y:close, name:'收盤價',    type:'scatter', mode:'lines',
+              line:{color:'#58a6ff',width:1.5}, yaxis:'y2'};
+  const t3 = {x:dates, y:bpchg, name:'週增減', type:'bar',
+              marker:{color:bpchg.map(v => v >= 0 ? 'rgba(63,185,80,.6)' : 'rgba(248,81,73,.6)')},
+              yaxis:'y3', visible:'legendonly'};
+
+  const layout = {
+    ...PLY,
+    yaxis: {title:'千張大戶%', gridcolor:'#21262d', zeroline:false, titlefont:{color:'#3fb950'}},
+    yaxis2:{title:'收盤價', overlaying:'y', side:'right', gridcolor:'transparent',
+            zeroline:false, titlefont:{color:'#58a6ff'}},
+    yaxis3:{overlaying:'y', side:'right', showgrid:false, showticklabels:false, zeroline:true,
+            zerolinecolor:'#30363d'},
+    hovermode:'x unified',
+  };
+  Plotly.newPlot('chart-main', [t1, t2, t3], layout, {responsive:true, displayModeBar:false});
+}
+
+// ── Plotly: lead-lag bar ───────────────────────────────────────────────
+function plotLag(d) {
+  const lags  = d.lag_analysis;
+  const x     = lags.map(l => l.label);
+  const y     = lags.map(l => l.r);
+  const clrs  = y.map((v, i) => lags[i].sig ? (v > 0 ? '#3fb950' : '#f85149') : '#30363d');
+  const text  = lags.map(l => l.sig ? '★' : '');
+
+  Plotly.newPlot('chart-lag', [{
+    type:'bar', x, y, text, textposition:'outside',
+    marker:{color:clrs},
+    hovertemplate:'%{x}<br>r = %{y:.3f}<extra></extra>',
+  }], {
+    ...PLY, margin:{t:10,r:20,b:70,l:50},
+    xaxis:{tickangle:-40, gridcolor:'transparent', tickfont:{size:9}},
+    yaxis:{range:[-0.7,0.7], gridcolor:'#21262d', zeroline:true, zerolinecolor:'#30363d'},
+    shapes:[{type:'line', x0:-0.5, x1:lags.length-0.5, y0:0, y1:0,
+             line:{color:'#30363d',width:1}}],
+    annotations:[{text:'★ = p<0.05', xref:'paper', yref:'paper',
+                  x:0.98, y:0.98, xanchor:'right', showarrow:false,
+                  font:{color:'#d29922',size:10}}],
+    showlegend:false,
+  }, {responsive:true, displayModeBar:false});
+}
+
+// ── Compare ────────────────────────────────────────────────────────────
+function toggleCompare(e, sid) {
+  e.stopPropagation();
+  const idx = compareSel.indexOf(sid);
+  if (idx >= 0) {
+    compareSel.splice(idx, 1);
+  } else {
+    if (compareSel.length >= 8) { showToast('最多比較 8 支股票', true); return; }
+    compareSel.push(sid);
+  }
+  updateCompareCount();
+  renderList();
+  if (document.getElementById('pane-compare').classList.contains('active')) {
+    updateCompare();
+  }
+}
+
+function updateCompareCount() {
+  const n = compareSel.length;
+  const el = document.getElementById('compare-count');
+  if (el) el.textContent = n > 0 ? n : '';
+  // bottom nav badge
+  const badge = document.getElementById('bnav-badge');
+  if (badge) {
+    badge.textContent = n;
+    badge.style.display = n > 0 ? '' : 'none';
+  }
+}
+
+function removeFromCompare(sid) {
+  const idx = compareSel.indexOf(sid);
+  if (idx >= 0) compareSel.splice(idx, 1);
+  updateCompareCount();
+  renderList();
+  renderCompareChips();
+  updateCompare();
+}
+
+function renderCompareChips() {
+  const el = document.getElementById('compare-chips');
+  if (compareSel.length === 0) {
+    el.innerHTML = '<span style="color:var(--mut);font-size:11px;font-style:italic">點選股票右側 + 加入比較</span>';
+    return;
+  }
+  el.innerHTML = compareSel.map((sid, i) => {
+    const s = allStocks.find(x => x.stock_id === sid);
+    const name = s ? s.stock_name : sid;
+    const color = COLORS[i % COLORS.length];
+    return `<span class="chip" style="border-color:${color}40">
+      <span style="color:${color};font-weight:700">${sid}</span>
+      <span style="color:var(--mut)">${name}</span>
+      <span class="chip-rm" onclick="removeFromCompare('${sid}')">×</span>
+    </span>`;
+  }).join('');
+}
+
+async function updateCompare() {
+  renderCompareChips();
+  const body = document.getElementById('compare-body');
+  if (compareSel.length === 0) {
+    body.innerHTML = `<div class="empty">
+      <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8M12 8v8"/>
+      </svg><span>尚無選擇股票</span></div>`;
+    return;
+  }
+
+  body.innerHTML = '<div class="loading"><div class="spinner"></div><span>載入比較資料...</span></div>';
+  const years = document.getElementById('compare-years').value;
+
+  const r = await fetch('/api/compare', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({stocks: compareSel, years: parseInt(years)})
+  });
+  const j = await r.json();
+
+  if (!j.stocks || j.stocks.length === 0) {
+    body.innerHTML = '<div class="empty">無法取得比較資料</div>';
+    return;
+  }
+
+  body.innerHTML = `
+    <div class="compare-charts-row" style="flex:1;min-height:0">
+      <div class="chart-box" style="flex:1">
+        <div class="chart-title">標準化股價（= 100 at 起始）</div>
+        <div id="cmp-price" style="height:calc(100% - 32px)"></div>
+      </div>
+      <div class="chart-box" style="flex:1">
+        <div class="chart-title">千張大戶持股%</div>
+        <div id="cmp-bpct" style="height:calc(100% - 32px)"></div>
+      </div>
+    </div>
+    <div class="compare-table-wrap">
+      <table class="ctable" id="cmp-table"></table>
+    </div>`;
+
+  plotCompare(j.stocks);
+}
+
+function plotCompare(stocks) {
+  const traces_price = [], traces_bpct = [];
+  stocks.forEach((s, i) => {
+    const color = COLORS[i % COLORS.length];
+    const dates = s.rows.map(r => r.date);
+    traces_price.push({
+      x: dates, y: s.rows.map(r => r.norm), name: `${s.stock_id} ${s.stock_name}`,
+      type:'scatter', mode:'lines', line:{color, width:2},
+      hovertemplate:'%{x}<br>%{y:.1f}<extra>' + s.stock_id + '</extra>',
+    });
+    traces_bpct.push({
+      x: dates, y: s.rows.map(r => r.bpct), name: `${s.stock_id} ${s.stock_name}`,
+      type:'scatter', mode:'lines', line:{color, width:2},
+      hovertemplate:'%{x}<br>%{y:.2f}%<extra>' + s.stock_id + '</extra>',
+    });
+  });
+
+  const commonLayout = {...PLY, hovermode:'x unified',
+                        legend:{bgcolor:'transparent',font:{size:10},orientation:'h',y:-0.15}};
+  Plotly.newPlot('cmp-price', traces_price, {
+    ...commonLayout,
+    yaxis:{gridcolor:'#21262d', zeroline:false, title:'標準化價格'},
+    shapes:[{type:'line',x0:0,x1:1,xref:'paper',y0:100,y1:100,
+             line:{color:'#30363d',width:1,dash:'dot'}}],
+  }, {responsive:true, displayModeBar:false});
+
+  Plotly.newPlot('cmp-bpct', traces_bpct, {
+    ...commonLayout,
+    yaxis:{gridcolor:'#21262d', zeroline:false, title:'千張大戶%'},
+  }, {responsive:true, displayModeBar:false});
+
+  // Table
+  const tbl = document.getElementById('cmp-table');
+  tbl.innerHTML = `<tr>
+    <th style="text-align:left">代號</th><th>名稱</th><th>千張大戶%</th>
+    <th>週增減pp</th><th>人數</th><th>收盤價</th><th>期間漲跌%</th>
+  </tr>` + stocks.map((s, i) => {
+    const color = COLORS[i % COLORS.length];
+    const first = s.rows[0]?.close ?? 0;
+    const last  = s.rows.at(-1)?.close ?? 0;
+    const perf  = first > 0 ? ((last - first) / first * 100).toFixed(1) : '—';
+    const perfCls = parseFloat(perf) > 0 ? 'pct-up' : parseFloat(perf) < 0 ? 'pct-dn' : '';
+    const lastR = s.rows.at(-1) ?? {};
+    const chg = lastR.pct_chg ?? 0;
+    const chgCls = chg > 0 ? 'pct-up' : chg < 0 ? 'pct-dn' : '';
+    return `<tr>
+      <td><span style="color:${color};font-weight:700">${s.stock_id}</span></td>
+      <td style="text-align:left;color:var(--mut)">${s.stock_name}</td>
+      <td>${s.latest_bpct?.toFixed(2) ?? '—'}%</td>
+      <td class="${chgCls}">${chg > 0 ? '+' : ''}${chg.toFixed(3)}</td>
+      <td>${lastR.bp?.toLocaleString() ?? '—'}</td>
+      <td style="color:var(--blu)">${s.latest_close?.toFixed(0) ?? '—'}</td>
+      <td class="${perfCls}">${chg >= 0 ? '+' : ''}${perf}%</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Tab switch ─────────────────────────────────────────────────────────
+function switchTab(name) {
+  // desktop tabs
+  const tabNames = ['single','compare','grade'];
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    t.classList.toggle('active', tabNames[i] === name);
+  });
+  // panes
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.getElementById(`pane-${name}`).classList.add('active');
+  // bottom nav
+  document.querySelectorAll('.bnav-btn').forEach(b => b.classList.remove('active'));
+  const navBtn = document.getElementById(`bnav-${name}`);
+  if (navBtn) navBtn.classList.add('active');
+
+  if (name === 'compare') {
+    renderCompareChips();
+    if (compareSel.length > 0) updateCompare();
+  }
+  if (name === 'grade') {
+    loadGrading();
+    // start polling if grading is running
+    fetch('/api/grading/status').then(r => r.json()).then(s => {
+      if (s.running && !gradePolling) {
+        gradePolling = setInterval(pollGradingProgress, 3000);
+      }
+    });
+  }
+  setTimeout(() => Plotly.Plots.resize(), 80);
+}
+
+// ── Toast ──────────────────────────────────────────────────────────────
+function showToast(msg, err=false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (err ? ' err' : '') + ' show';
+  setTimeout(() => { t.className = 'toast' + (err ? ' err' : ''); }, 3000);
+}
+
+// ─── GRADING ────────────────────────────────────────────────────────────
+let gradeFilterTier  = '';
+let gradeFilterGrade = '';
+let gradeSortKey     = 'volatility';
+let gradeSortAsc     = false;
+let gradePolling     = null;
+
+function setGradeFilter(type, val, btn) {
+  if (type === 'tier')  gradeFilterTier  = val;
+  if (type === 'grade') gradeFilterGrade = val;
+  // activate button in the right group
+  btn.closest('.grade-filter-row').querySelectorAll('.gf-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadGrading();
+}
+
+async function loadGrading() {
+  const q = document.getElementById('grade-search')?.value ?? '';
+  const url = `/api/grading?tier=${gradeFilterTier}&grade=${gradeFilterGrade}&q=${encodeURIComponent(q)}`;
+  const r   = await fetch(url);
+  const j   = await r.json();
+  renderGrading(j);
+}
+
+function renderGrading(j) {
+  const body = document.getElementById('grade-body');
+  document.getElementById('grade-count').textContent =
+    `${j.total.toLocaleString()} / ${j.ready.toLocaleString()} 支`;
+
+  if (!j.tiers || j.tiers.length === 0) {
+    body.innerHTML = '<div class="empty" style="padding:40px"><span>尚無分級資料，請稍候…</span></div>';
+    return;
+  }
+
+  const tierClsMap = {mega:'tb-mega',large:'tb-large',mid:'tb-mid',small:'tb-small',micro:'tb-micro'};
+  const gradeClr   = {S:'#ef4444',A:'#f97316',B:'#eab308',C:'#60a5fa',D:'#6b7280'};
+  const gradeLbl   = {S:'極高波動',A:'高波動',B:'中波動',C:'低波動',D:'極低波動'};
+
+  // compute max volatility for bar scaling
+  let maxVol = 0;
+  j.tiers.forEach(t => t.stocks.forEach(s => { if (s.volatility > maxVol) maxVol = s.volatility; }));
+
+  body.innerHTML = j.tiers.map(tier => {
+    const rows = [...tier.stocks].sort((a, b) =>
+      gradeSortAsc ? (a[gradeSortKey]??0)-(b[gradeSortKey]??0)
+                   : (b[gradeSortKey]??0)-(a[gradeSortKey]??0)
+    );
+
+    const tableRows = rows.map(s => {
+      const barW = maxVol > 0 ? Math.min(60, s.volatility / maxVol * 60) : 2;
+      const bpChg = s.bpct_chg ?? 0;
+      const chgCls = bpChg > 0 ? 'pct-up' : bpChg < 0 ? 'pct-dn' : '';
+      const cap = s.market_cap_億 >= 10000
+        ? `${(s.market_cap_億/10000).toFixed(1)}兆`
+        : `${Math.round(s.market_cap_億).toLocaleString()}億`;
+      return `<tr onclick="selectStock('${s.stock_id}')" style="cursor:pointer">
+        <td><a style="color:var(--blu);font-weight:700;font-family:monospace">${s.stock_id}</a></td>
+        <td style="max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.stock_name}</td>
+        <td style="text-align:center">
+          <span class="gbadge gb-${s.grade}" title="${gradeLbl[s.grade]}">${s.grade}</span>
+        </td>
+        <td>
+          <span style="display:inline-block;width:${barW}px;height:6px;border-radius:3px;background:${gradeClr[s.grade]??'#888'};opacity:.8;vertical-align:middle;margin-right:4px"></span>
+          ${s.volatility.toFixed(3)}
+        </td>
+        <td>${cap}</td>
+        <td style="color:var(--acc)">${s.latest_bpct?.toFixed(1)??'—'}%</td>
+        <td class="${chgCls}">${bpChg>=0?'+':''}${(bpChg??0).toFixed(3)}</td>
+        <td>${s.latest_bp?.toLocaleString()??'—'}</td>
+        <td style="color:var(--blu)">${s.latest_price?.toFixed(0)??'—'}</td>
+      </tr>`;
+    }).join('');
+
+    const thSort = (key, label) => {
+      const active = gradeSortKey === key;
+      const arrow  = active ? (gradeSortAsc ? '↑' : '↓') : '';
+      return `<th onclick="gradeSort('${key}')" style="${active?'color:var(--acc)':''}">${label} ${arrow}</th>`;
+    };
+
+    return `<div class="tier-section" id="ts-${tier.key}">
+      <div class="tier-header" onclick="toggleTier('${tier.key}')">
+        <span>${tier.icon}</span>
+        <span class="tier-header-title">${tier.label}</span>
+        <span class="tier-cnt">${tier.count} 支</span>
+        <span class="tier-toggle">▾</span>
+      </div>
+      <div class="grade-table-wrap">
+        <table class="gtable">
+          <thead><tr>
+            ${thSort('stock_id','代號')}
+            <th>名稱</th>
+            ${thSort('grade','等級')}
+            ${thSort('volatility','大戶波動度')}
+            ${thSort('market_cap_億','市值')}
+            ${thSort('latest_bpct','千張大戶%')}
+            ${thSort('bpct_chg','週增減')}
+            ${thSort('latest_bp','人數')}
+            ${thSort('latest_price','股價')}
+          </tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function gradeSort(key) {
+  if (gradeSortKey === key) gradeSortAsc = !gradeSortAsc;
+  else { gradeSortKey = key; gradeSortAsc = false; }
+  loadGrading();
+}
+
+function toggleTier(key) {
+  document.getElementById(`ts-${key}`)?.classList.toggle('collapsed');
+}
+
+async function pollGradingProgress() {
+  const r = await fetch('/api/grading/status');
+  const s = await r.json();
+  const bar  = document.getElementById('grade-progress-bar');
+  const fill = document.getElementById('gp-fill');
+  const lbl  = document.getElementById('gp-label');
+
+  if (s.running) {
+    if (bar) bar.style.display = '';
+    if (fill) fill.style.width = `${s.pct}%`;
+    if (lbl)  lbl.textContent  = `${s.done} / ${s.total} (${s.pct}%)`;
+    loadGrading();
+  } else {
+    if (bar) bar.style.display = 'none';
+    if (s.ready > 0) loadGrading();
+    clearInterval(gradePolling);
+    gradePolling = null;
+  }
+}
+
+async function refreshGrading() {
+  const r = await fetch('/api/grading/refresh', {method:'POST'});
+  const j = await r.json();
+  showToast(j.message);
+  if (j.ok && !gradePolling) {
+    gradePolling = setInterval(pollGradingProgress, 3000);
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    import os
+    port = int(os.getenv("PORT", PORT))
+    uvicorn.run("big_holder_web:app", host="0.0.0.0", port=port, reload=False)
