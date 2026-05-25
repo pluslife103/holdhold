@@ -746,13 +746,11 @@ def api_broker_trader(
         raise HTTPException(500, "未設定 FINMIND_TOKEN")
     try:
         r = requests.get(
-            FINMIND_BASE,
+            "https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report",
+            headers={"Authorization": f"Bearer {token}"},
             params={
-                "dataset":              "TaiwanStockTradingDailyReport",
                 "securities_trader_id": trader_id,
-                "start_date":           date,
-                "end_date":             date,
-                "token":                token,
+                "date":                 date,
             },
             timeout=25,
         )
