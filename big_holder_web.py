@@ -663,20 +663,21 @@ def api_broker(
     RETAIL = 1_000_000
     processed = []
     for row in rows_raw:
-        buy      = float(row.get("buy", 0) or 0)
-        sell     = float(row.get("sell", 0) or 0)
-        buy_px   = float(row.get("buy_price", 0) or 0)
-        sell_px  = float(row.get("sell_price", 0) or 0)
-        buy_amt  = buy * 1000 * buy_px
-        sell_amt = sell * 1000 * sell_px
+        buy_shares  = float(row.get("buy", 0) or 0)   # 股
+        sell_shares = float(row.get("sell", 0) or 0)  # 股
+        px          = float(row.get("price", 0) or 0) # 每股價格
+        buy_lots    = buy_shares / 1000                # 轉換為張
+        sell_lots   = sell_shares / 1000
+        buy_amt     = buy_shares * px                  # 金額 NTD
+        sell_amt    = sell_shares * px
         processed.append({
-            "broker_id":   row.get("broker_id", ""),
-            "broker_name": row.get("broker_name", ""),
-            "buy":         int(buy),
-            "sell":        int(sell),
-            "net":         int(buy - sell),
-            "buy_price":   round(buy_px, 2),
-            "sell_price":  round(sell_px, 2),
+            "broker_id":   row.get("securities_trader_id", ""),
+            "broker_name": row.get("securities_trader", ""),
+            "buy":         int(buy_lots),
+            "sell":        int(sell_lots),
+            "net":         int(buy_lots - sell_lots),
+            "buy_price":   round(px, 2),
+            "sell_price":  round(px, 2),
             "buy_amount":  round(buy_amt),
             "sell_amount": round(sell_amt),
             "is_retail":   buy_amt < RETAIL and sell_amt < RETAIL,
@@ -689,8 +690,6 @@ def api_broker(
         "stock_id":   stock_id,
         "stock_name": rows_raw[0].get("stock_name", stock_id),
         "date":       date,
-        "_debug_keys": list(rows_raw[0].keys()),
-        "_debug_first": rows_raw[0],
         "rows":       processed,
         "summary": {
             "total":        len(processed),
