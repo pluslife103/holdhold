@@ -5,9 +5,6 @@ on:
   schedule:
     - cron: '0 22 * * 1-5'  # 22:00 UTC = 台灣時間隔天 06:00，美股收盤後 2 小時
 
-permissions:
-  contents: write
-
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -27,10 +24,14 @@ jobs:
         working-directory: us-stocks-screener
         run: python backfill.py
 
-      - name: Commit & push updated DB
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add us-stocks-screener/data/history.db
-          git commit -m "data: update stocks $(date +%Y-%m-%d)" || echo "no changes"
-          git push
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Deploy to Vercel
+        working-directory: us-stocks-screener
+        run: npx vercel deploy --prod --token ${{ secrets.VERCEL_TOKEN }} --yes
+        env:
+          VERCEL_ORG_ID: team_CvHKBdrRcWNPvRlwdU5FeKw1
+          VERCEL_PROJECT_ID: prj_dfftdyMBEeZIDRgLSbLALTVcPTdO
