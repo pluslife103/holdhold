@@ -896,6 +896,20 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
     return processed
 
 
+def _fetch_price_range(stock_id: str, start: str, end: str) -> dict:
+    """Fetch daily close+volume for one stock over a date range. Returns {date_str: {close, volume}}."""
+    df = _fm("TaiwanStockPrice", stock_id, start, end)
+    price_map: dict = {}
+    if not df.empty:
+        for _, pr in df.iterrows():
+            d_str = str(pr.get("date", ""))[:10]
+            price_map[d_str] = {
+                "close":  float(pr.get("close", 0) or 0),
+                "volume": round(float(pr.get("Trading_Volume", 0) or 0) / 1000),
+            }
+    return price_map
+
+
 @app.get("/api/multi_timeline")
 def api_multi_timeline(
     stocks: str = Query(""),
@@ -924,33 +938,77 @@ def api_multi_timeline(
         d += td(days=1)
 
     THOLD = 8_000_000
-    raw: dict = {s: {} for s in stock_list}
+    raw: dict       = {s: {} for s in stock_list}
+    price_raw: dict = {s: {} for s in stock_list}
+
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(_fetch_broker_day, token, s, dt): (s, dt)
-                for s in stock_list for dt in dates}
-        for fut in as_completed(futs):
-            sid, dt = futs[fut]
+        broker_futs = {ex.submit(_fetch_broker_day, token, s, dt): (s, dt)
+                       for s in stock_list for dt in dates}
+        price_futs  = {ex.submit(_fetch_price_range, s, start_d.isoformat(), end_d.isoformat()): s
+                       for s in stock_list}
+        for fut in as_completed(broker_futs):
+            sid, dt = broker_futs[fut]
             raw[sid][dt] = fut.result()
+        for fut in as_completed(price_futs):
+            sid = price_futs[fut]
+            try:
+                price_raw[sid] = fut.result()
+            except Exception:
+                price_raw[sid] = {}
 
     output = []
     for stock_id in stock_list:
         timeline = []
         for dt in sorted(dates):
             rows = raw[stock_id].get(dt, [])
-            bs = ss = 0
+            bs = ss = rb = rs = 0
             for row in rows:
-                bs += int(row.get("buy_amount",  0) // THOLD)
-                ss += int(row.get("sell_amount", 0) // THOLD)
-            timeline.append({"date": dt, "buy_score": bs, "sell_score": ss, "net_score": bs - ss})
+                if row.get("is_retail"):
+                    rb += row.get("buy",  0)
+                    rs += row.get("sell", 0)
+                else:
+                    bs += int(row.get("buy_amount",  0) // THOLD)
+                    ss += int(row.get("sell_amount", 0) // THOLD)
+            pm = price_raw[stock_id].get(dt, {})
+            timeline.append({
+                "date":        dt,
+                "buy_score":   bs,
+                "sell_score":  ss,
+                "net_score":   bs - ss,
+                "retail_buy":  rb,
+                "retail_sell": rs,
+                "close":       pm.get("close",  0),
+                "volume":      pm.get("volume", 0),
+            })
+
+        # Drop trailing all-zero dates
+        while timeline and not any([
+            timeline[-1]["buy_score"], timeline[-1]["sell_score"],
+            timeline[-1]["retail_buy"], timeline[-1]["retail_sell"],
+            timeline[-1]["close"],
+        ]):
+            timeline.pop()
+
         total_buy  = sum(t["buy_score"]  for t in timeline)
         total_sell = sum(t["sell_score"] for t in timeline)
+
+        closes = [t["close"] for t in timeline if t["close"] > 0]
+        latest_close  = closes[-1]               if closes          else 0
+        prev_close    = closes[-2]               if len(closes) > 1 else 0
+        price_chg_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
+
         output.append({
-            "stock_id":   stock_id,
-            "timeline":   timeline,
-            "total_buy":  total_buy,
-            "total_sell": total_sell,
-            "total_net":  total_buy - total_sell,
+            "stock_id":          stock_id,
+            "timeline":          timeline,
+            "total_buy":         total_buy,
+            "total_sell":        total_sell,
+            "total_net":         total_buy - total_sell,
+            "total_retail_buy":  sum(t["retail_buy"]  for t in timeline),
+            "total_retail_sell": sum(t["retail_sell"] for t in timeline),
+            "latest_close":      latest_close,
+            "price_chg_pct":     price_chg_pct,
         })
+
     output.sort(key=lambda x: -(x["total_buy"] + x["total_sell"]))
     return {"results": output, "dates": sorted(dates)}
 
@@ -2501,23 +2559,113 @@ function renderOverviewGrid() {
     const net      = item.total_net;
     const netColor = net > 0 ? '#f85149' : net < 0 ? '#3fb950' : '#8b949e';
     const netStr   = net > 0 ? '+'+net : ''+net;
-    const spark    = _miniSpark(item.timeline, 188, 50);
+    const closeStr = item.latest_close > 0 ? item.latest_close.toFixed(1) : '—';
+    const chgPct   = item.price_chg_pct || 0;
+    const chgColor = chgPct > 0 ? '#f85149' : chgPct < 0 ? '#3fb950' : '#8b949e';
+    const chgSign  = chgPct > 0 ? '+' : '';
+    const rBuy     = item.total_retail_buy  || 0;
+    const rSell    = item.total_retail_sell || 0;
+    const spark    = _ovSpark(item.timeline, 188);
     return `<div class="ov-card" onclick="jumpToTimeline('${item.stock_id}')">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">
         <div>
           <span style="font-weight:700;font-size:13px">${item.stock_id}</span>
           <span style="font-size:10px;color:var(--mut);margin-left:4px">${name}</span>
         </div>
-        <span style="font-size:13px;font-weight:700;color:${netColor}">${netStr}</span>
+        <span style="font-size:12px;font-weight:700;color:${netColor}">${netStr}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:4px">
+        <span style="color:var(--blu)">${closeStr}</span>
+        <span style="color:${chgColor}">${chgSign}${chgPct}%</span>
       </div>
       ${spark}
       <div style="display:flex;justify-content:space-between;font-size:10px;margin-top:4px">
-        <span style="color:#f85149">買 +${item.total_buy}</span>
-        <span style="color:#3fb950">賣 -${item.total_sell}</span>
+        <span style="color:var(--mut)">主 <span style="color:#f85149">+${item.total_buy}</span><span style="color:#3fb950"> -${item.total_sell}</span></span>
+        <span style="color:var(--mut)">散 <span style="color:#f85149">+${rBuy}</span><span style="color:#3fb950"> -${rSell}</span></span>
       </div>
     </div>`;
   }).join('');
   document.getElementById('overview-grid').innerHTML = cards || '<div class="empty" style="grid-column:1/-1">無大戶活動資料</div>';
+}
+
+function _ovSpark(timeline, w) {
+  const pH = 34, iH = 48, rH = 28, gap = 2;
+  const h  = pH + gap + iH + gap + rH;
+  if (!timeline || !timeline.length) {
+    return `<svg width="${w}" height="${h}" style="display:block;border-radius:3px">
+      <rect width="${w}" height="${h}" fill="#161b22"/></svg>`;
+  }
+  const n    = timeline.length;
+  const barW = Math.max(2, Math.floor((w - n) / n));
+  const iY0  = pH + gap;
+  const rY0  = iY0 + iH + gap;
+  const iMid = iY0 + Math.floor(iH / 2);
+  const rMid = rY0 + Math.floor(rH / 2);
+
+  const closes  = timeline.map(d => d.close  || 0);
+  const volumes = timeline.map(d => d.volume || 0);
+  const hasPx   = closes.some(c => c > 0);
+  const hasVol  = volumes.some(v => v > 0);
+  const maxI    = Math.max(...timeline.map(d => Math.max(d.buy_score || 0, d.sell_score || 0)), 1);
+  const maxR    = Math.max(...timeline.map(d => Math.max(d.retail_buy || 0, d.retail_sell || 0)), 1);
+  const hasR    = timeline.some(d => (d.retail_buy || 0) + (d.retail_sell || 0) > 0);
+
+  let s = '';
+
+  // Volume bars (bottom of price panel)
+  if (hasVol) {
+    const maxV = Math.max(...volumes, 1);
+    timeline.forEach((d, i) => {
+      const x  = i * (barW + 1);
+      const vH = Math.round((d.volume || 0) / maxV * (pH * 0.55));
+      if (vH > 0) s += `<rect x="${x}" y="${pH - vH}" width="${barW}" height="${vH}" fill="rgba(88,166,255,0.22)"/>`;
+    });
+  }
+
+  // Price line
+  if (hasPx) {
+    const vv  = closes.filter(c => c > 0);
+    const mn  = Math.min(...vv), mx = Math.max(...vv);
+    const rng = mx - mn || 1;
+    const pts = timeline.map((d, i) => {
+      const x = (i * (barW + 1) + barW / 2).toFixed(1);
+      const y = (pH - 3 - ((d.close || mn) - mn) / rng * (pH - 8)).toFixed(1);
+      return `${x},${y}`;
+    }).join(' ');
+    s += `<polyline points="${pts}" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+
+  // Big player bars
+  timeline.forEach((d, i) => {
+    const x  = i * (barW + 1);
+    const bH = Math.round((d.buy_score  || 0) / maxI * (iH / 2 - 3));
+    const sH = Math.round((d.sell_score || 0) / maxI * (iH / 2 - 3));
+    if (bH > 0) s += `<rect x="${x}" y="${iMid - bH}" width="${barW}" height="${bH}" fill="rgba(248,81,73,0.85)"/>`;
+    if (sH > 0) s += `<rect x="${x}" y="${iMid}" width="${barW}" height="${sH}" fill="rgba(63,185,80,0.85)"/>`;
+  });
+
+  // Retail bars
+  if (hasR) {
+    timeline.forEach((d, i) => {
+      const x  = i * (barW + 1);
+      const bH = Math.round((d.retail_buy  || 0) / maxR * (rH / 2 - 2));
+      const sH = Math.round((d.retail_sell || 0) / maxR * (rH / 2 - 2));
+      if (bH > 0) s += `<rect x="${x}" y="${rMid - bH}" width="${barW}" height="${bH}" fill="rgba(248,81,73,0.45)"/>`;
+      if (sH > 0) s += `<rect x="${x}" y="${rMid}" width="${barW}" height="${sH}" fill="rgba(63,185,80,0.45)"/>`;
+    });
+  }
+
+  return `<svg width="${w}" height="${h}" style="display:block;border-radius:3px">
+    <rect width="${w}" height="${h}" fill="#161b22"/>
+    <line x1="0" y1="${iY0 - 1}" x2="${w}" y2="${iY0 - 1}" stroke="#21262d" stroke-width="1"/>
+    <line x1="0" y1="${iMid}" x2="${w}" y2="${iMid}" stroke="#30363d" stroke-width="0.5"/>
+    <line x1="0" y1="${rY0 - 1}" x2="${w}" y2="${rY0 - 1}" stroke="#21262d" stroke-width="1"/>
+    <line x1="0" y1="${rMid}" x2="${w}" y2="${rMid}" stroke="#30363d" stroke-width="0.5"/>
+    ${s}
+    <text x="2" y="${pH - 2}" font-size="7" fill="#444c56">量</text>
+    <text x="2" y="${iY0 + 9}" font-size="7" fill="#444c56">主力</text>
+    <text x="2" y="${rY0 + 9}" font-size="7" fill="#444c56">散戶</text>
+  </svg>`;
 }
 
 function _miniSpark(timeline, w, h) {
