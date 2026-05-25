@@ -647,11 +647,12 @@ def api_broker(
     try:
         j = r.json()
     except Exception:
-        raise HTTPException(502, f"FinMind 回應無法解析 (HTTP {r.status_code})")
+        raise HTTPException(502, f"FinMind 回應無法解析 (HTTP {r.status_code}): {r.text[:200]}")
 
     if r.status_code != 200 or j.get("status") not in (200, None):
         msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
-        raise HTTPException(502, f"FinMind: {msg}")
+        # 回傳完整 JSON 供除錯（不含 token）
+        raise HTTPException(502, f"FinMind error: {msg} | raw: {json.dumps(j, ensure_ascii=False)[:300]}")
 
     rows_raw = j.get("data", [])
     if not rows_raw:
