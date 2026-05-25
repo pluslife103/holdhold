@@ -143,15 +143,57 @@ _STOCK_MAP: dict[str, str] = {}   # id -> name
 
 
 def _load_stocks() -> None:
+    """取得上市+上櫃所有股票清單。FinMind TaiwanStockInfo 無分頁，一次回傳全部。
+    若回傳數量偏少（雲端環境有時發生），改用 TWSE/TPEX 官方 API 補足。"""
     global _STOCKS, _STOCK_MAP
+
     df = _fm("TaiwanStockInfo")
-    if df.empty:
-        return
-    df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
-    df = df[["stock_id", "stock_name", "type"]].drop_duplicates("stock_id")
+    if not df.empty:
+        df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
+        df = df[["stock_id", "stock_name", "type"]].drop_duplicates("stock_id")
+
+    # 若取得數量異常少，改從 TWSE/TPEX 官方 API 取
+    if len(df) < 1000:
+        print(f"  ⚠ FinMind 只回傳 {len(df)} 筆，改用 TWSE/TPEX 官方 API...")
+        df = _load_stocks_from_twse()
+
     _STOCKS = df.to_dict(orient="records")
     _STOCK_MAP = dict(zip(df["stock_id"], df["stock_name"]))
     print(f"  股票清單：{len(_STOCKS)} 支")
+
+
+def _load_stocks_from_twse() -> pd.DataFrame:
+    """備用：直接從 TWSE/TPEX ISIN API 取全股清單（公開，免 token）"""
+    rows = []
+    for mode, market in [("2", "twse"), ("4", "tpex")]:
+        try:
+            r = requests.get(
+                "https://isin.twse.com.tw/isin/C_public.jsp",
+                params={"strMode": mode},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30,
+            )
+            r.encoding = "big5"
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tr in soup.select("tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+                cell = tds[0].get_text(strip=True)
+                import re
+                m = re.match(r"^(\d{4,5})\s+(.+)", cell)
+                if m and len(m.group(1)) == 4:
+                    rows.append({"stock_id": m.group(1),
+                                 "stock_name": m.group(2).strip(),
+                                 "type": market})
+        except Exception as e:
+            print(f"  TWSE/TPEX {market} 失敗：{e}")
+
+    if rows:
+        df = pd.DataFrame(rows).drop_duplicates("stock_id")
+        return df
+    return pd.DataFrame(columns=["stock_id", "stock_name", "type"])
 
 
 # ── 分級計算 ──────────────────────────────────────────────────────────────
@@ -189,10 +231,16 @@ def _assign_grades_inplace(rows: list[dict]) -> None:
         )
 
 
+def _spark_arr(series: "pd.Series", n: int = 12) -> list:
+    """取最近 n 筆、清除 NaN、四捨五入，回傳 list（給前端畫 sparkline）"""
+    vals = series.dropna().tail(n).round(2).tolist()
+    return vals if len(vals) >= 2 else []
+
+
 def _fetch_one_grading(sid: str) -> dict | None:
-    """Fetch 1-year holding + 30-day price for one stock; return grading metrics."""
+    """Fetch 1-year holding + 3-month price for one stock; return grading metrics + sparklines."""
     start_1y = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    start_1m = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    start_3m = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
     # ── 持股分佈 ────────────────────────────────────────────────────────────
     hdf = _fm("TaiwanStockHoldingSharesPer", sid, start_1y)
@@ -208,7 +256,7 @@ def _fetch_one_grading(sid: str) -> dict | None:
     if pd.isna(total_shares) or total_shares <= 0:
         return None
 
-    # 千張大戶波動度
+    # 千張大戶波動度 + sparkline
     big = hdf[hdf["HoldingSharesLevel"] == BIG_BRACKET].copy()
     if len(big) < 4:
         return None
@@ -219,16 +267,23 @@ def _fetch_one_grading(sid: str) -> dict | None:
     volatility     = float(big["chg"].dropna().std())
     latest_bpct    = float(big["pct"].iloc[-1])
     latest_bp      = int(big["people"].iloc[-1])
+    bpct_spark     = _spark_arr(big["pct"], 12)   # 近 12 週千張大戶% 走勢
 
-    # ── 最新股價 ────────────────────────────────────────────────────────────
-    pdf = _fm("TaiwanStockPrice", sid, start_1m)
+    # ── 股價（3 個月，用於 sparkline + 市值）────────────────────────────────
+    pdf = _fm("TaiwanStockPrice", sid, start_3m)
     if pdf.empty:
         return None
-    latest_close = pd.to_numeric(
-        pdf.sort_values("date")["close"].iloc[-1], errors="coerce"
-    )
-    if pd.isna(latest_close) or latest_close <= 0:
+    pdf["date"]  = pd.to_datetime(pdf["date"])
+    pdf["close"] = pd.to_numeric(pdf["close"], errors="coerce")
+    pdf          = pdf.sort_values("date")
+    # resample 成週收盤
+    pw = pdf.set_index("date")["close"].resample("W-FRI").last().dropna()
+    if pw.empty:
         return None
+    latest_close = float(pw.iloc[-1])
+    if latest_close <= 0:
+        return None
+    price_spark = _spark_arr(pw, 12)              # 近 12 週股價走勢
 
     market_cap_億 = float(latest_close * total_shares / 1e8)
 
@@ -241,8 +296,10 @@ def _fetch_one_grading(sid: str) -> dict | None:
         "latest_bpct":   round(latest_bpct, 2),
         "bpct_chg":      round(float(big["chg"].iloc[-1]) if not pd.isna(big["chg"].iloc[-1]) else 0, 3),
         "latest_bp":     latest_bp,
-        "latest_price":  round(float(latest_close), 2),
+        "latest_price":  round(latest_close, 2),
         "n_weeks":       len(big),
+        "bpct_spark":    bpct_spark,   # 近 12 週千張大戶% sparkline
+        "price_spark":   price_spark,  # 近 12 週股價 sparkline
     }
 
 
@@ -548,6 +605,101 @@ def api_grading_refresh():
     return {"ok": True, "message": "已開始重新計算"}
 
 
+@app.get("/api/broker")
+def api_broker(
+    stock_id: str = Query(""),
+    date:     str = Query(""),
+    force:    int = Query(0),
+):
+    import os
+    from datetime import date as dt_date
+    stock_id = stock_id.strip().upper()
+    if not stock_id:
+        raise HTTPException(400, "請輸入股票代號")
+    if not date:
+        date = dt_date.today().isoformat()
+    ckey = f"broker|{stock_id}|{date}"
+    if not force:
+        cached = _cget(ckey, ttl_h=6)
+        if cached is not None:
+            return cached
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={
+                "dataset":    "TaiwanStockTradingDailyReport",
+                "stock_id":   stock_id,
+                "start_date": date,
+                "end_date":   date,
+                "token":      token,
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+        j = r.json()
+    except Exception as e:
+        raise HTTPException(502, f"FinMind API 錯誤: {e}")
+
+    if j.get("status") != 200:
+        raise HTTPException(502, j.get("msg", "FinMind API 錯誤"))
+
+    rows_raw = j.get("data", [])
+    if not rows_raw:
+        result = {"stock_id": stock_id, "date": date, "rows": [], "summary": {}}
+        _cset(ckey, result)
+        return result
+
+    RETAIL = 1_000_000
+    processed = []
+    for row in rows_raw:
+        buy      = float(row.get("buy", 0) or 0)
+        sell     = float(row.get("sell", 0) or 0)
+        buy_px   = float(row.get("buy_price", 0) or 0)
+        sell_px  = float(row.get("sell_price", 0) or 0)
+        buy_amt  = buy * 1000 * buy_px
+        sell_amt = sell * 1000 * sell_px
+        processed.append({
+            "broker_id":   row.get("broker_id", ""),
+            "broker_name": row.get("broker_name", ""),
+            "buy":         int(buy),
+            "sell":        int(sell),
+            "net":         int(buy - sell),
+            "buy_price":   round(buy_px, 2),
+            "sell_price":  round(sell_px, 2),
+            "buy_amount":  round(buy_amt),
+            "sell_amount": round(sell_amt),
+            "is_retail":   buy_amt < RETAIL and sell_amt < RETAIL,
+        })
+
+    processed.sort(key=lambda x: x["net"], reverse=True)
+    retail = [r for r in processed if r["is_retail"]]
+    inst   = [r for r in processed if not r["is_retail"]]
+    result = {
+        "stock_id":   stock_id,
+        "stock_name": rows_raw[0].get("stock_name", stock_id),
+        "date":       date,
+        "rows":       processed,
+        "summary": {
+            "total":        len(processed),
+            "retail_count": len(retail),
+            "inst_count":   len(inst),
+            "retail_buy":   sum(r["buy"]  for r in retail),
+            "retail_sell":  sum(r["sell"] for r in retail),
+            "retail_net":   sum(r["net"]  for r in retail),
+            "inst_buy":     sum(r["buy"]  for r in inst),
+            "inst_sell":    sum(r["sell"] for r in inst),
+            "inst_net":     sum(r["net"]  for r in inst),
+        },
+    }
+    _cset(ckey, result)
+    return result
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return _HTML
@@ -655,6 +807,22 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 .spinner{width:32px;height:32px;border:3px solid var(--bor);border-top-color:var(--acc);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+/* ─── TOOLTIP ─── */
+.tip{position:relative;display:inline-flex;align-items:center;gap:3px;cursor:help}
+.tip::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:#1c2030;color:#e6edf3;border:1px solid #444c6b;border-radius:8px;padding:10px 14px;font-size:11px;line-height:1.7;white-space:pre-line;max-width:280px;text-align:left;z-index:2000;pointer-events:none;opacity:0;transition:opacity .15s;box-shadow:0 6px 24px rgba(0,0,0,.7);font-weight:400}
+.tip:hover::after,.tip.tipped::after{opacity:1}
+.tip-i{width:15px;height:15px;border-radius:50%;background:var(--sur2);color:var(--mut);font-size:9px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid var(--bor)}
+/* ─── QUICK SORT BUTTONS ─── */
+.qs-btn{font-size:11px;padding:3px 10px;border-radius:14px;border:1px solid var(--bor);background:var(--sur2);color:var(--mut);cursor:pointer;white-space:nowrap;transition:.15s}
+.qs-btn:hover{background:var(--bor);color:var(--txt)}
+.qs-btn.active{background:var(--blu);border-color:var(--blu);color:#fff;font-weight:700}
+/* ─── GRADE LEGEND ─── */
+.grade-legend{background:var(--sur);border:1px solid var(--bor);border-radius:var(--rad);padding:12px 14px;font-size:11px;color:var(--mut);flex-shrink:0}
+.grade-legend b{color:var(--txt)}
+.legend-row{display:flex;align-items:center;gap:8px;padding:3px 0;flex-wrap:wrap}
+.legend-sep{border:none;border-top:1px solid var(--bor);margin:6px 0}
+/* ─── LAG LEGEND ─── */
+.lag-note{font-size:10px;color:var(--mut);padding:6px 10px;line-height:1.7;flex-shrink:0}
 /* Plotly dark override */
 .js-plotly-plot .plotly .bg{fill:transparent!important}
 .nsewdrag{fill:transparent!important}
@@ -851,6 +1019,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab active" onclick="switchTab('single')">個股分析</div>
       <div class="tab" onclick="switchTab('compare')">對比分析 <span id="compare-count" style="font-size:10px;padding:1px 5px;background:var(--sur2);border-radius:8px;margin-left:4px"></span></div>
       <div class="tab" onclick="switchTab('grade')">分級排行</div>
+      <div class="tab" onclick="switchTab('broker')">🏦 分點籌碼</div>
     </div>
 
     <!-- 個股 pane -->
@@ -908,23 +1077,38 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
         <!-- 控制列 -->
         <div class="grade-controls">
           <div class="grade-filter-row">
-            <span style="font-size:11px;color:var(--mut)">規模：</span>
+            <span class="tip" style="font-size:11px;color:var(--mut)"
+              data-tip="依市值（股價×總股數）分層&#10;超大型 > 1兆&#10;大型 1000億–1兆&#10;中型 100億–1000億&#10;小型 20億–100億&#10;微型 &lt; 20億">
+              規模 <span class="tip-i">?</span>：</span>
             <button class="gf-btn active" onclick="setGradeFilter('tier','',this)">全部</button>
-            <button class="gf-btn" onclick="setGradeFilter('tier','mega',this)">🏢 超大型</button>
-            <button class="gf-btn" onclick="setGradeFilter('tier','large',this)">🏗 大型</button>
-            <button class="gf-btn" onclick="setGradeFilter('tier','mid',this)">🏬 中型</button>
-            <button class="gf-btn" onclick="setGradeFilter('tier','small',this)">🏪 小型</button>
-            <button class="gf-btn" onclick="setGradeFilter('tier','micro',this)">🏠 微型</button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','mega',this)">🏢 超大型<small style="opacity:.6;margin-left:3px">&gt;1兆</small></button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','large',this)">🏗 大型<small style="opacity:.6;margin-left:3px">&gt;1000億</small></button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','mid',this)">🏬 中型<small style="opacity:.6;margin-left:3px">&gt;100億</small></button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','small',this)">🏪 小型<small style="opacity:.6;margin-left:3px">&gt;20億</small></button>
+            <button class="gf-btn" onclick="setGradeFilter('tier','micro',this)">🏠 微型<small style="opacity:.6;margin-left:3px">&lt;20億</small></button>
           </div>
           <div class="grade-filter-row" style="margin-top:4px">
-            <span style="font-size:11px;color:var(--mut)">等級：</span>
+            <span class="tip" style="font-size:11px;color:var(--mut)"
+              data-tip="同規模內，大戶波動度的百分位排名&#10;波動度 = 每週千張大戶持股%變化的標準差&#10;&#10;S 前10%  → 大戶每週大幅進出（最活躍）&#10;A 前10-30% → 大戶頻繁異動&#10;B 中間30-70% → 多數股票的正常水準&#10;C 後10-30% → 大戶較穩定&#10;D 後10%  → 大戶幾乎鎖倉不動（最穩定）">
+              等級 <span class="tip-i">?</span>：</span>
             <button class="gf-btn active" onclick="setGradeFilter('grade','',this)">全部</button>
-            <button class="gf-btn grade-s" onclick="setGradeFilter('grade','S',this)">S 極高</button>
-            <button class="gf-btn grade-a" onclick="setGradeFilter('grade','A',this)">A 高</button>
-            <button class="gf-btn grade-b" onclick="setGradeFilter('grade','B',this)">B 中</button>
-            <button class="gf-btn grade-c" onclick="setGradeFilter('grade','C',this)">C 低</button>
-            <button class="gf-btn grade-d" onclick="setGradeFilter('grade','D',this)">D 極低</button>
+            <button class="gf-btn grade-s" onclick="setGradeFilter('grade','S',this)" title="同規模前10%，大戶每週大幅進出">S 極高波動</button>
+            <button class="gf-btn grade-a" onclick="setGradeFilter('grade','A',this)" title="同規模前10–30%">A 高波動</button>
+            <button class="gf-btn grade-b" onclick="setGradeFilter('grade','B',this)" title="同規模中間30–70%，大多數股票">B 中波動</button>
+            <button class="gf-btn grade-c" onclick="setGradeFilter('grade','C',this)" title="同規模後10–30%">C 低波動</button>
+            <button class="gf-btn grade-d" onclick="setGradeFilter('grade','D',this)" title="同規模後10%，大戶幾乎鎖倉">D 極低波動</button>
           </div>
+          <!-- 快速排序 -->
+          <div class="grade-filter-row" style="margin-top:6px;gap:4px">
+            <span style="font-size:11px;color:var(--mut);flex-shrink:0">排序：</span>
+            <button class="qs-btn" id="qs-bpct"    onclick="quickSort('latest_bpct',  false, this)">千張% 高→低</button>
+            <button class="qs-btn" id="qs-buy"     onclick="quickSort('bpct_chg',     false, this)">📈 週大買（增減↓）</button>
+            <button class="qs-btn" id="qs-sell"    onclick="quickSort('bpct_chg',     true,  this)">📉 週大賣（增減↑）</button>
+            <button class="qs-btn" id="qs-people"  onclick="quickSort('latest_bp',    false, this)">人數 高→低</button>
+            <button class="qs-btn" id="qs-vol"     onclick="quickSort('volatility',   false, this)">波動度 高→低</button>
+            <button class="qs-btn" id="qs-mktcap"  onclick="quickSort('market_cap_億',false, this)">市值 高→低</button>
+          </div>
+          <!-- 搜尋 + 重算 -->
           <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
             <input id="grade-search" class="search" placeholder="搜尋代號或名稱…"
                    style="flex:1;min-width:120px;max-width:260px" oninput="loadGrading()">
@@ -935,10 +1119,86 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           </div>
         </div>
 
+        <!-- 名詞說明 legend -->
+        <div class="grade-legend">
+          <div class="legend-row">
+            <b>📖 名詞說明</b>
+          </div>
+          <hr class="legend-sep">
+          <div class="legend-row">
+            <span class="gbadge gb-S" style="width:20px;height:20px;font-size:10px">S</span>
+            <span><b style="color:#ef4444">極高波動</b> — 同規模內前10%，千張大戶每週持股%大幅變動，大戶積極進出</span>
+          </div>
+          <div class="legend-row">
+            <span class="gbadge gb-A" style="width:20px;height:20px;font-size:10px">A</span>
+            <span><b style="color:#f97316">高波動</b> — 同規模內前10–30%，大戶頻繁異動</span>
+          </div>
+          <div class="legend-row">
+            <span class="gbadge gb-B" style="width:20px;height:20px;font-size:10px">B</span>
+            <span><b style="color:#ca8a04">中波動</b> — 同規模內30–70%，大多數股票的正常水準</span>
+          </div>
+          <div class="legend-row">
+            <span class="gbadge gb-C" style="width:20px;height:20px;font-size:10px">C</span>
+            <span><b style="color:#60a5fa">低波動</b> — 同規模內後10–30%，大戶相對穩定持有</span>
+          </div>
+          <div class="legend-row">
+            <span class="gbadge gb-D" style="width:20px;height:20px;font-size:10px">D</span>
+            <span><b style="color:#9ca3af">極低波動</b> — 同規模內後10%，大戶幾乎鎖倉不動</span>
+          </div>
+          <hr class="legend-sep">
+          <div class="legend-row" style="gap:16px;flex-wrap:wrap">
+            <span>📊 <b>大戶波動度</b> = 每週千張大戶持股%變化量的標準差（越高=進出越頻繁）</span>
+            <span>🏦 <b>規模層</b> = 股價 × 總股數 = 市值</span>
+            <span>👥 <b>千張</b> = 持股≥1000張（=100萬股）的股東</span>
+          </div>
+        </div>
+
         <!-- 分級結果 -->
         <div id="grade-body" class="grade-body">
           <div class="loading"><div class="spinner"></div><span>等待計算…</span></div>
         </div>
+      </div>
+    </div>
+
+    <!-- 分點籌碼 pane -->
+    <div class="pane" id="pane-broker">
+      <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px;height:100%;overflow-y:auto">
+
+        <!-- 控制列 -->
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <input id="broker-stock" class="search" placeholder="股票代號 e.g. 0050" style="width:130px"
+                 onkeydown="if(event.key==='Enter')loadBroker()">
+          <button class="sort-btn" onclick="setPreset('0050')" style="font-size:11px;padding:3px 8px">0050</button>
+          <button class="sort-btn" onclick="setPreset('2330')" style="font-size:11px;padding:3px 8px">2330</button>
+          <button class="sort-btn" onclick="setPreset('006208')" style="font-size:11px;padding:3px 8px">006208</button>
+          <button class="sort-btn" onclick="setPreset('00878')" style="font-size:11px;padding:3px 8px">00878</button>
+          <button class="sort-btn" onclick="brokerPrevDay()" style="padding:3px 8px">←</button>
+          <input id="broker-date" type="date" class="search" style="width:140px"
+                 onchange="loadBroker()">
+          <button class="sort-btn" onclick="brokerNextDay()" style="padding:3px 8px">→</button>
+          <button class="sort-btn" onclick="loadBroker()" style="background:var(--acc);color:#000;font-weight:700">查詢</button>
+          <div style="display:flex;gap:3px;margin-left:auto">
+            <button class="gf-btn active" id="bf-all"    onclick="setBrokerFilter('all')">全部</button>
+            <button class="gf-btn"        id="bf-inst"   onclick="setBrokerFilter('inst')">主力</button>
+            <button class="gf-btn"        id="bf-retail" onclick="setBrokerFilter('retail')">散戶</button>
+          </div>
+        </div>
+
+        <!-- 摘要卡 -->
+        <div id="broker-summary" style="display:none;gap:8px;flex-wrap:wrap"></div>
+        <!-- 佔比橫條 -->
+        <div id="broker-flow-wrap" style="display:none">
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mut);margin-bottom:3px">
+            <span id="bf-inst-lbl"></span><span id="bf-retail-lbl"></span>
+          </div>
+          <div style="height:6px;border-radius:3px;overflow:hidden;background:var(--bor);display:flex">
+            <div id="bf-inst-bar"   style="background:#d29922;height:100%;transition:width .4s"></div>
+            <div id="bf-retail-bar" style="background:#58a6ff;height:100%;transition:width .4s"></div>
+          </div>
+        </div>
+
+        <!-- 表格 -->
+        <div id="broker-table-wrap" style="overflow-x:auto;flex:1"></div>
       </div>
     </div>
 
@@ -973,6 +1233,12 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
     </svg>
     <span>分級</span>
+  </button>
+  <button class="bnav-btn" id="bnav-broker" onclick="switchTab('broker')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M3 21h18M3 10h18M5 6l7-3 7 3M4 10v11M20 10v11M8 14v3M12 14v3M16 14v3"/>
+    </svg>
+    <span>分點</span>
   </button>
 </nav>
 
@@ -1158,12 +1424,14 @@ function renderSingle(d) {
   document.getElementById('single-wrap').innerHTML = `
     <div class="stat-row">
       <div class="stat-card">
-        <div class="stat-label">千張大戶持股%</div>
+        <div class="stat-label tip" data-tip="持股≥1000張（=100萬股）的投資人\n合計持有的股份佔全公司比例\n比例越高表示籌碼越集中在大戶手中">
+          千張大戶持股% <span class="tip-i">?</span></div>
         <div class="stat-val ${chgCls}">${l.bpct?.toFixed(2) ?? '—'}%</div>
-        <div class="stat-sub ${chgCls}">${sign}${chg.toFixed(3)} pp 週增減</div>
+        <div class="stat-sub ${chgCls} tip" data-tip="與上一週相比的變化量（百分點 pp）\n正值=大戶本週增持，負值=大戶減持">${sign}${chg.toFixed(3)} pp 週增減 <span class="tip-i">?</span></div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">千張大戶人數</div>
+        <div class="stat-label tip" data-tip="持有≥1000張的股東人數\n人數增加=新大戶進場，減少=大戶出場\n搭配持股%一起看才準確">
+          千張大戶人數 <span class="tip-i">?</span></div>
         <div class="stat-val">${l.bp?.toLocaleString() ?? '—'}</div>
         <div class="stat-sub ${bpChg > 0 ? 'pct-up' : bpChg < 0 ? 'pct-dn' : ''}">${bpChg > 0 ? '+' : ''}${bpChg ?? 0} 人/週</div>
       </div>
@@ -1173,7 +1441,8 @@ function renderSingle(d) {
         <div class="stat-sub">${d.stock_id} ${d.stock_name}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">資料期間</div>
+        <div class="stat-label tip" data-tip="FinMind 取得的週收盤價歷史筆數\n資料來源：台灣證交所 每週四公布">
+          資料期間 <span class="tip-i">?</span></div>
         <div class="stat-val" style="font-size:1rem">${d.weeks} 週</div>
         <div class="stat-sub">截至 ${l.date}</div>
       </div>
@@ -1183,9 +1452,16 @@ function renderSingle(d) {
         <div class="chart-title">${d.stock_id} ${d.stock_name}｜千張大戶持股% + 收盤價</div>
         <div id="chart-main" style="height:calc(100% - 32px)"></div>
       </div>
-      <div class="chart-box lag-box">
-        <div class="chart-title">Lead-Lag 分析（千張增減 → N週後報酬）</div>
-        <div id="chart-lag" style="height:calc(100% - 32px)"></div>
+      <div class="chart-box lag-box" style="display:flex;flex-direction:column">
+        <div class="chart-title tip" data-tip="Lead-Lag（領先滯後）分析：\n計算千張大戶持股%週增減\n與不同時間點股價報酬的相關係數(r)\n\n大戶先行N週 → r>0 代表大戶增持後\n  N週股價傾向上漲（大戶是領先指標）\n同期 → 大戶增減與同週股價的相關\n股價先行N週 → 股價先漲跌 大戶才跟進\n\n★ = 統計顯著(p<0.05) 較可信
+">Lead-Lag 分析 <span class="tip-i">?</span></div>
+        <div id="chart-lag" style="flex:1;min-height:0"></div>
+        <div class="lag-note">
+          <b style="color:var(--acc)">大戶先行</b> → 大戶增持後N週股價是否上漲 ｜
+          <b style="color:var(--txt)">同期</b> → 同週相關 ｜
+          <b style="color:var(--blu)">股價先行</b> → 股價先漲 大戶才跟進 ｜
+          <b style="color:var(--yel)">★</b> 統計顯著 p&lt;0.05
+        </div>
       </div>
     </div>`;
 
@@ -1411,7 +1687,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade'];
+  const tabNames = ['single','compare','grade','broker'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -1429,17 +1705,205 @@ function switchTab(name) {
   }
   if (name === 'grade') {
     loadGrading();
-    // start polling if grading is running
     fetch('/api/grading/status').then(r => r.json()).then(s => {
       if (s.running && !gradePolling) {
         gradePolling = setInterval(pollGradingProgress, 3000);
       }
     });
   }
+  if (name === 'broker') {
+    // set today's date if empty
+    const inp = document.getElementById('broker-date');
+    if (!inp.value) inp.value = new Date().toISOString().slice(0,10);
+  }
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
 
+// ── 分點籌碼 ──────────────────────────────────────────────────────────
+let _brokerData = null;
+let _brokerFilter = 'all';
+let _brokerSort = { col: 'net', asc: false };
+
+function setPreset(s) {
+  document.getElementById('broker-stock').value = s;
+  loadBroker();
+}
+
+function brokerPrevDay() {
+  const inp = document.getElementById('broker-date');
+  if (!inp.value) inp.value = new Date().toISOString().slice(0,10);
+  const d = new Date(inp.value); d.setDate(d.getDate() - 1);
+  inp.value = d.toISOString().slice(0,10);
+  loadBroker();
+}
+function brokerNextDay() {
+  const inp = document.getElementById('broker-date');
+  if (!inp.value) inp.value = new Date().toISOString().slice(0,10);
+  const d = new Date(inp.value); d.setDate(d.getDate() + 1);
+  const today = new Date().toISOString().slice(0,10);
+  if (d.toISOString().slice(0,10) > today) return;
+  inp.value = d.toISOString().slice(0,10);
+  loadBroker();
+}
+
+function setBrokerFilter(f) {
+  _brokerFilter = f;
+  ['all','inst','retail'].forEach(x => {
+    document.getElementById('bf-'+x).classList.toggle('active', x === f);
+  });
+  if (_brokerData) renderBrokerTable(_brokerData.rows || []);
+}
+
+function fmtAmt(v) {
+  if (!v) return '—';
+  if (v >= 1e8) return (v/1e8).toFixed(2) + '億';
+  return (v/1e4).toFixed(0) + '萬';
+}
+function fmtNet(v) {
+  if (!v) return '<span style="color:var(--mut)">0</span>';
+  const s = v.toLocaleString();
+  return v > 0 ? `<span style="color:var(--acc);font-weight:700">+${s}</span>`
+               : `<span style="color:var(--red);font-weight:700">${s}</span>`;
+}
+
+async function loadBroker() {
+  const stock = document.getElementById('broker-stock').value.trim().toUpperCase();
+  const date  = document.getElementById('broker-date').value;
+  if (!stock) { document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">請輸入股票代號</div>'; return; }
+  document.getElementById('broker-summary').style.display = 'none';
+  document.getElementById('broker-flow-wrap').style.display = 'none';
+  document.getElementById('broker-table-wrap').innerHTML = '<div class="empty" style="padding:40px">抓取分點資料中…</div>';
+  try {
+    const res = await fetch(`/api/broker?stock_id=${encodeURIComponent(stock)}&date=${date||''}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">${err.detail || '載入失敗'}</div>`;
+      return;
+    }
+    const d = await res.json();
+    if (!d.rows || !d.rows.length) {
+      document.getElementById('broker-table-wrap').innerHTML = `<div class="empty">${date||'今日'} 無分點資料（非交易日或查無資料）</div>`;
+      return;
+    }
+    _brokerData = d;
+    renderBrokerSummary(d.summary, d.stock_name || stock, d.date || date);
+    renderBrokerTable(d.rows);
+  } catch(e) {
+    document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function renderBrokerSummary(s, name, date) {
+  if (!s || !s.total) return;
+  const instNet   = s.inst_net   || 0;
+  const retailNet = s.retail_net || 0;
+  const totalVol  = (s.inst_buy + s.inst_sell + s.retail_buy + s.retail_sell) || 1;
+  const instPct   = Math.round((s.inst_buy + s.inst_sell) / totalVol * 100);
+  const retailPct = 100 - instPct;
+  const card = (label, color, count, buy, sell, net) => `
+    <div style="flex:1;min-width:150px;background:var(--sur2);border-radius:8px;padding:10px 13px;border:1px solid var(--bor)">
+      <div style="font-size:10px;color:${color};font-weight:700;margin-bottom:6px;text-transform:uppercase">${label} (${count} 分點)</div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+        <span style="color:var(--mut)">買進</span><span style="color:var(--acc);font-weight:700">${buy.toLocaleString()}張</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+        <span style="color:var(--mut)">賣出</span><span style="color:var(--red);font-weight:700">${sell.toLocaleString()}張</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px">
+        <span style="color:var(--mut)">淨</span>${fmtNet(net)}
+      </div>
+    </div>`;
+  const sumEl = document.getElementById('broker-summary');
+  sumEl.style.display = 'flex';
+  sumEl.innerHTML =
+    card('🏦 主力', '#d29922', s.inst_count, s.inst_buy||0, s.inst_sell||0, instNet) +
+    card('👥 散戶', '#58a6ff', s.retail_count, s.retail_buy||0, s.retail_sell||0, retailNet) +
+    `<div style="flex:1;min-width:150px;background:var(--sur2);border-radius:8px;padding:10px 13px;border:1px solid var(--bor)">
+      <div style="font-size:10px;color:var(--mut);font-weight:700;margin-bottom:6px">${name} · ${date} · ${s.total} 分點</div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+        <span style="color:var(--mut)">主力佔比</span><span style="color:#d29922;font-weight:700">${instPct}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px">
+        <span style="color:var(--mut)">散戶佔比</span><span style="color:#58a6ff;font-weight:700">${retailPct}%</span>
+      </div>
+    </div>`;
+  document.getElementById('broker-flow-wrap').style.display = 'block';
+  document.getElementById('bf-inst-lbl').textContent   = `主力 ${instPct}%`;
+  document.getElementById('bf-retail-lbl').textContent = `散戶 ${retailPct}%`;
+  document.getElementById('bf-inst-bar').style.width   = instPct   + '%';
+  document.getElementById('bf-retail-bar').style.width = retailPct + '%';
+}
+
+function renderBrokerTable(rows) {
+  const filtered = rows.filter(r => {
+    if (_brokerFilter === 'inst')   return !r.is_retail;
+    if (_brokerFilter === 'retail') return  r.is_retail;
+    return true;
+  });
+  const { col, asc } = _brokerSort;
+  const sorted = [...filtered].sort((a, b) => {
+    const av = a[col] ?? 0, bv = b[col] ?? 0;
+    return asc ? av - bv : bv - av;
+  });
+  if (!sorted.length) {
+    document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">此分類無資料</div>';
+    return;
+  }
+  const si = c => c === col ? (asc ? '↑' : '↓') : '<span style="opacity:.3">↕</span>';
+  const th = (c, label) => `<th onclick="brokerSortBy('${c}')" style="cursor:pointer;white-space:nowrap">${label} ${si(c)}</th>`;
+  const rows_html = sorted.map((r, i) => `
+    <tr>
+      <td style="color:var(--mut);font-size:11px">${i+1}</td>
+      <td style="font-weight:600;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.broker_name}">${r.broker_name || r.broker_id}</td>
+      <td><span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:700;${r.is_retail ? 'background:#58a6ff22;color:#58a6ff;border:1px solid #58a6ff44' : 'background:#d2992222;color:#d29922;border:1px solid #d2992244'}">${r.is_retail ? '散戶' : '主力'}</span></td>
+      <td style="text-align:right;color:var(--acc)">${r.buy ? r.buy.toLocaleString() : '—'}</td>
+      <td style="text-align:right;color:var(--red)">${r.sell ? r.sell.toLocaleString() : '—'}</td>
+      <td style="text-align:right">${fmtNet(r.net)}</td>
+      <td style="text-align:right;color:var(--mut);font-size:11px">${r.buy_price || '—'}</td>
+      <td style="text-align:right;color:var(--mut);font-size:11px">${r.sell_price || '—'}</td>
+      <td style="text-align:right;font-size:11px;color:var(--mut)">${fmtAmt(r.buy_amount)}</td>
+      <td style="text-align:right;font-size:11px;color:var(--mut)">${fmtAmt(r.sell_amount)}</td>
+    </tr>`).join('');
+  document.getElementById('broker-table-wrap').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead style="position:sticky;top:0;background:var(--sur)">
+        <tr style="border-bottom:1px solid var(--bor)">
+          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">#</th>
+          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">分點名稱</th>
+          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">類型</th>
+          ${th('buy','買進(張)')}
+          ${th('sell','賣出(張)')}
+          ${th('net','淨買超')}
+          ${th('buy_price','買均價')}
+          ${th('sell_price','賣均價')}
+          ${th('buy_amount','買進金額')}
+          ${th('sell_amount','賣出金額')}
+        </tr>
+      </thead>
+      <tbody>${rows_html}</tbody>
+    </table>`;
+}
+
+function brokerSortBy(col) {
+  if (_brokerSort.col === col) _brokerSort.asc = !_brokerSort.asc;
+  else { _brokerSort.col = col; _brokerSort.asc = false; }
+  if (_brokerData) renderBrokerTable(_brokerData.rows || []);
+}
+
 // ── Toast ──────────────────────────────────────────────────────────────
+// ─── TOOLTIP: mobile tap toggle ──────────────────────────────────────
+document.addEventListener('click', e => {
+  const tip = e.target.closest('.tip');
+  if (tip) {
+    e.stopPropagation();
+    const wasActive = tip.classList.contains('tipped');
+    document.querySelectorAll('.tip.tipped').forEach(t => t.classList.remove('tipped'));
+    if (!wasActive) tip.classList.add('tipped');
+  } else {
+    document.querySelectorAll('.tip.tipped').forEach(t => t.classList.remove('tipped'));
+  }
+});
+
 function showToast(msg, err=false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -1471,10 +1935,37 @@ async function loadGrading() {
   renderGrading(j);
 }
 
+// ── Sparkline SVG ────────────────────────────────────────────────────────
+function sparkline(vals, w=52, h=20, clr=null) {
+  if (!vals || vals.length < 2) return '<svg width="'+w+'" height="'+h+'"></svg>';
+  const f = vals.filter(v => v != null && !isNaN(v));
+  if (f.length < 2) return '<svg width="'+w+'" height="'+h+'"></svg>';
+  const mn = Math.min(...f), mx = Math.max(...f);
+  const rng = mx - mn || 1;
+  const n = f.length;
+  const pts = f.map((v, i) => {
+    const x = (i / (n - 1) * w).toFixed(1);
+    const y = ((1 - (v - mn) / rng) * (h - 3) + 1.5).toFixed(1);
+    return x + ',' + y;
+  }).join(' ');
+  const c = clr || (f[f.length-1] >= f[0] ? '#3fb950' : '#f85149');
+  // filled area under curve
+  const first = f[0], last = f[f.length-1];
+  const fx = '0', fy = ((1-(first-mn)/rng)*(h-3)+1.5).toFixed(1);
+  const lx = w.toFixed(1), ly = ((1-(last-mn)/rng)*(h-3)+1.5).toFixed(1);
+  const area = pts + ' ' + lx + ',' + h + ' ' + fx + ',' + h;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="flex-shrink:0;display:block;overflow:visible">
+    <polygon points="${area}" fill="${c}" opacity="0.12"/>
+    <polyline points="${pts}" fill="none" stroke="${c}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${lx}" cy="${ly}" r="2" fill="${c}"/>
+  </svg>`;
+}
+
 function renderGrading(j) {
   const body = document.getElementById('grade-body');
   document.getElementById('grade-count').textContent =
     `${j.total.toLocaleString()} / ${j.ready.toLocaleString()} 支`;
+  _syncQsBtns();
 
   if (!j.tiers || j.tiers.length === 0) {
     body.innerHTML = '<div class="empty" style="padding:40px"><span>尚無分級資料，請稍候…</span></div>';
@@ -1513,17 +2004,28 @@ function renderGrading(j) {
           ${s.volatility.toFixed(3)}
         </td>
         <td>${cap}</td>
-        <td style="color:var(--acc)">${s.latest_bpct?.toFixed(1)??'—'}%</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:5px;justify-content:flex-end">
+            ${sparkline(s.bpct_spark, 52, 20)}
+            <span style="color:var(--acc);font-weight:600">${s.latest_bpct?.toFixed(1)??'—'}%</span>
+          </div>
+        </td>
         <td class="${chgCls}">${bpChg>=0?'+':''}${(bpChg??0).toFixed(3)}</td>
         <td>${s.latest_bp?.toLocaleString()??'—'}</td>
-        <td style="color:var(--blu)">${s.latest_price?.toFixed(0)??'—'}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:5px;justify-content:flex-end">
+            ${sparkline(s.price_spark, 52, 20)}
+            <span style="color:var(--blu);font-weight:600">${s.latest_price?.toFixed(0)??'—'}</span>
+          </div>
+        </td>
       </tr>`;
     }).join('');
 
-    const thSort = (key, label) => {
+    const thSort = (key, label, tip='') => {
       const active = gradeSortKey === key;
       const arrow  = active ? (gradeSortAsc ? '↑' : '↓') : '';
-      return `<th onclick="gradeSort('${key}')" style="${active?'color:var(--acc)':''}">${label} ${arrow}</th>`;
+      const tipAttr = tip ? ` class="tip" data-tip="${tip}"` : '';
+      return `<th onclick="gradeSort('${key}')" style="${active?'color:var(--acc)':''}"><span${tipAttr}>${label} ${arrow}</span></th>`;
     };
 
     return `<div class="tier-section" id="ts-${tier.key}">
@@ -1539,8 +2041,8 @@ function renderGrading(j) {
             ${thSort('stock_id','代號')}
             <th>名稱</th>
             ${thSort('grade','等級')}
-            ${thSort('volatility','大戶波動度')}
-            ${thSort('market_cap_億','市值')}
+            ${thSort('volatility','大戶波動度 ⓘ','每週千張大戶持股%變動量的標準差\n數字越大=大戶進出越頻繁\n等級S/A/B/C/D以此在同規模內排名')}
+            ${thSort('market_cap_億','市值 ⓘ','股價 × 總股數（億元）\n用來決定規模層（超大/大/中/小/微型）')}
             ${thSort('latest_bpct','千張大戶%')}
             ${thSort('bpct_chg','週增減')}
             ${thSort('latest_bp','人數')}
@@ -1556,7 +2058,35 @@ function renderGrading(j) {
 function gradeSort(key) {
   if (gradeSortKey === key) gradeSortAsc = !gradeSortAsc;
   else { gradeSortKey = key; gradeSortAsc = false; }
+  // sync quick-sort button active state
+  _syncQsBtns();
   loadGrading();
+}
+
+function quickSort(key, asc, btn) {
+  gradeSortKey = key;
+  gradeSortAsc = asc;
+  _syncQsBtns();
+  loadGrading();
+}
+
+// Quick-sort → 大買/大賣 特殊判定
+const _QS_MAP = {
+  'qs-bpct':   { key:'latest_bpct',   asc:false },
+  'qs-buy':    { key:'bpct_chg',      asc:false },
+  'qs-sell':   { key:'bpct_chg',      asc:true  },
+  'qs-people': { key:'latest_bp',     asc:false },
+  'qs-vol':    { key:'volatility',    asc:false },
+  'qs-mktcap': { key:'market_cap_億', asc:false },
+};
+
+function _syncQsBtns() {
+  Object.entries(_QS_MAP).forEach(([id, cfg]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle('active',
+      gradeSortKey === cfg.key && gradeSortAsc === cfg.asc);
+  });
 }
 
 function toggleTier(key) {
