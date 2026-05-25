@@ -689,6 +689,8 @@ def api_broker(
         "stock_id":   stock_id,
         "stock_name": rows_raw[0].get("stock_name", stock_id),
         "date":       date,
+        "_debug_keys": list(rows_raw[0].keys()),
+        "_debug_first": rows_raw[0],
         "rows":       processed,
         "summary": {
             "total":        len(processed),
