@@ -937,46 +937,57 @@ def api_big_player_timeline(
             date, rows = fut.result()
             day_map[date] = rows
 
-    # ── broker scores per day ─────────────────────────────────────────────
+    # ── broker scores per day (主力 + 散戶) ───────────────────────────────
     score_map: dict = {}
     for date in day_map:
         rows = day_map[date]
         if not rows:
             continue
-        bs = ss = 0
+        bs = ss = rb = rs = 0
         for row in rows:
-            bs += int(row.get("buy_amount",  0) // THRESHOLD)
-            ss += int(row.get("sell_amount", 0) // THRESHOLD)
-        if bs or ss:
-            score_map[date] = {"buy_score": bs, "sell_score": ss}
+            if row.get("is_retail"):
+                rb += row.get("buy",  0)
+                rs += row.get("sell", 0)
+            else:
+                bs += int(row.get("buy_amount",  0) // THRESHOLD)
+                ss += int(row.get("sell_amount", 0) // THRESHOLD)
+        if bs or ss or rb or rs:
+            score_map[date] = {
+                "buy_score": bs, "sell_score": ss,
+                "retail_buy": rb, "retail_sell": rs,
+            }
 
-    # ── fetch price for the whole range (one call, cached) ────────────────
+    # ── fetch price + volume for the whole range (one call, cached) ───────
     pdf = _fm("TaiwanStockPrice", stock_id, start_d.isoformat(), end_d.isoformat())
     price_map: dict = {}
     if not pdf.empty:
         for _, pr in pdf.iterrows():
             d_str = str(pr.get("date", ""))[:10]
             price_map[d_str] = {
-                "open":  float(pr.get("open",  0) or 0),
-                "high":  float(pr.get("max",   0) or 0),
-                "low":   float(pr.get("min",   0) or 0),
-                "close": float(pr.get("close", 0) or 0),
+                "open":   float(pr.get("open",  0) or 0),
+                "high":   float(pr.get("max",   0) or 0),
+                "low":    float(pr.get("min",   0) or 0),
+                "close":  float(pr.get("close", 0) or 0),
+                "volume": round(float(pr.get("Trading_Volume", 0) or 0) / 1000),
             }
 
-    all_dates = sorted(set(list(price_map.keys())) | set(score_map.keys()))
+    all_dates = sorted(set(price_map.keys()) | set(score_map.keys()))
     timeline = []
     for date in all_dates:
-        sc = score_map.get(date, {"buy_score": 0, "sell_score": 0})
-        pr = price_map.get(date, {"open": 0, "high": 0, "low": 0, "close": 0})
+        sc = score_map.get(date, {"buy_score": 0, "sell_score": 0, "retail_buy": 0, "retail_sell": 0})
+        pr = price_map.get(date, {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0})
         timeline.append({
-            "date":       date,
-            "buy_score":  sc["buy_score"],
-            "sell_score": sc["sell_score"],
-            "net_score":  sc["buy_score"] - sc["sell_score"],
-            "open":       pr["open"],
-            "high":       pr["high"],
-            "low":        pr["low"],
-            "close":      pr["close"],
+            "date":        date,
+            "buy_score":   sc["buy_score"],
+            "sell_score":  sc["sell_score"],
+            "net_score":   sc["buy_score"] - sc["sell_score"],
+            "retail_buy":  sc["retail_buy"],
+            "retail_sell": sc["retail_sell"],
+            "open":        pr["open"],
+            "high":        pr["high"],
+            "low":         pr["low"],
+            "close":       pr["close"],
+            "volume":      pr["volume"],
         })
 
     return {"stock_id": stock_id, "timeline": timeline}
@@ -2123,30 +2134,46 @@ function renderTimeline(tl, stock) {
   const total_buy  = tl.reduce((s,d) => s+d.buy_score,  0);
   const total_sell = tl.reduce((s,d) => s+d.sell_score, 0);
   const total_net  = total_buy - total_sell;
-  const netColor   = total_net > 0 ? '#3fb950' : total_net < 0 ? '#f85149' : '#8b949e';
+  const netColor   = total_net > 0 ? '#f85149' : total_net < 0 ? '#3fb950' : '#8b949e';
 
   wrap.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:4px">
       <span style="font-weight:700;font-size:13px">${stock} 大戶時間軸</span>
       <div style="display:flex;gap:12px;font-size:12px">
-        <span style="color:#3fb950">買方 +${total_buy}</span>
-        <span style="color:#f85149">賣方 -${total_sell}</span>
+        <span style="color:#f85149">主力買 +${total_buy}</span>
+        <span style="color:#3fb950">主力賣 -${total_sell}</span>
         <span style="color:${netColor};font-weight:700">淨 ${total_net>0?'+':''}${total_net}</span>
       </div>
     </div>
     <div style="font-size:10px;color:#8b949e;margin-bottom:6px">每格 = 800萬 NTD｜紅漲綠跌（台股慣例）</div>
-    <div id="tl-chart" style="width:100%;height:500px"></div>`;
+    <div id="tl-chart" style="width:100%;height:620px"></div>`;
 
-  const dates = tl.map(d => d.date);
-  const closes = tl.map(d => d.close || null);
-  const opens  = tl.map(d => d.open  || null);
-  const highs  = tl.map(d => d.high  || null);
-  const lows   = tl.map(d => d.low   || null);
-  const buyScores  = tl.map(d =>  d.buy_score);
-  const sellScores = tl.map(d => -d.sell_score);
-  const hasPrice   = closes.some(c => c && c > 0);
+  const dates       = tl.map(d => d.date);
+  const closes      = tl.map(d => d.close  || null);
+  const opens       = tl.map(d => d.open   || null);
+  const highs       = tl.map(d => d.high   || null);
+  const lows        = tl.map(d => d.low    || null);
+  const volumes     = tl.map(d => d.volume || 0);
+  const buyScores   = tl.map(d =>  d.buy_score);
+  const sellScores  = tl.map(d => -d.sell_score);
+  const retailBuys  = tl.map(d =>  (d.retail_buy  || 0));
+  const retailSells = tl.map(d => -(d.retail_sell || 0));
+  const hasPrice    = closes.some(c => c && c > 0);
+  const hasVolume   = volumes.some(v => v > 0);
 
   const traces = [];
+
+  // 成交量 (overlay on price panel, right axis, scaled to bottom 20%)
+  if (hasVolume) {
+    traces.push({
+      type: 'bar', x: dates, y: volumes,
+      name: '成交量(張)', marker: { color: 'rgba(88,166,255,0.22)' },
+      xaxis: 'x', yaxis: 'y4',
+      hovertemplate: '%{x}<br>成交量 %{y}張<extra></extra>',
+    });
+  }
+
+  // K線
   if (hasPrice) {
     traces.push({
       type: 'candlestick',
@@ -2156,54 +2183,84 @@ function renderTimeline(tl, stock) {
       decreasing: { line: { color: '#3fb950', width: 1 }, fillcolor: '#3fb950' },
       xaxis: 'x', yaxis: 'y',
       showlegend: false,
-      hoverinfo: 'x+y',
     });
   }
+
+  // 主力強度
   traces.push({
     type: 'bar', x: dates, y: buyScores,
-    name: '大戶買', marker: { color: 'rgba(248,81,73,0.75)' },
+    name: '主力買', marker: { color: 'rgba(248,81,73,0.80)' },
     xaxis: 'x', yaxis: 'y2',
-    hovertemplate: '%{x}<br>買 +%{y}<extra></extra>',
+    hovertemplate: '%{x}<br>主力買 +%{y}<extra></extra>',
   });
   traces.push({
     type: 'bar', x: dates, y: sellScores,
-    name: '大戶賣', marker: { color: 'rgba(63,185,80,0.75)' },
+    name: '主力賣', marker: { color: 'rgba(63,185,80,0.80)' },
     xaxis: 'x', yaxis: 'y2',
-    hovertemplate: '%{x}<br>賣 %{y}<extra></extra>',
+    hovertemplate: '%{x}<br>主力賣 %{y}<extra></extra>',
   });
 
-  const priceH = hasPrice ? 0.62 : 0;
-  const gap    = hasPrice ? 0.04 : 0;
+  // 散戶
+  traces.push({
+    type: 'bar', x: dates, y: retailBuys,
+    name: '散戶買', marker: { color: 'rgba(248,81,73,0.45)' },
+    xaxis: 'x', yaxis: 'y3',
+    hovertemplate: '%{x}<br>散戶買 +%{y}張<extra></extra>',
+  });
+  traces.push({
+    type: 'bar', x: dates, y: retailSells,
+    name: '散戶賣', marker: { color: 'rgba(63,185,80,0.45)' },
+    xaxis: 'x', yaxis: 'y3',
+    hovertemplate: '%{x}<br>散戶賣 %{y}張<extra></extra>',
+  });
+
+  // domain: 價格[0.54,1.0]  主力[0.30,0.51]  散戶[0,0.26]
+  const pD = [0.54, 1.00];
+  const iD = [0.30, 0.51];
+  const rD = [0.00, 0.26];
+  const maxVol = hasVolume ? Math.max(...volumes) : 1;
+
   const layout = {
     paper_bgcolor: '#0d1117',
     plot_bgcolor:  '#161b22',
     font:   { color: '#e6edf3', size: 11, family: 'system-ui,sans-serif' },
-    margin: { l: 52, r: 12, t: 8, b: 40 },
+    margin: { l: 55, r: 55, t: 8, b: 40 },
     xaxis: {
       type: 'category',
       tickfont:    { size: 10 },
       gridcolor:   '#30363d',
       linecolor:   '#30363d',
       rangeslider: { visible: false },
-      domain: [0, 1],
       nticks: Math.min(tl.length, 20),
+      anchor: 'y3',
     },
-    yaxis: hasPrice ? {
-      title: { text: '股價', font: { size: 10 } },
-      gridcolor: '#30363d',
-      linecolor: '#30363d',
-      domain: [1 - priceH, 1.0],
-      tickfont:  { size: 10 },
-      side: 'left',
-    } : { visible: false, domain: [1, 1] },
+    yaxis: {
+      title:     { text: '股價', font: { size: 10 } },
+      gridcolor: '#30363d', linecolor: '#30363d',
+      domain: pD, tickfont: { size: 10 },
+      visible: hasPrice,
+    },
     yaxis2: {
-      title:     { text: '大戶強度', font: { size: 10 } },
-      gridcolor: '#30363d',
-      linecolor: '#30363d',
-      domain: [0, 1 - priceH - gap],
+      title:     { text: '主力強度', font: { size: 10 } },
+      gridcolor: '#30363d', linecolor: '#30363d',
+      domain: iD,
       zeroline: true, zerolinecolor: '#8b949e', zerolinewidth: 1,
       tickfont: { size: 10 },
-      side: 'left',
+    },
+    yaxis3: {
+      title:     { text: '散戶(張)', font: { size: 10 } },
+      gridcolor: '#30363d', linecolor: '#30363d',
+      domain: rD,
+      zeroline: true, zerolinecolor: '#8b949e', zerolinewidth: 1,
+      tickfont: { size: 10 },
+    },
+    yaxis4: {
+      overlaying: 'y',
+      side: 'right',
+      showgrid: false, showticklabels: false,
+      domain: pD,
+      range: [0, maxVol * 5],
+      visible: hasVolume,
     },
     barmode: 'relative',
     legend: { orientation: 'h', x: 0, y: -0.06, font: { size: 10 } },
@@ -2215,7 +2272,7 @@ function renderTimeline(tl, stock) {
     displayModeBar: true,
     modeBarButtonsToRemove: ['select2d','lasso2d','autoScale2d'],
     responsive: true,
-    scrollZoom:  true,
+    scrollZoom: true,
   });
 }
 
