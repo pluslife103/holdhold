@@ -1679,28 +1679,38 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 
     <!-- 大戶總覽 pane -->
     <div class="pane" id="pane-overview">
-      <div style="display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;flex-wrap:wrap">
-        <span style="font-weight:700;font-size:13px">大戶總覽</span>
-        <select id="ov-days" class="search" style="width:130px">
-          <option value="10">近10交易日</option>
-          <option value="15" selected>近15交易日</option>
-          <option value="20">近20交易日</option>
-          <option value="30">近30交易日</option>
-        </select>
-        <select id="ov-sort" class="search" style="width:120px" onchange="ovSort()">
-          <option value="active">最活躍</option>
-          <option value="buy">主力淨買多</option>
-          <option value="sell">主力淨賣多</option>
-        </select>
-        <button class="sort-btn" onclick="loadOverview()"
-          style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">查詢</button>
-        <span style="font-size:10px;color:var(--mut)">取目前側邊欄清單（最多30檔）・每格=800萬</span>
+      <div style="padding:10px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-weight:700;font-size:13px">大戶總覽</span>
+          <select id="ov-days" class="search" style="width:130px">
+            <option value="10">近10交易日</option>
+            <option value="15" selected>近15交易日</option>
+            <option value="20">近20交易日</option>
+            <option value="30">近30交易日</option>
+          </select>
+          <select id="ov-sort" class="search" style="width:120px" onchange="ovSort()">
+            <option value="active">最活躍</option>
+            <option value="buy">主力淨買多</option>
+            <option value="sell">主力淨賣多</option>
+          </select>
+          <button class="sort-btn" onclick="loadOverview()"
+            style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">查詢</button>
+          <button class="sort-btn" onclick="ovImportSidebar()"
+            style="font-size:11px;padding:3px 10px">匯入側邊欄</button>
+          <span style="font-size:10px;color:var(--mut)">最多30檔・每格=800萬</span>
+        </div>
+        <textarea id="ov-stocks" class="search"
+          style="width:100%;height:52px;resize:vertical;font-family:monospace;font-size:11px;line-height:1.5"
+          placeholder="輸入股票代號，逗號或換行分隔，最多 30 檔"
+>2330, 2454, 2317, 2382, 2395, 2412, 2308, 3711, 2303, 6505,
+2881, 2882, 2886, 2891, 2892, 1301, 1303, 1326, 2002, 2357,
+2379, 3008, 2408, 2327, 2376, 2345, 2615, 2603, 2609, 2610</textarea>
       </div>
       <div id="overview-grid"
         style="flex:1;overflow-y:auto;padding:12px;
                display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
                gap:10px;align-content:start">
-        <div class="empty">點擊「查詢」載入大戶時間軸總覽</div>
+        <div class="empty" style="grid-column:1/-1">點擊「查詢」載入大戶時間軸總覽</div>
       </div>
     </div>
 
@@ -2446,15 +2456,22 @@ function renderTimeline(tl, stock) {
 // ── 大戶總覽 ──────────────────────────────────────────────────────────────
 let _ovData = null;
 
+function ovImportSidebar() {
+  if (!allStocks.length) { showToast('側邊欄尚未載入股票清單'); return; }
+  document.getElementById('ov-stocks').value = allStocks.slice(0, 30).map(s => s.stock_id).join(', ');
+  showToast(`已匯入 ${Math.min(allStocks.length, 30)} 檔`);
+}
+
 async function loadOverview() {
-  const stocks = allStocks.slice(0, 30).map(s => s.stock_id);
+  const raw    = document.getElementById('ov-stocks').value;
+  const stocks = raw.split(/[\s,\n]+/).map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
   if (!stocks.length) {
-    document.getElementById('overview-grid').innerHTML = '<div class="empty">尚未載入股票清單</div>';
+    document.getElementById('overview-grid').innerHTML = '<div class="empty" style="grid-column:1/-1">請輸入股票代號</div>';
     return;
   }
   const days = document.getElementById('ov-days').value;
   const grid = document.getElementById('overview-grid');
-  grid.innerHTML = `<div class="empty" style="padding:40px;grid-column:1/-1">抓取 ${stocks.length} 檔分點資料中，請稍候…</div>`;
+  grid.innerHTML = `<div class="empty" style="padding:40px;grid-column:1/-1">抓取 ${stocks.length} 檔分點資料中，請稍候（約需 ${Math.ceil(stocks.length*0.8)} 秒）…</div>`;
   try {
     const res = await fetch(`/api/multi_timeline?stocks=${stocks.join(',')}&days=${days}`);
     if (!res.ok) {
