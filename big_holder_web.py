@@ -827,6 +827,134 @@ def api_broker_trader(
     return result
 
 
+def _fetch_broker_day(token: str, stock_id: str, date: str):
+    """Fetch+process one stock's broker data for one date. Cached. Returns rows list or []."""
+    ckey = f"broker|{stock_id}|{date}"
+    cached = _cget(ckey, ttl_h=6)
+    if cached is not None:
+        return cached.get("rows", [])
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                    "start_date": date, "end_date": date, "token": token},
+            timeout=20,
+        )
+        j = r.json()
+    except Exception:
+        return []
+    if r.status_code != 200 or j.get("status") not in (200, None):
+        return []
+    rows_raw = j.get("data", [])
+    if not rows_raw:
+        _cset(ckey, {"stock_id": stock_id, "date": date, "rows": [], "summary": {}})
+        return []
+    THOLD = 8_000_000
+    processed, i = [], 0
+    while i < len(rows_raw):
+        name = rows_raw[i].get("securities_trader", "")
+        bid  = rows_raw[i].get("securities_trader_id", "")
+        g_buy_s = g_sell_s = g_buy_amt = g_sell_amt = 0.0
+        j2 = i
+        while j2 < len(rows_raw) and rows_raw[j2].get("securities_trader", "") == name:
+            row = rows_raw[j2]
+            bs  = float(row.get("buy",   0) or 0)
+            ss  = float(row.get("sell",  0) or 0)
+            px  = float(row.get("price", 0) or 0)
+            g_buy_s += bs; g_sell_s += ss
+            g_buy_amt += bs * px; g_sell_amt += ss * px
+            j2 += 1
+        bl = g_buy_s / 1000; sl = g_sell_s / 1000
+        processed.append({
+            "broker_id":   bid,
+            "broker_name": name,
+            "buy":         int(bl),
+            "sell":        int(sl),
+            "net":         int(bl - sl),
+            "buy_price":   round(g_buy_amt  / g_buy_s,  2) if g_buy_s  else 0.0,
+            "sell_price":  round(g_sell_amt / g_sell_s, 2) if g_sell_s else 0.0,
+            "buy_amount":  round(g_buy_amt),
+            "sell_amount": round(g_sell_amt),
+            "is_retail":   g_buy_amt <= THOLD and g_sell_amt <= THOLD,
+        })
+        i = j2
+    retail = [r for r in processed if r["is_retail"]]
+    inst   = [r for r in processed if not r["is_retail"]]
+    _cset(ckey, {
+        "stock_id": stock_id, "date": date, "rows": processed,
+        "summary": {
+            "total": len(processed),
+            "retail_count": len(retail), "inst_count": len(inst),
+            "retail_buy":  sum(r["buy"]  for r in retail),
+            "retail_sell": sum(r["sell"] for r in retail),
+            "retail_net":  sum(r["net"]  for r in retail),
+            "inst_buy":    sum(r["buy"]  for r in inst),
+            "inst_sell":   sum(r["sell"] for r in inst),
+            "inst_net":    sum(r["net"]  for r in inst),
+        },
+    })
+    return processed
+
+
+@app.get("/api/multi_timeline")
+def api_multi_timeline(
+    stocks: str = Query(""),
+    days:   int = Query(15),
+):
+    from datetime import date as dt_date, timedelta as td
+    import os
+
+    stock_list = [s.strip().upper() for s in stocks.split(",") if s.strip()]
+    if not stock_list:
+        raise HTTPException(400, "請輸入股票代號")
+    stock_list = stock_list[:30]
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+
+    today   = dt_date.today()
+    end_d   = today
+    start_d = end_d - td(days=round(days * 1.5))
+    dates   = []
+    d = start_d
+    while d <= end_d:
+        if d.weekday() < 5:
+            dates.append(d.isoformat())
+        d += td(days=1)
+
+    THOLD = 8_000_000
+    raw: dict = {s: {} for s in stock_list}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_fetch_broker_day, token, s, dt): (s, dt)
+                for s in stock_list for dt in dates}
+        for fut in as_completed(futs):
+            sid, dt = futs[fut]
+            raw[sid][dt] = fut.result()
+
+    output = []
+    for stock_id in stock_list:
+        timeline = []
+        for dt in sorted(dates):
+            rows = raw[stock_id].get(dt, [])
+            bs = ss = 0
+            for row in rows:
+                bs += int(row.get("buy_amount",  0) // THOLD)
+                ss += int(row.get("sell_amount", 0) // THOLD)
+            timeline.append({"date": dt, "buy_score": bs, "sell_score": ss, "net_score": bs - ss})
+        total_buy  = sum(t["buy_score"]  for t in timeline)
+        total_sell = sum(t["sell_score"] for t in timeline)
+        output.append({
+            "stock_id":   stock_id,
+            "timeline":   timeline,
+            "total_buy":  total_buy,
+            "total_sell": total_sell,
+            "total_net":  total_buy - total_sell,
+        })
+    output.sort(key=lambda x: -(x["total_buy"] + x["total_sell"]))
+    return {"results": output, "dates": sorted(dates)}
+
+
 @app.get("/api/big_player_timeline")
 def api_big_player_timeline(
     stock_id:   str = Query(""),
@@ -1061,6 +1189,10 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 .tab.active{color:var(--acc);border-bottom-color:var(--acc)}
 .pane{display:none;flex:1;overflow:hidden;flex-direction:column}
 .pane.active{display:flex}
+
+/* ── 大戶總覽 cards ── */
+.ov-card{background:var(--sur);border:1px solid var(--bor);border-radius:var(--rad);padding:10px;cursor:pointer;transition:.15s}
+.ov-card:hover{border-color:var(--acc);background:var(--sur2)}
 
 /* ── Single stock pane ── */
 .single-wrap{display:flex;flex-direction:column;flex:1;overflow:hidden;padding:12px 16px;gap:10px}
@@ -1313,6 +1445,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('compare')">對比分析 <span id="compare-count" style="font-size:10px;padding:1px 5px;background:var(--sur2);border-radius:8px;margin-left:4px"></span></div>
       <div class="tab" onclick="switchTab('grade')">分級排行</div>
       <div class="tab" onclick="switchTab('broker')">🏦 分點籌碼</div>
+      <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
     </div>
 
     <!-- 個股 pane -->
@@ -1544,6 +1677,33 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
+    <!-- 大戶總覽 pane -->
+    <div class="pane" id="pane-overview">
+      <div style="display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;flex-wrap:wrap">
+        <span style="font-weight:700;font-size:13px">大戶總覽</span>
+        <select id="ov-days" class="search" style="width:130px">
+          <option value="10">近10交易日</option>
+          <option value="15" selected>近15交易日</option>
+          <option value="20">近20交易日</option>
+          <option value="30">近30交易日</option>
+        </select>
+        <select id="ov-sort" class="search" style="width:120px" onchange="ovSort()">
+          <option value="active">最活躍</option>
+          <option value="buy">主力淨買多</option>
+          <option value="sell">主力淨賣多</option>
+        </select>
+        <button class="sort-btn" onclick="loadOverview()"
+          style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">查詢</button>
+        <span style="font-size:10px;color:var(--mut)">取目前側邊欄清單（最多30檔）・每格=800萬</span>
+      </div>
+      <div id="overview-grid"
+        style="flex:1;overflow-y:auto;padding:12px;
+               display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
+               gap:10px;align-content:start">
+        <div class="empty">點擊「查詢」載入大戶時間軸總覽</div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -1581,6 +1741,13 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <path d="M3 21h18M3 10h18M5 6l7-3 7 3M4 10v11M20 10v11M8 14v3M12 14v3M16 14v3"/>
     </svg>
     <span>分點</span>
+  </button>
+  <button class="bnav-btn" id="bnav-overview" onclick="switchTab('overview')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+      <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+    </svg>
+    <span>總覽</span>
   </button>
 </nav>
 
@@ -2029,7 +2196,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker'];
+  const tabNames = ['single','compare','grade','broker','overview'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -2274,6 +2441,98 @@ function renderTimeline(tl, stock) {
     responsive: true,
     scrollZoom: true,
   });
+}
+
+// ── 大戶總覽 ──────────────────────────────────────────────────────────────
+let _ovData = null;
+
+async function loadOverview() {
+  const stocks = allStocks.slice(0, 30).map(s => s.stock_id);
+  if (!stocks.length) {
+    document.getElementById('overview-grid').innerHTML = '<div class="empty">尚未載入股票清單</div>';
+    return;
+  }
+  const days = document.getElementById('ov-days').value;
+  const grid = document.getElementById('overview-grid');
+  grid.innerHTML = `<div class="empty" style="padding:40px;grid-column:1/-1">抓取 ${stocks.length} 檔分點資料中，請稍候…</div>`;
+  try {
+    const res = await fetch(`/api/multi_timeline?stocks=${stocks.join(',')}&days=${days}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      grid.innerHTML = `<div class="empty" style="color:var(--red);grid-column:1/-1">${err.detail || '載入失敗'}</div>`;
+      return;
+    }
+    _ovData = await res.json();
+    renderOverviewGrid();
+  } catch(e) {
+    grid.innerHTML = `<div class="empty" style="color:var(--red);grid-column:1/-1">錯誤：${e.message}</div>`;
+  }
+}
+
+function ovSort() { if (_ovData) renderOverviewGrid(); }
+
+function renderOverviewGrid() {
+  const sort = document.getElementById('ov-sort').value;
+  let results = [...(_ovData?.results || [])];
+  if      (sort === 'buy')  results.sort((a,b) => b.total_net  - a.total_net);
+  else if (sort === 'sell') results.sort((a,b) => a.total_net  - b.total_net);
+  else                      results.sort((a,b) => (b.total_buy+b.total_sell) - (a.total_buy+a.total_sell));
+
+  const cards = results.map(item => {
+    const info     = allStocks.find(s => s.stock_id === item.stock_id);
+    const name     = info?.stock_name || '';
+    const net      = item.total_net;
+    const netColor = net > 0 ? '#f85149' : net < 0 ? '#3fb950' : '#8b949e';
+    const netStr   = net > 0 ? '+'+net : ''+net;
+    const spark    = _miniSpark(item.timeline, 188, 50);
+    return `<div class="ov-card" onclick="jumpToTimeline('${item.stock_id}')">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px">
+        <div>
+          <span style="font-weight:700;font-size:13px">${item.stock_id}</span>
+          <span style="font-size:10px;color:var(--mut);margin-left:4px">${name}</span>
+        </div>
+        <span style="font-size:13px;font-weight:700;color:${netColor}">${netStr}</span>
+      </div>
+      ${spark}
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-top:4px">
+        <span style="color:#f85149">買 +${item.total_buy}</span>
+        <span style="color:#3fb950">賣 -${item.total_sell}</span>
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('overview-grid').innerHTML = cards || '<div class="empty" style="grid-column:1/-1">無大戶活動資料</div>';
+}
+
+function _miniSpark(timeline, w, h) {
+  if (!timeline || !timeline.length) {
+    return `<svg width="${w}" height="${h}" style="display:block;border-radius:3px">
+      <rect width="${w}" height="${h}" fill="#161b22"/>
+      <line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="#30363d" stroke-width="1"/>
+    </svg>`;
+  }
+  const n      = timeline.length;
+  const barW   = Math.max(2, Math.floor((w - n + 1) / n));
+  const midY   = Math.floor(h / 2);
+  const maxAbs = Math.max(...timeline.map(d => Math.max(d.buy_score, d.sell_score)), 1);
+  const rects  = timeline.map((d, i) => {
+    const x  = i * (barW + 1);
+    const bH = Math.round(d.buy_score  / maxAbs * (midY - 2));
+    const sH = Math.round(d.sell_score / maxAbs * (midY - 2));
+    return `<rect x="${x}" y="${midY-bH}" width="${barW}" height="${bH}" fill="#f85149" opacity="0.85"/>` +
+           `<rect x="${x}" y="${midY}"    width="${barW}" height="${sH}" fill="#3fb950" opacity="0.85"/>`;
+  }).join('');
+  return `<svg width="${w}" height="${h}" style="display:block;border-radius:3px">
+    <rect width="${w}" height="${h}" fill="#161b22"/>
+    <line x1="0" y1="${midY}" x2="${w}" y2="${midY}" stroke="#30363d" stroke-width="1"/>
+    ${rects}
+  </svg>`;
+}
+
+function jumpToTimeline(stockId) {
+  switchTab('broker');
+  setBrokerMode('timeline');
+  document.getElementById('tl-stock').value = stockId;
+  loadTimeline();
 }
 
 function setTraderPreset(id) {
