@@ -827,6 +827,137 @@ def api_broker_trader(
     return result
 
 
+@app.get("/api/big_player_timeline")
+def api_big_player_timeline(
+    stock_id:   str = Query(""),
+    start_date: str = Query(""),
+    end_date:   str = Query(""),
+):
+    import os
+    from datetime import date as dt_date, timedelta as td
+
+    stock_id = stock_id.strip().upper()
+    if not stock_id:
+        raise HTTPException(400, "請輸入股票代號")
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+
+    today = dt_date.today()
+    end_d   = dt_date.fromisoformat(end_date)   if end_date   else today
+    start_d = dt_date.fromisoformat(start_date) if start_date else end_d - td(days=41)
+
+    dates = []
+    d = start_d
+    while d <= end_d:
+        if d.weekday() < 5:
+            dates.append(d.isoformat())
+        d += td(days=1)
+
+    THRESHOLD = 8_000_000
+
+    def _fetch_one(date: str):
+        ckey = f"broker|{stock_id}|{date}"
+        cached = _cget(ckey, ttl_h=6)
+        if cached is not None:
+            return date, cached.get("rows", [])
+        try:
+            r = requests.get(
+                FINMIND_BASE,
+                params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                        "start_date": date, "end_date": date, "token": token},
+                timeout=20,
+            )
+            j = r.json()
+        except Exception:
+            return date, None
+        if r.status_code != 200 or j.get("status") not in (200, None):
+            return date, None
+        rows_raw = j.get("data", [])
+        if not rows_raw:
+            _cset(ckey, {"stock_id": stock_id, "date": date, "rows": [], "summary": {}})
+            return date, []
+        processed = []
+        i = 0
+        while i < len(rows_raw):
+            name = rows_raw[i].get("securities_trader", "")
+            bid  = rows_raw[i].get("securities_trader_id", "")
+            g_buy_s = g_sell_s = g_buy_amt = g_sell_amt = 0.0
+            j2 = i
+            while j2 < len(rows_raw) and rows_raw[j2].get("securities_trader", "") == name:
+                row = rows_raw[j2]
+                bs  = float(row.get("buy",   0) or 0)
+                ss  = float(row.get("sell",  0) or 0)
+                px  = float(row.get("price", 0) or 0)
+                g_buy_s += bs; g_sell_s += ss
+                g_buy_amt += bs * px; g_sell_amt += ss * px
+                j2 += 1
+            buy_lots  = g_buy_s  / 1000
+            sell_lots = g_sell_s / 1000
+            avg_buy_px  = round(g_buy_amt  / g_buy_s,  2) if g_buy_s  else 0.0
+            avg_sell_px = round(g_sell_amt / g_sell_s, 2) if g_sell_s else 0.0
+            processed.append({
+                "broker_id":   bid,
+                "broker_name": name,
+                "buy":         int(buy_lots),
+                "sell":        int(sell_lots),
+                "net":         int(buy_lots - sell_lots),
+                "buy_price":   avg_buy_px,
+                "sell_price":  avg_sell_px,
+                "buy_amount":  round(g_buy_amt),
+                "sell_amount": round(g_sell_amt),
+                "is_retail":   g_buy_amt <= THRESHOLD and g_sell_amt <= THRESHOLD,
+            })
+            i = j2
+        retail = [r for r in processed if r["is_retail"]]
+        inst   = [r for r in processed if not r["is_retail"]]
+        result = {
+            "stock_id": stock_id,
+            "date":     date,
+            "rows":     processed,
+            "summary": {
+                "total":        len(processed),
+                "retail_count": len(retail),
+                "inst_count":   len(inst),
+                "retail_buy":   sum(r["buy"]  for r in retail),
+                "retail_sell":  sum(r["sell"] for r in retail),
+                "retail_net":   sum(r["net"]  for r in retail),
+                "inst_buy":     sum(r["buy"]  for r in inst),
+                "inst_sell":    sum(r["sell"] for r in inst),
+                "inst_net":     sum(r["net"]  for r in inst),
+            },
+        }
+        _cset(ckey, result)
+        return date, processed
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {ex.submit(_fetch_one, d): d for d in dates}
+        day_map = {}
+        for fut in as_completed(futs):
+            date, rows = fut.result()
+            day_map[date] = rows
+
+    timeline = []
+    for date in sorted(day_map.keys()):
+        rows = day_map[date]
+        if rows is None or len(rows) == 0:
+            continue
+        buy_score = sell_score = 0
+        for row in rows:
+            buy_score  += int(row.get("buy_amount",  0) // THRESHOLD)
+            sell_score += int(row.get("sell_amount", 0) // THRESHOLD)
+        if buy_score == 0 and sell_score == 0:
+            continue
+        timeline.append({
+            "date":       date,
+            "buy_score":  buy_score,
+            "sell_score": sell_score,
+            "net_score":  buy_score - sell_score,
+        })
+
+    return {"stock_id": stock_id, "timeline": timeline}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return _HTML
@@ -1292,9 +1423,10 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px;height:100%;overflow-y:auto">
 
         <!-- 模式切換 -->
-        <div style="display:flex;gap:6px">
-          <button class="gf-btn active" id="bmode-stock"  onclick="setBrokerMode('stock')"  style="font-size:12px;padding:4px 14px">個股查詢</button>
-          <button class="gf-btn"        id="bmode-trader" onclick="setBrokerMode('trader')" style="font-size:12px;padding:4px 14px">券商統計</button>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="gf-btn active" id="bmode-stock"    onclick="setBrokerMode('stock')"    style="font-size:12px;padding:4px 14px">個股查詢</button>
+          <button class="gf-btn"        id="bmode-trader"   onclick="setBrokerMode('trader')"   style="font-size:12px;padding:4px 14px">券商統計</button>
+          <button class="gf-btn"        id="bmode-timeline" onclick="setBrokerMode('timeline')" style="font-size:12px;padding:4px 14px">大戶時間軸</button>
         </div>
 
         <!-- 控制列：個股模式 -->
@@ -1336,6 +1468,28 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             <button class="gf-btn"        id="btf-retail" onclick="setBrokerFilter('retail')">散戶</button>
           </div>
         </div>
+
+        <!-- 控制列：時間軸模式 -->
+        <div id="broker-ctrl-timeline" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+          <input id="tl-stock" class="search" placeholder="股票代號 e.g. 2330" style="width:130px"
+                 onkeydown="if(event.key==='Enter')loadTimeline()">
+          <button class="sort-btn" onclick="tlSetPreset('2330')" style="font-size:11px;padding:3px 8px">2330</button>
+          <button class="sort-btn" onclick="tlSetPreset('2454')" style="font-size:11px;padding:3px 8px">2454</button>
+          <button class="sort-btn" onclick="tlSetPreset('2317')" style="font-size:11px;padding:3px 8px">2317</button>
+          <button class="sort-btn" onclick="tlSetPreset('0050')" style="font-size:11px;padding:3px 8px">0050</button>
+          <input id="tl-start" type="date" class="search" style="width:140px">
+          <span style="color:var(--mut);font-size:12px">～</span>
+          <input id="tl-end"   type="date" class="search" style="width:140px">
+          <button class="sort-btn" onclick="loadTimeline()" style="background:var(--acc);color:#000;font-weight:700">查詢</button>
+          <select id="tl-range" class="search" style="width:110px" onchange="tlSetRange(this.value)">
+            <option value="20">近20交易日</option>
+            <option value="40" selected>近40交易日</option>
+            <option value="60">近60交易日</option>
+          </select>
+        </div>
+
+        <!-- 時間軸圖表區 -->
+        <div id="broker-timeline-wrap" style="display:none;flex-direction:column;gap:6px"></div>
 
         <!-- 摘要卡 -->
         <div id="broker-summary" style="display:none;gap:8px;flex-wrap:wrap"></div>
@@ -1880,17 +2034,122 @@ let _brokerMode = 'stock';
 
 function setBrokerMode(mode) {
   _brokerMode = mode;
-  document.getElementById('bmode-stock').classList.toggle('active', mode === 'stock');
-  document.getElementById('bmode-trader').classList.toggle('active', mode === 'trader');
-  document.getElementById('broker-ctrl-stock').style.display  = mode === 'stock'  ? 'flex' : 'none';
-  document.getElementById('broker-ctrl-trader').style.display = mode === 'trader' ? 'flex' : 'none';
+  ['stock','trader','timeline'].forEach(m => {
+    document.getElementById('bmode-'+m).classList.toggle('active', m === mode);
+    document.getElementById('broker-ctrl-'+m).style.display = m === mode ? 'flex' : 'none';
+  });
   document.getElementById('broker-summary').style.display = 'none';
   document.getElementById('broker-flow-wrap').style.display = 'none';
   document.getElementById('broker-table-wrap').innerHTML = '';
+  document.getElementById('broker-timeline-wrap').style.display = 'none';
+  document.getElementById('broker-timeline-wrap').innerHTML = '';
   if (mode === 'trader') {
     const d = document.getElementById('broker-date-trader');
     if (!d.value) d.value = document.getElementById('broker-date').value;
   }
+  if (mode === 'timeline') {
+    const end = new Date(); end.setDate(end.getDate() - 1);
+    const start = new Date(end); start.setDate(start.getDate() - 55);
+    document.getElementById('tl-end').value   = end.toISOString().slice(0,10);
+    document.getElementById('tl-start').value = start.toISOString().slice(0,10);
+  }
+}
+
+function tlSetPreset(id) {
+  document.getElementById('tl-stock').value = id;
+  loadTimeline();
+}
+
+function tlSetRange(days) {
+  const end = new Date(); end.setDate(end.getDate() - 1);
+  const start = new Date(end); start.setDate(start.getDate() - Math.round(days * 1.45));
+  document.getElementById('tl-end').value   = end.toISOString().slice(0,10);
+  document.getElementById('tl-start').value = start.toISOString().slice(0,10);
+}
+
+async function loadTimeline() {
+  const stock = document.getElementById('tl-stock').value.trim().toUpperCase();
+  const start = document.getElementById('tl-start').value;
+  const end   = document.getElementById('tl-end').value;
+  if (!stock) { showToast('請輸入股票代號'); return; }
+  const wrap = document.getElementById('broker-timeline-wrap');
+  wrap.style.display = 'flex';
+  wrap.innerHTML = '<div class="empty" style="padding:40px">抓取多日分點資料中，請稍候…</div>';
+  try {
+    const res = await fetch(`/api/big_player_timeline?stock_id=${encodeURIComponent(stock)}&start_date=${start}&end_date=${end}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      wrap.innerHTML = `<div class="empty" style="color:var(--red)">${err.detail || '載入失敗'}</div>`;
+      return;
+    }
+    const d = await res.json();
+    if (!d.timeline || !d.timeline.length) {
+      wrap.innerHTML = '<div class="empty">此區間無大戶活動資料</div>';
+      return;
+    }
+    renderTimeline(d.timeline, stock);
+  } catch(e) {
+    wrap.innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function renderTimeline(tl, stock) {
+  const wrap = document.getElementById('broker-timeline-wrap');
+  const maxB = Math.max(...tl.map(d => d.buy_score),  1);
+  const maxS = Math.max(...tl.map(d => d.sell_score), 1);
+  const maxV  = Math.max(maxB, maxS);
+  const BAR_H = 18;
+  const GAP   = 3;
+  const LABEL_W = 76;
+  const SCORE_W = 38;
+  const CHART_W = Math.min(600, window.innerWidth - LABEL_W - SCORE_W - 40);
+
+  const rows = tl.map(d => {
+    const bPct  = (d.buy_score  / maxV * 100).toFixed(1);
+    const sPct  = (d.sell_score / maxV * 100).toFixed(1);
+    const net   = d.net_score;
+    const netColor = net > 0 ? 'var(--acc)' : net < 0 ? 'var(--red)' : 'var(--mut)';
+    const netStr   = net > 0 ? '+'+net : ''+net;
+    return `
+    <div style="display:flex;align-items:center;gap:6px;font-size:11px;min-height:${BAR_H+GAP*2}px">
+      <span style="width:${LABEL_W}px;color:var(--mut);flex-shrink:0;text-align:right">${d.date.slice(5)}</span>
+      <div style="flex:1;display:flex;flex-direction:column;gap:2px">
+        <div style="display:flex;align-items:center;gap:3px">
+          <div style="height:${BAR_H-2}px;width:${bPct}%;background:#1f6f3a;border-radius:2px;min-width:${d.buy_score?2:0}px;transition:width .3s"></div>
+          <span style="color:#3fb950;font-size:10px;white-space:nowrap">${d.buy_score ? '+'+d.buy_score : ''}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:3px">
+          <div style="height:${BAR_H-2}px;width:${sPct}%;background:#6e1f1f;border-radius:2px;min-width:${d.sell_score?2:0}px;transition:width .3s"></div>
+          <span style="color:#f85149;font-size:10px;white-space:nowrap">${d.sell_score ? '-'+d.sell_score : ''}</span>
+        </div>
+      </div>
+      <span style="width:${SCORE_W}px;text-align:right;font-weight:700;color:${netColor};flex-shrink:0">${netStr}</span>
+    </div>`;
+  }).join('');
+
+  const total_buy  = tl.reduce((s,d) => s+d.buy_score,  0);
+  const total_sell = tl.reduce((s,d) => s+d.sell_score, 0);
+  const total_net  = total_buy - total_sell;
+  const netColor   = total_net > 0 ? 'var(--acc)' : total_net < 0 ? 'var(--red)' : 'var(--mut)';
+
+  wrap.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <span style="font-weight:700;font-size:13px">${stock} 大戶時間軸</span>
+      <div style="display:flex;gap:12px;font-size:12px">
+        <span style="color:#3fb950">買方累計 +${total_buy}</span>
+        <span style="color:#f85149">賣方累計 -${total_sell}</span>
+        <span style="color:${netColor};font-weight:700">淨 ${total_net>0?'+':''}${total_net}</span>
+      </div>
+    </div>
+    <div style="font-size:10px;color:var(--mut);display:flex;justify-content:flex-end;gap:16px;padding-right:${SCORE_W+6}px">
+      <span>■ 每格 = 800萬</span>
+    </div>
+    <div style="display:flex;font-size:10px;color:var(--mut);margin-bottom:2px">
+      <span style="width:${LABEL_W}px;text-align:right">日期</span>
+      <span style="flex:1;padding-left:10px">← 大戶買(綠) / 賣(紅) →</span>
+      <span style="width:${SCORE_W}px;text-align:right">淨</span>
+    </div>
+    <div style="overflow-y:auto;max-height:calc(100vh - 260px)">${rows}</div>`;
 }
 
 function setTraderPreset(id) {
