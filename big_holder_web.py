@@ -723,6 +723,112 @@ def api_broker(
     return result
 
 
+@app.get("/api/broker_trader")
+def api_broker_trader(
+    trader_id: str = Query(""),
+    date:      str = Query(""),
+    force:     int = Query(0),
+):
+    import os
+    from datetime import date as dt_date
+    trader_id = trader_id.strip()
+    if not trader_id:
+        raise HTTPException(400, "請輸入券商代碼")
+    if not date:
+        date = dt_date.today().isoformat()
+    ckey = f"broker_trader|{trader_id}|{date}"
+    if not force:
+        cached = _cget(ckey, ttl_h=6)
+        if cached is not None:
+            return cached
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={
+                "dataset":              "TaiwanStockTradingDailyReport",
+                "securities_trader_id": trader_id,
+                "start_date":           date,
+                "end_date":             date,
+                "token":                token,
+            },
+            timeout=25,
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(502, f"無法連線 FinMind API: {type(e).__name__}")
+    try:
+        j = r.json()
+    except Exception:
+        raise HTTPException(502, f"FinMind 回應無法解析 (HTTP {r.status_code}): {r.text[:200]}")
+    if r.status_code != 200 or j.get("status") not in (200, None):
+        msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
+        raise HTTPException(502, f"FinMind error: {msg} | raw: {json.dumps(j, ensure_ascii=False)[:300]}")
+    rows_raw = j.get("data", [])
+    if not rows_raw:
+        result = {"trader_id": trader_id, "date": date, "rows": [], "summary": {}}
+        _cset(ckey, result)
+        return result
+
+    INST_THRESHOLD = 8_000_000
+    processed = []
+    i = 0
+    while i < len(rows_raw):
+        sid  = rows_raw[i].get("stock_id", "")
+        g_buy_s = g_sell_s = g_buy_amt = g_sell_amt = 0.0
+        j2 = i
+        while j2 < len(rows_raw) and rows_raw[j2].get("stock_id", "") == sid:
+            row = rows_raw[j2]
+            bs  = float(row.get("buy",   0) or 0)
+            ss  = float(row.get("sell",  0) or 0)
+            px  = float(row.get("price", 0) or 0)
+            g_buy_s    += bs
+            g_sell_s   += ss
+            g_buy_amt  += bs * px
+            g_sell_amt += ss * px
+            j2 += 1
+        buy_lots    = g_buy_s  / 1000
+        sell_lots   = g_sell_s / 1000
+        avg_buy_px  = round(g_buy_amt  / g_buy_s,  2) if g_buy_s  else 0.0
+        avg_sell_px = round(g_sell_amt / g_sell_s, 2) if g_sell_s else 0.0
+        processed.append({
+            "stock_id":    sid,
+            "buy":         int(buy_lots),
+            "sell":        int(sell_lots),
+            "net":         int(buy_lots - sell_lots),
+            "buy_price":   avg_buy_px,
+            "sell_price":  avg_sell_px,
+            "buy_amount":  round(g_buy_amt),
+            "sell_amount": round(g_sell_amt),
+            "is_retail":   g_buy_amt <= INST_THRESHOLD and g_sell_amt <= INST_THRESHOLD,
+        })
+        i = j2
+
+    processed.sort(key=lambda x: x["net"], reverse=True)
+    retail = [r for r in processed if r["is_retail"]]
+    inst   = [r for r in processed if not r["is_retail"]]
+    result = {
+        "trader_id":   trader_id,
+        "trader_name": rows_raw[0].get("securities_trader", trader_id),
+        "date":        date,
+        "rows":        processed,
+        "summary": {
+            "total":        len(processed),
+            "retail_count": len(retail),
+            "inst_count":   len(inst),
+            "retail_buy":   sum(r["buy"]  for r in retail),
+            "retail_sell":  sum(r["sell"] for r in retail),
+            "retail_net":   sum(r["net"]  for r in retail),
+            "inst_buy":     sum(r["buy"]  for r in inst),
+            "inst_sell":    sum(r["sell"] for r in inst),
+            "inst_net":     sum(r["net"]  for r in inst),
+        },
+    }
+    _cset(ckey, result)
+    return result
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return _HTML
@@ -1187,8 +1293,14 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
     <div class="pane" id="pane-broker">
       <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px;height:100%;overflow-y:auto">
 
-        <!-- 控制列 -->
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <!-- 模式切換 -->
+        <div style="display:flex;gap:6px">
+          <button class="gf-btn active" id="bmode-stock"  onclick="setBrokerMode('stock')"  style="font-size:12px;padding:4px 14px">個股查詢</button>
+          <button class="gf-btn"        id="bmode-trader" onclick="setBrokerMode('trader')" style="font-size:12px;padding:4px 14px">券商統計</button>
+        </div>
+
+        <!-- 控制列：個股模式 -->
+        <div id="broker-ctrl-stock" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <input id="broker-stock" class="search" placeholder="股票代號 e.g. 0050" style="width:130px"
                  onkeydown="if(event.key==='Enter')loadBroker()">
           <button class="sort-btn" onclick="setPreset('0050')" style="font-size:11px;padding:3px 8px">0050</button>
@@ -1204,6 +1316,26 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             <button class="gf-btn active" id="bf-all"    onclick="setBrokerFilter('all')">全部</button>
             <button class="gf-btn"        id="bf-inst"   onclick="setBrokerFilter('inst')">主力</button>
             <button class="gf-btn"        id="bf-retail" onclick="setBrokerFilter('retail')">散戶</button>
+          </div>
+        </div>
+
+        <!-- 控制列：券商模式 -->
+        <div id="broker-ctrl-trader" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+          <input id="broker-trader-id" class="search" placeholder="券商代碼 e.g. 1020" style="width:130px"
+                 onkeydown="if(event.key==='Enter')loadBrokerTrader()">
+          <button class="sort-btn" onclick="setTraderPreset('1020')" style="font-size:11px;padding:3px 8px">1020 合庫</button>
+          <button class="sort-btn" onclick="setTraderPreset('1440')" style="font-size:11px;padding:3px 8px">1440 元大</button>
+          <button class="sort-btn" onclick="setTraderPreset('9200')" style="font-size:11px;padding:3px 8px">9200 富邦</button>
+          <button class="sort-btn" onclick="setTraderPreset('6460')" style="font-size:11px;padding:3px 8px">6460 永豐金</button>
+          <button class="sort-btn" onclick="brokerPrevDay()" style="padding:3px 8px">←</button>
+          <input id="broker-date-trader" type="date" class="search" style="width:140px"
+                 onchange="loadBrokerTrader()">
+          <button class="sort-btn" onclick="brokerNextDay()" style="padding:3px 8px">→</button>
+          <button class="sort-btn" onclick="loadBrokerTrader()" style="background:var(--acc);color:#000;font-weight:700">查詢</button>
+          <div style="display:flex;gap:3px;margin-left:auto">
+            <button class="gf-btn active" id="btf-all"    onclick="setBrokerFilter('all')">全部</button>
+            <button class="gf-btn"        id="btf-inst"   onclick="setBrokerFilter('inst')">主力</button>
+            <button class="gf-btn"        id="btf-retail" onclick="setBrokerFilter('retail')">散戶</button>
           </div>
         </div>
 
@@ -1746,6 +1878,104 @@ function switchTab(name) {
 let _brokerData = null;
 let _brokerFilter = 'all';
 let _brokerSort = { col: 'net', asc: false };
+let _brokerMode = 'stock';
+
+function setBrokerMode(mode) {
+  _brokerMode = mode;
+  document.getElementById('bmode-stock').classList.toggle('active', mode === 'stock');
+  document.getElementById('bmode-trader').classList.toggle('active', mode === 'trader');
+  document.getElementById('broker-ctrl-stock').style.display  = mode === 'stock'  ? 'flex' : 'none';
+  document.getElementById('broker-ctrl-trader').style.display = mode === 'trader' ? 'flex' : 'none';
+  document.getElementById('broker-summary').style.display = 'none';
+  document.getElementById('broker-flow-wrap').style.display = 'none';
+  document.getElementById('broker-table-wrap').innerHTML = '';
+  if (mode === 'trader') {
+    const d = document.getElementById('broker-date-trader');
+    if (!d.value) d.value = document.getElementById('broker-date').value;
+  }
+}
+
+function setTraderPreset(id) {
+  document.getElementById('broker-trader-id').value = id;
+  loadBrokerTrader();
+}
+
+async function loadBrokerTrader() {
+  const tid  = document.getElementById('broker-trader-id').value.trim();
+  const date = document.getElementById('broker-date-trader').value;
+  if (!tid) { document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">請輸入券商代碼</div>'; return; }
+  document.getElementById('broker-summary').style.display = 'none';
+  document.getElementById('broker-flow-wrap').style.display = 'none';
+  document.getElementById('broker-table-wrap').innerHTML = '<div class="empty" style="padding:40px">抓取券商資料中…</div>';
+  try {
+    const res = await fetch(`/api/broker_trader?trader_id=${encodeURIComponent(tid)}&date=${date||''}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">${err.detail || '載入失敗'}</div>`;
+      return;
+    }
+    const d = await res.json();
+    if (!d.rows || !d.rows.length) {
+      document.getElementById('broker-table-wrap').innerHTML = `<div class="empty">${date||'今日'} 無資料（非交易日或查無資料）</div>`;
+      return;
+    }
+    _brokerData = d;
+    renderBrokerSummary(d.summary, d.trader_name || tid, d.date || date);
+    renderTraderTable(d.rows);
+  } catch(e) {
+    document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function renderTraderTable(rows) {
+  const filtered = rows.filter(r => {
+    if (_brokerFilter === 'inst')   return !r.is_retail;
+    if (_brokerFilter === 'retail') return  r.is_retail;
+    return true;
+  });
+  const { col, asc } = _brokerSort;
+  const sorted = [...filtered].sort((a, b) => {
+    const av = a[col] ?? 0, bv = b[col] ?? 0;
+    return asc ? av - bv : bv - av;
+  });
+  if (!sorted.length) {
+    document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">此分類無資料</div>';
+    return;
+  }
+  const si = c => c === col ? (asc ? '↑' : '↓') : '<span style="opacity:.3">↕</span>';
+  const th = (c, label) => `<th onclick="brokerSortBy('${c}')" style="cursor:pointer;white-space:nowrap">${label} ${si(c)}</th>`;
+  const rows_html = sorted.map((r, i) => `
+    <tr>
+      <td style="color:var(--mut);font-size:11px">${i+1}</td>
+      <td style="font-weight:700;color:var(--acc)">${r.stock_id}</td>
+      <td><span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:700;${r.is_retail ? 'background:#58a6ff22;color:#58a6ff;border:1px solid #58a6ff44' : 'background:#d2992222;color:#d29922;border:1px solid #d2992244'}">${r.is_retail ? '散戶' : '主力'}</span></td>
+      <td style="text-align:right;color:var(--acc)">${r.buy ? r.buy.toLocaleString() : '—'}</td>
+      <td style="text-align:right;color:var(--red)">${r.sell ? r.sell.toLocaleString() : '—'}</td>
+      <td style="text-align:right">${fmtNet(r.net)}</td>
+      <td style="text-align:right;color:var(--mut);font-size:11px">${r.buy_price || '—'}</td>
+      <td style="text-align:right;color:var(--mut);font-size:11px">${r.sell_price || '—'}</td>
+      <td style="text-align:right;font-size:11px;color:var(--mut)">${fmtAmt(r.buy_amount)}</td>
+      <td style="text-align:right;font-size:11px;color:var(--mut)">${fmtAmt(r.sell_amount)}</td>
+    </tr>`).join('');
+  document.getElementById('broker-table-wrap').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead style="position:sticky;top:0;background:var(--sur)">
+        <tr style="border-bottom:1px solid var(--bor)">
+          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">#</th>
+          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">股票代號</th>
+          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">類型</th>
+          ${th('buy','買進(張)')}
+          ${th('sell','賣出(張)')}
+          ${th('net','淨買超')}
+          ${th('buy_price','買均價')}
+          ${th('sell_price','賣均價')}
+          ${th('buy_amount','買進金額')}
+          ${th('sell_amount','賣出金額')}
+        </tr>
+      </thead>
+      <tbody>${rows_html}</tbody>
+    </table>`;
+}
 
 function setPreset(s) {
   document.getElementById('broker-stock').value = s;
@@ -1772,9 +2002,15 @@ function brokerNextDay() {
 function setBrokerFilter(f) {
   _brokerFilter = f;
   ['all','inst','retail'].forEach(x => {
-    document.getElementById('bf-'+x).classList.toggle('active', x === f);
+    const s = document.getElementById('bf-'+x);
+    const t = document.getElementById('btf-'+x);
+    if (s) s.classList.toggle('active', x === f);
+    if (t) t.classList.toggle('active', x === f);
   });
-  if (_brokerData) renderBrokerTable(_brokerData.rows || []);
+  if (_brokerData) {
+    if (_brokerMode === 'trader') renderTraderTable(_brokerData.rows || []);
+    else renderBrokerTable(_brokerData.rows || []);
+  }
 }
 
 function fmtAmt(v) {
@@ -1910,7 +2146,10 @@ function renderBrokerTable(rows) {
 function brokerSortBy(col) {
   if (_brokerSort.col === col) _brokerSort.asc = !_brokerSort.asc;
   else { _brokerSort.col = col; _brokerSort.asc = false; }
-  if (_brokerData) renderBrokerTable(_brokerData.rows || []);
+  if (_brokerData) {
+    if (_brokerMode === 'trader') renderTraderTable(_brokerData.rows || []);
+    else renderBrokerTable(_brokerData.rows || []);
+  }
 }
 
 // ── Toast ──────────────────────────────────────────────────────────────
