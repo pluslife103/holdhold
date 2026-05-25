@@ -695,7 +695,7 @@ def api_broker(
             "sell_price":  avg_sell_px,
             "buy_amount":  round(g_buy_amt),
             "sell_amount": round(g_sell_amt),
-            "is_retail":   total_amt <= INST_THRESHOLD,
+            "is_retail":   g_buy_amt <= INST_THRESHOLD and g_sell_amt <= INST_THRESHOLD,
         })
         i = j
 
