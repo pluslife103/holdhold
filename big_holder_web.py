@@ -640,13 +640,18 @@ def api_broker(
             },
             timeout=25,
         )
-        r.raise_for_status()
-        j = r.json()
-    except Exception as e:
-        raise HTTPException(502, f"FinMind API 錯誤: {e}")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(502, f"無法連線 FinMind API: {type(e).__name__}")
 
-    if j.get("status") != 200:
-        raise HTTPException(502, j.get("msg", "FinMind API 錯誤"))
+    # 先嘗試解析 JSON，以取得 FinMind 的錯誤訊息（不暴露 token URL）
+    try:
+        j = r.json()
+    except Exception:
+        raise HTTPException(502, f"FinMind 回應無法解析 (HTTP {r.status_code})")
+
+    if r.status_code != 200 or j.get("status") not in (200, None):
+        msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
+        raise HTTPException(502, f"FinMind: {msg}")
 
     rows_raw = j.get("data", [])
     if not rows_raw:
