@@ -660,28 +660,44 @@ def api_broker(
         _cset(ckey, result)
         return result
 
-    RETAIL = 1_000_000
+    INST_THRESHOLD = 8_000_000  # 買進+賣出金額合計 > 800萬 → 主力
+
+    # 序號連號且分點名稱相同 → 合併為同一筆
     processed = []
-    for row in rows_raw:
-        buy_shares  = float(row.get("buy", 0) or 0)   # 股
-        sell_shares = float(row.get("sell", 0) or 0)  # 股
-        px          = float(row.get("price", 0) or 0) # 每股價格
-        buy_lots    = buy_shares / 1000                # 轉換為張
-        sell_lots   = sell_shares / 1000
-        buy_amt     = buy_shares * px                  # 金額 NTD
-        sell_amt    = sell_shares * px
+    i = 0
+    while i < len(rows_raw):
+        name = rows_raw[i].get("securities_trader", "")
+        bid  = rows_raw[i].get("securities_trader_id", "")
+        g_buy_s = g_sell_s = g_buy_amt = g_sell_amt = 0.0
+        j = i
+        while j < len(rows_raw) and rows_raw[j].get("securities_trader", "") == name:
+            r  = rows_raw[j]
+            bs = float(r.get("buy",   0) or 0)
+            ss = float(r.get("sell",  0) or 0)
+            px = float(r.get("price", 0) or 0)
+            g_buy_s    += bs
+            g_sell_s   += ss
+            g_buy_amt  += bs * px
+            g_sell_amt += ss * px
+            j += 1
+        buy_lots  = g_buy_s  / 1000
+        sell_lots = g_sell_s / 1000
+        avg_buy_px  = round(g_buy_amt  / g_buy_s,  2) if g_buy_s  else 0.0
+        avg_sell_px = round(g_sell_amt / g_sell_s, 2) if g_sell_s else 0.0
+        total_amt   = g_buy_amt + g_sell_amt
         processed.append({
-            "broker_id":   row.get("securities_trader_id", ""),
-            "broker_name": row.get("securities_trader", ""),
+            "broker_id":   bid,
+            "broker_name": name,
             "buy":         int(buy_lots),
             "sell":        int(sell_lots),
             "net":         int(buy_lots - sell_lots),
-            "buy_price":   round(px, 2),
-            "sell_price":  round(px, 2),
-            "buy_amount":  round(buy_amt),
-            "sell_amount": round(sell_amt),
-            "is_retail":   buy_amt < RETAIL and sell_amt < RETAIL,
+            "buy_price":   avg_buy_px,
+            "sell_price":  avg_sell_px,
+            "buy_amount":  round(g_buy_amt),
+            "sell_amount": round(g_sell_amt),
+            "is_retail":   total_amt <= INST_THRESHOLD,
         })
+        i = j
 
     processed.sort(key=lambda x: x["net"], reverse=True)
     retail = [r for r in processed if r["is_retail"]]
