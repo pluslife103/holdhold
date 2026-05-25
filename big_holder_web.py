@@ -633,7 +633,7 @@ def api_broker(
             FINMIND_BASE,
             params={
                 "dataset":    "TaiwanStockTradingDailyReport",
-                "stock_id":   stock_id,
+                "data_id":    stock_id,
                 "start_date": date,
                 "end_date":   date,
                 "token":      token,
