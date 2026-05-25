@@ -937,22 +937,46 @@ def api_big_player_timeline(
             date, rows = fut.result()
             day_map[date] = rows
 
-    timeline = []
-    for date in sorted(day_map.keys()):
+    # ── broker scores per day ─────────────────────────────────────────────
+    score_map: dict = {}
+    for date in day_map:
         rows = day_map[date]
-        if rows is None or len(rows) == 0:
+        if not rows:
             continue
-        buy_score = sell_score = 0
+        bs = ss = 0
         for row in rows:
-            buy_score  += int(row.get("buy_amount",  0) // THRESHOLD)
-            sell_score += int(row.get("sell_amount", 0) // THRESHOLD)
-        if buy_score == 0 and sell_score == 0:
-            continue
+            bs += int(row.get("buy_amount",  0) // THRESHOLD)
+            ss += int(row.get("sell_amount", 0) // THRESHOLD)
+        if bs or ss:
+            score_map[date] = {"buy_score": bs, "sell_score": ss}
+
+    # ── fetch price for the whole range (one call, cached) ────────────────
+    pdf = _fm("TaiwanStockPrice", stock_id, start_d.isoformat(), end_d.isoformat())
+    price_map: dict = {}
+    if not pdf.empty:
+        for _, pr in pdf.iterrows():
+            d_str = str(pr.get("date", ""))[:10]
+            price_map[d_str] = {
+                "open":  float(pr.get("open",  0) or 0),
+                "high":  float(pr.get("max",   0) or 0),
+                "low":   float(pr.get("min",   0) or 0),
+                "close": float(pr.get("close", 0) or 0),
+            }
+
+    all_dates = sorted(set(list(price_map.keys())) | set(score_map.keys()))
+    timeline = []
+    for date in all_dates:
+        sc = score_map.get(date, {"buy_score": 0, "sell_score": 0})
+        pr = price_map.get(date, {"open": 0, "high": 0, "low": 0, "close": 0})
         timeline.append({
             "date":       date,
-            "buy_score":  buy_score,
-            "sell_score": sell_score,
-            "net_score":  buy_score - sell_score,
+            "buy_score":  sc["buy_score"],
+            "sell_score": sc["sell_score"],
+            "net_score":  sc["buy_score"] - sc["sell_score"],
+            "open":       pr["open"],
+            "high":       pr["high"],
+            "low":        pr["low"],
+            "close":      pr["close"],
         })
 
     return {"stock_id": stock_id, "timeline": timeline}
@@ -2095,61 +2119,104 @@ async function loadTimeline() {
 
 function renderTimeline(tl, stock) {
   const wrap = document.getElementById('broker-timeline-wrap');
-  const maxB = Math.max(...tl.map(d => d.buy_score),  1);
-  const maxS = Math.max(...tl.map(d => d.sell_score), 1);
-  const maxV  = Math.max(maxB, maxS);
-  const BAR_H = 18;
-  const GAP   = 3;
-  const LABEL_W = 76;
-  const SCORE_W = 38;
-  const CHART_W = Math.min(600, window.innerWidth - LABEL_W - SCORE_W - 40);
-
-  const rows = tl.map(d => {
-    const bPct  = (d.buy_score  / maxV * 100).toFixed(1);
-    const sPct  = (d.sell_score / maxV * 100).toFixed(1);
-    const net   = d.net_score;
-    const netColor = net > 0 ? 'var(--acc)' : net < 0 ? 'var(--red)' : 'var(--mut)';
-    const netStr   = net > 0 ? '+'+net : ''+net;
-    return `
-    <div style="display:flex;align-items:center;gap:6px;font-size:11px;min-height:${BAR_H+GAP*2}px">
-      <span style="width:${LABEL_W}px;color:var(--mut);flex-shrink:0;text-align:right">${d.date.slice(5)}</span>
-      <div style="flex:1;display:flex;flex-direction:column;gap:2px">
-        <div style="display:flex;align-items:center;gap:3px">
-          <div style="height:${BAR_H-2}px;width:${bPct}%;background:#1f6f3a;border-radius:2px;min-width:${d.buy_score?2:0}px;transition:width .3s"></div>
-          <span style="color:#3fb950;font-size:10px;white-space:nowrap">${d.buy_score ? '+'+d.buy_score : ''}</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:3px">
-          <div style="height:${BAR_H-2}px;width:${sPct}%;background:#6e1f1f;border-radius:2px;min-width:${d.sell_score?2:0}px;transition:width .3s"></div>
-          <span style="color:#f85149;font-size:10px;white-space:nowrap">${d.sell_score ? '-'+d.sell_score : ''}</span>
-        </div>
-      </div>
-      <span style="width:${SCORE_W}px;text-align:right;font-weight:700;color:${netColor};flex-shrink:0">${netStr}</span>
-    </div>`;
-  }).join('');
 
   const total_buy  = tl.reduce((s,d) => s+d.buy_score,  0);
   const total_sell = tl.reduce((s,d) => s+d.sell_score, 0);
   const total_net  = total_buy - total_sell;
-  const netColor   = total_net > 0 ? 'var(--acc)' : total_net < 0 ? 'var(--red)' : 'var(--mut)';
+  const netColor   = total_net > 0 ? '#3fb950' : total_net < 0 ? '#f85149' : '#8b949e';
 
   wrap.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:4px">
       <span style="font-weight:700;font-size:13px">${stock} 大戶時間軸</span>
       <div style="display:flex;gap:12px;font-size:12px">
-        <span style="color:#3fb950">買方累計 +${total_buy}</span>
-        <span style="color:#f85149">賣方累計 -${total_sell}</span>
+        <span style="color:#3fb950">買方 +${total_buy}</span>
+        <span style="color:#f85149">賣方 -${total_sell}</span>
         <span style="color:${netColor};font-weight:700">淨 ${total_net>0?'+':''}${total_net}</span>
       </div>
     </div>
-    <div style="font-size:10px;color:var(--mut);display:flex;justify-content:flex-end;gap:16px;padding-right:${SCORE_W+6}px">
-      <span>■ 每格 = 800萬</span>
-    </div>
-    <div style="display:flex;font-size:10px;color:var(--mut);margin-bottom:2px">
-      <span style="width:${LABEL_W}px;text-align:right">日期</span>
-      <span style="flex:1;padding-left:10px">← 大戶買(綠) / 賣(紅) →</span>
-      <span style="width:${SCORE_W}px;text-align:right">淨</span>
-    </div>
-    <div style="overflow-y:auto;max-height:calc(100vh - 260px)">${rows}</div>`;
+    <div style="font-size:10px;color:#8b949e;margin-bottom:6px">每格 = 800萬 NTD｜紅漲綠跌（台股慣例）</div>
+    <div id="tl-chart" style="width:100%;height:500px"></div>`;
+
+  const dates = tl.map(d => d.date);
+  const closes = tl.map(d => d.close || null);
+  const opens  = tl.map(d => d.open  || null);
+  const highs  = tl.map(d => d.high  || null);
+  const lows   = tl.map(d => d.low   || null);
+  const buyScores  = tl.map(d =>  d.buy_score);
+  const sellScores = tl.map(d => -d.sell_score);
+  const hasPrice   = closes.some(c => c && c > 0);
+
+  const traces = [];
+  if (hasPrice) {
+    traces.push({
+      type: 'candlestick',
+      x: dates, open: opens, high: highs, low: lows, close: closes,
+      name: '股價',
+      increasing: { line: { color: '#f85149', width: 1 }, fillcolor: '#f85149' },
+      decreasing: { line: { color: '#3fb950', width: 1 }, fillcolor: '#3fb950' },
+      xaxis: 'x', yaxis: 'y',
+      showlegend: false,
+      hoverinfo: 'x+y',
+    });
+  }
+  traces.push({
+    type: 'bar', x: dates, y: buyScores,
+    name: '大戶買', marker: { color: 'rgba(248,81,73,0.75)' },
+    xaxis: 'x', yaxis: 'y2',
+    hovertemplate: '%{x}<br>買 +%{y}<extra></extra>',
+  });
+  traces.push({
+    type: 'bar', x: dates, y: sellScores,
+    name: '大戶賣', marker: { color: 'rgba(63,185,80,0.75)' },
+    xaxis: 'x', yaxis: 'y2',
+    hovertemplate: '%{x}<br>賣 %{y}<extra></extra>',
+  });
+
+  const priceH = hasPrice ? 0.62 : 0;
+  const gap    = hasPrice ? 0.04 : 0;
+  const layout = {
+    paper_bgcolor: '#0d1117',
+    plot_bgcolor:  '#161b22',
+    font:   { color: '#e6edf3', size: 11, family: 'system-ui,sans-serif' },
+    margin: { l: 52, r: 12, t: 8, b: 40 },
+    xaxis: {
+      type: 'date',
+      tickformat: '%m/%d',
+      tickfont:   { size: 10 },
+      gridcolor:  '#30363d',
+      linecolor:  '#30363d',
+      rangeslider:{ visible: false },
+      domain: [0, 1],
+    },
+    yaxis: hasPrice ? {
+      title: { text: '股價', font: { size: 10 } },
+      gridcolor: '#30363d',
+      linecolor: '#30363d',
+      domain: [1 - priceH, 1.0],
+      tickfont:  { size: 10 },
+      side: 'left',
+    } : { visible: false, domain: [1, 1] },
+    yaxis2: {
+      title:     { text: '大戶強度', font: { size: 10 } },
+      gridcolor: '#30363d',
+      linecolor: '#30363d',
+      domain: [0, 1 - priceH - gap],
+      zeroline: true, zerolinecolor: '#8b949e', zerolinewidth: 1,
+      tickfont: { size: 10 },
+      side: 'left',
+    },
+    barmode: 'relative',
+    legend: { orientation: 'h', x: 0, y: -0.06, font: { size: 10 } },
+    hovermode: 'x unified',
+    dragmode:  'pan',
+  };
+
+  Plotly.newPlot('tl-chart', traces, layout, {
+    displayModeBar: true,
+    modeBarButtonsToRemove: ['select2d','lasso2d','autoScale2d'],
+    responsive: true,
+    scrollZoom:  true,
+  });
 }
 
 function setTraderPreset(id) {
