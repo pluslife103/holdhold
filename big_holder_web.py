@@ -921,7 +921,7 @@ def api_multi_timeline(
     stock_list = [s.strip().upper() for s in stocks.split(",") if s.strip()]
     if not stock_list:
         raise HTTPException(400, "請輸入股票代號")
-    stock_list = stock_list[:30]
+    stock_list = stock_list[:50]
 
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
     if not token:
@@ -1755,11 +1755,11 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">查詢</button>
           <button class="sort-btn" onclick="ovImportSidebar()"
             style="font-size:11px;padding:3px 10px">匯入側邊欄</button>
-          <span style="font-size:10px;color:var(--mut)">最多30檔・每格=800萬</span>
+          <span style="font-size:10px;color:var(--mut)">每批50檔・每格=800萬</span>
         </div>
         <textarea id="ov-stocks" class="search"
           style="width:100%;height:52px;resize:vertical;font-family:monospace;font-size:11px;line-height:1.5"
-          placeholder="輸入股票代號，逗號或換行分隔，最多 30 檔"
+          placeholder="輸入股票代號，逗號或換行分隔（支援全部股票）"
 >2330, 2454, 2317, 2382, 2395, 2412, 2308, 3711, 2303, 6505,
 2881, 2882, 2886, 2891, 2892, 1301, 1303, 1326, 2002, 2357,
 2379, 3008, 2408, 2327, 2376, 2345, 2615, 2603, 2609, 2610</textarea>
@@ -2516,32 +2516,61 @@ let _ovData = null;
 
 function ovImportSidebar() {
   if (!allStocks.length) { showToast('側邊欄尚未載入股票清單'); return; }
-  document.getElementById('ov-stocks').value = allStocks.slice(0, 30).map(s => s.stock_id).join(', ');
-  showToast(`已匯入 ${Math.min(allStocks.length, 30)} 檔`);
+  document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
+  showToast(`已匯入 ${allStocks.length} 檔`);
 }
 
 async function loadOverview() {
-  const raw    = document.getElementById('ov-stocks').value;
-  const stocks = raw.split(/[\s,\n]+/).map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
-  if (!stocks.length) {
+  const raw = document.getElementById('ov-stocks').value;
+  const allIds = raw.split(/[\s,\n]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+  if (!allIds.length) {
     document.getElementById('overview-grid').innerHTML = '<div class="empty" style="grid-column:1/-1">請輸入股票代號</div>';
     return;
   }
   const days = document.getElementById('ov-days').value;
   const grid = document.getElementById('overview-grid');
-  grid.innerHTML = `<div class="empty" style="padding:40px;grid-column:1/-1">抓取 ${stocks.length} 檔分點資料中，請稍候（約需 ${Math.ceil(stocks.length*0.8)} 秒）…</div>`;
-  try {
-    const res = await fetch(`/api/multi_timeline?stocks=${stocks.join(',')}&days=${days}`);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      grid.innerHTML = `<div class="empty" style="color:var(--red);grid-column:1/-1">${err.detail || '載入失敗'}</div>`;
-      return;
+  const BATCH = 50;
+  const batches = [];
+  for (let i = 0; i < allIds.length; i += BATCH) batches.push(allIds.slice(i, i + BATCH));
+
+  _ovData = { results: [], dates: [] };
+  let loaded = 0;
+
+  function setProgress(msg) {
+    let el = document.getElementById('ov-progress');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'ov-progress';
+      el.className = 'empty';
+      el.style.cssText = 'grid-column:1/-1;padding:20px;font-size:12px';
+      grid.appendChild(el);
     }
-    _ovData = await res.json();
-    renderOverviewGrid();
-  } catch(e) {
-    grid.innerHTML = `<div class="empty" style="color:var(--red);grid-column:1/-1">錯誤：${e.message}</div>`;
+    el.textContent = msg;
   }
+
+  grid.innerHTML = '';
+  setProgress(`準備載入 ${allIds.length} 檔…`);
+
+  for (const batch of batches) {
+    setProgress(`載入中 ${loaded} / ${allIds.length} 檔，請稍候…`);
+    try {
+      const res = await fetch(`/api/multi_timeline?stocks=${batch.join(',')}&days=${days}`);
+      if (res.ok) {
+        const bd = await res.json();
+        _ovData.results.push(...bd.results);
+        if ((bd.dates || []).length > _ovData.dates.length) _ovData.dates = bd.dates;
+      }
+    } catch(e) { /* skip failed batch */ }
+    loaded += batch.length;
+    const prog = document.getElementById('ov-progress');
+    if (prog) prog.remove();
+    renderOverviewGrid();
+  }
+
+  const prog = document.getElementById('ov-progress');
+  if (prog) prog.remove();
+  if (!_ovData.results.length)
+    grid.innerHTML = '<div class="empty" style="grid-column:1/-1;color:var(--red)">無資料，請確認股票代號</div>';
 }
 
 function ovSort() { if (_ovData) renderOverviewGrid(); }
