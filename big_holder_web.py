@@ -143,27 +143,65 @@ _STOCK_MAP: dict[str, str] = {}   # id -> name
 
 
 def _load_stocks() -> None:
-    """取得上市+上櫃所有股票清單。FinMind TaiwanStockInfo 無分頁，一次回傳全部。
-    若回傳數量偏少（雲端環境有時發生），改用 TWSE/TPEX 官方 API 補足。"""
+    """取得上市+上櫃所有股票清單。三層 fallback：FinMind → TWSE OpenAPI → ISIN scraping"""
     global _STOCKS, _STOCK_MAP
 
     df = _fm("TaiwanStockInfo")
     if not df.empty:
         df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
-        df = df[["stock_id", "stock_name", "type"]].drop_duplicates("stock_id")
+        if "stock_name" in df.columns and "type" in df.columns:
+            df = df[["stock_id", "stock_name", "type"]].drop_duplicates("stock_id")
+        else:
+            df = pd.DataFrame(columns=["stock_id", "stock_name", "type"])
+    print(f"  FinMind TaiwanStockInfo: {len(df)} 筆")
 
-    # 若取得數量異常少，改從 TWSE/TPEX 官方 API 取
+    # 第二層：TWSE/TPEX OpenAPI（JSON，穩定）
     if len(df) < 1000:
-        print(f"  ⚠ FinMind 只回傳 {len(df)} 筆，改用 TWSE/TPEX 官方 API...")
+        print(f"  ⚠ FinMind 只回傳 {len(df)} 筆，改用 TWSE OpenAPI...")
+        df = _load_stocks_from_twse_openapi()
+
+    # 第三層：ISIN 網頁 scraping
+    if len(df) < 1000:
+        print(f"  ⚠ OpenAPI 只回傳 {len(df)} 筆，改用 ISIN scraping...")
         df = _load_stocks_from_twse()
 
+    if len(df) == 0:
+        print("  ✗ 所有股票清單來源均失敗！")
     _STOCKS = df.to_dict(orient="records")
     _STOCK_MAP = dict(zip(df["stock_id"], df["stock_name"]))
     print(f"  股票清單：{len(_STOCKS)} 支")
 
 
+def _load_stocks_from_twse_openapi() -> pd.DataFrame:
+    """第二備用：TWSE/TPEX OpenAPI（JSON，最穩定）"""
+    import re
+    rows = []
+    sources = [
+        ("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", "twse"),
+        ("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",  "tpex"),
+    ]
+    for url, market in sources:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            data = r.json()
+            if not isinstance(data, list):
+                data = data.get("data", [])
+            for item in data:
+                sid  = str(item.get("公司代號", item.get("SecuritiesCompanyCode", item.get("Code", "")))).strip()
+                name = str(item.get("公司簡稱", item.get("CompanyAbbreviation", item.get("Name", "")))).strip()
+                if re.match(r"^\d{4}$", sid) and name:
+                    rows.append({"stock_id": sid, "stock_name": name, "type": market})
+            print(f"  OpenAPI {market}: {len(rows)} 筆")
+        except Exception as e:
+            print(f"  OpenAPI {market} 失敗：{e}")
+    if rows:
+        return pd.DataFrame(rows).drop_duplicates("stock_id")
+    return pd.DataFrame(columns=["stock_id", "stock_name", "type"])
+
+
 def _load_stocks_from_twse() -> pd.DataFrame:
     """備用：直接從 TWSE/TPEX ISIN API 取全股清單（公開，免 token）"""
+    import re
     rows = []
     for mode, market in [("2", "twse"), ("4", "tpex")]:
         try:
@@ -181,14 +219,13 @@ def _load_stocks_from_twse() -> pd.DataFrame:
                 if len(tds) < 2:
                     continue
                 cell = tds[0].get_text(strip=True)
-                import re
                 m = re.match(r"^(\d{4,5})\s+(.+)", cell)
                 if m and len(m.group(1)) == 4:
                     rows.append({"stock_id": m.group(1),
                                  "stock_name": m.group(2).strip(),
                                  "type": market})
         except Exception as e:
-            print(f"  TWSE/TPEX {market} 失敗：{e}")
+            print(f"  TWSE/TPEX ISIN {market} 失敗：{e}")
 
     if rows:
         df = pd.DataFrame(rows).drop_duplicates("stock_id")
@@ -1128,42 +1165,73 @@ def api_ov_scan_status():
 
 @app.get("/api/debug")
 def api_debug():
-    """診斷：stocks/grading 狀態 + 測試一支股票 broker data。"""
+    """診斷：stocks/grading 狀態 + 測試各資料來源。"""
     import os, traceback as tb
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
-    # Test one stock
-    test_sid = "2330"
-    test_result = {}
+
+    # Test TaiwanStockInfo
+    stock_info_result = {}
     try:
-        from datetime import date as dt_date, timedelta as td
-        end_d   = dt_date.today()
-        start_d = end_d - td(days=22)
-        raw_r = requests.get(
-            FINMIND_BASE,
-            params={"dataset": "TaiwanStockTradingDailyReport", "data_id": test_sid,
-                    "start_date": start_d.isoformat(), "end_date": end_d.isoformat(),
-                    "token": token},
-            timeout=15,
-        )
-        j = raw_r.json()
+        r = requests.get(FINMIND_BASE,
+                         params={"dataset": "TaiwanStockInfo", "token": token},
+                         timeout=20)
+        j = r.json()
         rows = j.get("data", [])
-        sample = rows[:3] if rows else []
-        test_result = {"status": j.get("status"), "row_count": len(rows),
-                       "sample": sample, "msg": j.get("msg", "")}
+        stock_info_result = {"status": j.get("status"), "row_count": len(rows),
+                             "msg": j.get("msg", ""), "sample": rows[:2]}
     except Exception as exc:
-        test_result = {"error": str(exc), "trace": tb.format_exc()[:400]}
+        stock_info_result = {"error": str(exc)}
+
+    # Test TWSE OpenAPI
+    twse_api_result = {}
+    try:
+        r = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        data = r.json() if isinstance(r.json(), list) else []
+        twse_api_result = {"row_count": len(data), "sample": data[:2] if data else []}
+    except Exception as exc:
+        twse_api_result = {"error": str(exc)}
+
+    # Test TaiwanStockTradingDailyReport (single day)
+    broker_result = {}
+    try:
+        from datetime import date as dt_date
+        today = dt_date.today().isoformat()
+        r2 = requests.get(FINMIND_BASE,
+                          params={"dataset": "TaiwanStockTradingDailyReport",
+                                  "data_id": "2330", "start_date": today, "token": token},
+                          timeout=15)
+        j2 = r2.json()
+        rows2 = j2.get("data", [])
+        broker_result = {"status": j2.get("status"), "row_count": len(rows2),
+                         "msg": j2.get("msg", ""), "sample": rows2[:2]}
+    except Exception as exc:
+        broker_result = {"error": str(exc)}
 
     with _OV_SCAN_LOCK:
         scan_snap = {k: v for k, v in _OV_SCAN.items() if k != "results"}
         scan_snap["results_count"] = len(_OV_SCAN["results"])
 
     return {
-        "stocks_count":  len(_STOCKS),
-        "grading_count": len(_GRADING),
-        "grade_prog":    _GRADE_PROG,
-        "scan":          scan_snap,
-        "test_2330":     test_result,
+        "stocks_count":    len(_STOCKS),
+        "grading_count":   len(_GRADING),
+        "grade_prog":      _GRADE_PROG,
+        "scan":            scan_snap,
+        "test_stock_info": stock_info_result,
+        "test_twse_api":   twse_api_result,
+        "test_broker_1day": broker_result,
     }
+
+
+@app.post("/api/reload_stocks")
+def api_reload_stocks():
+    """強制重新載入股票清單並重新計算分級。"""
+    def _do():
+        _load_stocks()
+        if _STOCKS:
+            _run_grading()
+    threading.Thread(target=_do, daemon=True).start()
+    return {"status": "started", "msg": "重新載入中，請等 1 分鐘後查看 /api/debug"}
 
 
 def _fetch_price_range(stock_id: str, start: str, end: str) -> dict:
