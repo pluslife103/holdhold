@@ -827,6 +827,10 @@ def api_broker_trader(
     return result
 
 
+class _FinMindRateLimit(Exception):
+    pass
+
+
 def _fetch_broker_day(token: str, stock_id: str, date: str):
     """Fetch+process one stock's broker data for one date. Cached. Returns rows list or []."""
     ckey = f"broker|{stock_id}|{date}"
@@ -843,7 +847,10 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
         j = r.json()
     except Exception:
         return []
-    if r.status_code != 200 or j.get("status") not in (200, None):
+    fm_status = j.get("status")
+    if r.status_code == 402 or fm_status == 402:
+        raise _FinMindRateLimit(j.get("msg", "FinMind 402: 超過請求頻率限制"))
+    if r.status_code != 200 or fm_status not in (200, None):
         return []
     rows_raw = j.get("data", [])
     if not rows_raw:
@@ -940,21 +947,38 @@ def api_multi_timeline(
     THOLD = 8_000_000
     raw: dict       = {s: {} for s in stock_list}
     price_raw: dict = {s: {} for s in stock_list}
+    rate_err: list  = []
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        broker_futs = {ex.submit(_fetch_broker_day, token, s, dt): (s, dt)
+    # FinMind free tier: ~3 req/s sustained. Use semaphore to throttle.
+    _sem = threading.Semaphore(3)
+
+    def _broker_throttled(tok, sid, dt):
+        with _sem:
+            result = _fetch_broker_day(tok, sid, dt)
+            time.sleep(0.35)
+            return result
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        broker_futs = {ex.submit(_broker_throttled, token, s, dt): (s, dt)
                        for s in stock_list for dt in dates}
         price_futs  = {ex.submit(_fetch_price_range, s, start_d.isoformat(), end_d.isoformat()): s
                        for s in stock_list}
         for fut in as_completed(broker_futs):
             sid, dt = broker_futs[fut]
-            raw[sid][dt] = fut.result()
+            try:
+                raw[sid][dt] = fut.result()
+            except _FinMindRateLimit as e:
+                rate_err.append(str(e))
+                raw[sid][dt] = []
         for fut in as_completed(price_futs):
             sid = price_futs[fut]
             try:
                 price_raw[sid] = fut.result()
             except Exception:
                 price_raw[sid] = {}
+
+    if rate_err and not any(any(v for v in raw[s].values()) for s in stock_list):
+        raise HTTPException(429, f"FinMind 速率限制（402）：{rate_err[0]}。請稍後再試，或改用付費 token。")
 
     output = []
     for stock_id in stock_list:
@@ -2591,6 +2615,16 @@ async function loadOverview() {
         const bd = await res.json();
         _ovData.results.push(...bd.results);
         if ((bd.dates || []).length > _ovData.dates.length) _ovData.dates = bd.dates;
+      } else if (res.status === 429) {
+        const err = await res.json().catch(() => ({}));
+        const prog = document.getElementById('ov-progress');
+        if (prog) prog.remove();
+        grid.insertAdjacentHTML('beforeend',
+          `<div class="empty" style="grid-column:1/-1;color:var(--red);padding:16px">
+            FinMind 速率限制（402）：${err.detail || '請求過於頻繁，請稍後再試'}
+          </div>`);
+        if (countEl) countEl.textContent = '速率限制';
+        return;
       }
     } catch(e) { /* skip failed batch */ }
     loaded += batch.length;
