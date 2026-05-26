@@ -906,7 +906,7 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
 # ── 大戶總覽後台掃描 ──────────────────────────────────────────────────────
 _OV_SCAN: dict = {
     "running": False, "done": 0, "total": 0,
-    "results": {}, "error": "", "days": 15, "started": "",
+    "results": {}, "error": "", "days": 15, "started": "", "tier": "",
 }
 _OV_SCAN_LOCK = threading.Lock()
 
@@ -1066,21 +1066,32 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int):
 
 
 @app.post("/api/overview_scan/start")
-def api_ov_scan_start(days: int = Query(15), force: bool = Query(False)):
+def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: str = Query("")):
     import os
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
     if not token:
         raise HTTPException(500, "未設定 FINMIND_TOKEN")
+    tier = tier.strip().lower()
+    if tier not in ({t[0] for t in TIERS} | {""}):
+        tier = ""
     with _OV_SCAN_LOCK:
         if _OV_SCAN["running"]:
             return {"status": "already_running", "done": _OV_SCAN["done"],
                     "total": _OV_SCAN["total"]}
-        if force or _OV_SCAN["days"] != days:
+        if force or _OV_SCAN["days"] != days or _OV_SCAN["tier"] != tier:
             _OV_SCAN["results"] = {}
-    stock_ids = [s["stock_id"] for s in _STOCKS]
+        _OV_SCAN["tier"] = tier
+    if tier:
+        with _CLOCK:
+            stock_ids = [sid for sid, g in _GRADING.items() if g.get("tier") == tier]
+        if not stock_ids:
+            # grading not ready yet — scan all and let results filter by tier label
+            stock_ids = [s["stock_id"] for s in _STOCKS]
+    else:
+        stock_ids = [s["stock_id"] for s in _STOCKS]
     threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days),
                      daemon=True).start()
-    return {"status": "started", "total": len(stock_ids)}
+    return {"status": "started", "total": len(stock_ids), "tier": tier}
 
 
 @app.get("/api/overview_scan/status")
@@ -1095,6 +1106,7 @@ def api_ov_scan_status():
         "running": _OV_SCAN["running"], "done": _OV_SCAN["done"],
         "total":   _OV_SCAN["total"],   "days":  _OV_SCAN["days"],
         "started": _OV_SCAN["started"], "error": _OV_SCAN["error"],
+        "tier":    _OV_SCAN["tier"],
         "results": results,
     }
 
@@ -1983,6 +1995,15 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           <button class="sort-btn" onclick="ovToggleCustom()"
             style="font-size:11px;padding:3px 10px" id="ov-custom-btn">自訂股票</button>
         </div>
+        <!-- 規模篩選 -->
+        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
+          <button class="gf-btn active" id="ovt-all"   onclick="ovSetTier('')">全部</button>
+          <button class="gf-btn" id="ovt-mega"  onclick="ovSetTier('mega')" >🏢 超大型<small id="ovt-cnt-mega"  style="opacity:.6;margin-left:3px"></small></button>
+          <button class="gf-btn" id="ovt-large" onclick="ovSetTier('large')">🏗 大型<small   id="ovt-cnt-large" style="opacity:.6;margin-left:3px"></small></button>
+          <button class="gf-btn" id="ovt-mid"   onclick="ovSetTier('mid')"  >🏬 中型<small   id="ovt-cnt-mid"   style="opacity:.6;margin-left:3px"></small></button>
+          <button class="gf-btn" id="ovt-small" onclick="ovSetTier('small')">🏪 小型<small   id="ovt-cnt-small" style="opacity:.6;margin-left:3px"></small></button>
+          <button class="gf-btn" id="ovt-micro" onclick="ovSetTier('micro')">🏠 微型<small   id="ovt-cnt-micro" style="opacity:.6;margin-left:3px"></small></button>
+        </div>
         <div id="ov-custom-area" style="display:none;margin-top:6px">
           <textarea id="ov-stocks" class="search"
             style="width:100%;height:52px;resize:vertical;font-family:monospace;font-size:11px;line-height:1.5"
@@ -2525,6 +2546,7 @@ function switchTab(name) {
     if (!inp.value) inp.value = new Date().toISOString().slice(0,10);
   }
   if (name === 'overview' && allStocks.length) {
+    _ovLoadTierCounts();
     if (_ovData === null) ovReload(false);
     else _ovStartPoll();  // resume polling if scan is still running
   }
@@ -2749,6 +2771,26 @@ function renderTimeline(tl, stock) {
 // ── 大戶總覽 ──────────────────────────────────────────────────────────────
 let _ovData      = null;
 let _ovPollTimer = null;
+let _ovTier      = '';
+
+function ovSetTier(tier) {
+  _ovTier = tier;
+  document.querySelectorAll('[id^="ovt-"]').forEach(b => b.classList.remove('active'));
+  document.getElementById('ovt-' + (tier || 'all'))?.classList.add('active');
+  ovReload(true);
+}
+
+async function _ovLoadTierCounts() {
+  try {
+    const r = await fetch('/api/grading?');
+    if (!r.ok) return;
+    const d = await r.json();
+    for (const t of (d.tiers || [])) {
+      const el = document.getElementById(`ovt-cnt-${t.key}`);
+      if (el) el.textContent = t.count;
+    }
+  } catch(e) {}
+}
 
 function ovToggleCustom() {
   const area = document.getElementById('ov-custom-area');
@@ -2770,7 +2812,7 @@ async function ovReload(force = true) {
   if (countEl) countEl.textContent = '啟動掃描…';
   document.getElementById('overview-grid').innerHTML =
     '<div class="empty" style="grid-column:1/-1;padding:30px">後台掃描中，每完成一批即更新…</div>';
-  await fetch(`/api/overview_scan/start?days=${days}&force=${force}`, { method: 'POST' });
+  await fetch(`/api/overview_scan/start?days=${days}&force=${force}&tier=${_ovTier}`, { method: 'POST' });
   _ovStartPoll();
 }
 
