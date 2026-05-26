@@ -949,69 +949,76 @@ _OV_SCAN: dict = {
 _OV_SCAN_LOCK = threading.Lock()
 
 
-def _fetch_broker_range(token: str, stock_id: str, start: str, end: str) -> dict:
-    """One API call: all broker rows for stock_id between start–end.
-    Returns {date_str: [processed_rows]}. Cached 6h."""
+def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
+    """Fetch + aggregate broker data for ONE trading day (free-tier FinMind compatible).
+    Returns list of processed broker rows; result cached 12h per day."""
     from collections import defaultdict
-    ckey = f"brange|{stock_id}|{start}|{end}"
-    cached = _cget(ckey, ttl_h=6)
+    ckey = f"broker_day|{stock_id}|{date_str}"
+    cached = _cget(ckey, ttl_h=12)
     if cached is not None:
         return cached
     try:
         r = requests.get(
             FINMIND_BASE,
             params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
-                    "start_date": start, "end_date": end, "token": token},
-            timeout=30,
+                    "start_date": date_str, "token": token},
+            timeout=20,
         )
         j = r.json()
     except Exception:
-        return {}
+        return []
     fm_status = j.get("status")
     if r.status_code == 402 or fm_status == 402:
         raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
     if r.status_code != 200 or fm_status not in (200, None):
-        return {}
-    rows_raw = j.get("data", [])
+        return []
+    rows_raw = [rw for rw in j.get("data", []) if str(rw.get("date", ""))[:10] == date_str]
     if not rows_raw:
-        _cset(ckey, {})
-        return {}
+        _cset(ckey, [])
+        return []
     THOLD = 8_000_000
-    agg: dict = defaultdict(lambda: defaultdict(
+    agg: dict = defaultdict(
         lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0, "buy_amt": 0.0, "sell_amt": 0.0}
-    ))
+    )
     for row in rows_raw:
-        d     = str(row.get("date", ""))[:10]
         bid   = row.get("securities_trader_id", "")
         buy_s = float(row.get("buy",   0) or 0)
         sel_s = float(row.get("sell",  0) or 0)
         px    = float(row.get("price", 0) or 0)
-        agg[d][bid]["name"]     = row.get("securities_trader", "")
-        agg[d][bid]["buy_s"]   += buy_s
-        agg[d][bid]["sell_s"]  += sel_s
-        agg[d][bid]["buy_amt"] += buy_s * px   # shares × price = NTD amount
-        agg[d][bid]["sell_amt"]+= sel_s * px
+        agg[bid]["name"]     = row.get("securities_trader", "")
+        agg[bid]["buy_s"]   += buy_s
+        agg[bid]["sell_s"]  += sel_s
+        agg[bid]["buy_amt"] += buy_s * px
+        agg[bid]["sell_amt"]+= sel_s * px
+    processed = []
+    for bid, v in agg.items():
+        is_retail = v["buy_amt"] <= THOLD and v["sell_amt"] <= THOLD
+        processed.append({
+            "name": v["name"], "id": bid,
+            "buy":  round(v["buy_s"] / 1000),
+            "sell": round(v["sell_s"] / 1000),
+            "net":  round((v["buy_s"] - v["sell_s"]) / 1000),
+            "buy_amount": v["buy_amt"], "sell_amount": v["sell_amt"],
+            "is_retail": is_retail,
+        })
+    _cset(ckey, processed)
+    return processed
+
+
+def _fetch_broker_range(token: str, stock_id: str, dates: list) -> dict:
+    """Fetch broker data for each date individually (free-tier compatible).
+    Returns {date_str: [processed_rows]}."""
     by_date: dict = {}
-    for d, brokers in agg.items():
-        processed = []
-        for bid, v in brokers.items():
-            is_retail = v["buy_amt"] <= THOLD and v["sell_amt"] <= THOLD
-            processed.append({
-                "name": v["name"], "id": bid,
-                "buy":  round(v["buy_s"] / 1000),   # shares → 張
-                "sell": round(v["sell_s"] / 1000),
-                "net":  round((v["buy_s"] - v["sell_s"]) / 1000),
-                "buy_amount": v["buy_amt"], "sell_amount": v["sell_amt"],
-                "is_retail": is_retail,
-            })
-        by_date[d] = processed
-    _cset(ckey, by_date)
+    for date_str in dates:
+        rows = _fetch_broker_day(token, stock_id, date_str)
+        if rows:
+            by_date[date_str] = rows
     return by_date
 
 
 def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str) -> dict:
     """Fetch + compute overview item for one stock."""
-    broker_data = _fetch_broker_range(token, stock_id, start, end)
+    broker_data = _fetch_broker_range(token, stock_id, dates)
     price_map   = _fetch_price_range(stock_id, start, end)
     THOLD = 8_000_000
     timeline = []
