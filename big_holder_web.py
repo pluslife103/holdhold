@@ -2214,6 +2214,12 @@ function closeDrawer() {
 // ── Init ──────────────────────────────────────────────────────────────
 (async () => {
   await loadStockList();
+  // Poll grading readiness every 15s until ready
+  _updateGradingReady();
+  const _gradingTimer = setInterval(async () => {
+    await _updateGradingReady();
+    if (_gradingReady > 0) clearInterval(_gradingTimer);
+  }, 15000);
 })();
 
 // ── Stock list ────────────────────────────────────────────────────────
@@ -2892,11 +2898,51 @@ function renderTimeline(tl, stock) {
 }
 
 // ── 大戶總覽 ──────────────────────────────────────────────────────────────
-let _ovData      = null;
-let _ovPollTimer = null;
-let _ovTier      = '';
+let _ovData         = null;
+let _ovPollTimer    = null;
+let _ovTier         = '';
+let _gradingReady   = 0;   // number of graded stocks, 0 = not ready
+
+async function _updateGradingReady() {
+  try {
+    const r = await fetch('/api/grading/status');
+    if (!r.ok) return;
+    const d = await r.json();
+    _gradingReady = d.ready || 0;
+    // update tier buttons: disable + show "計算中" when grading not done
+    const running = d.running || false;
+    const notReady = _gradingReady === 0;
+    ['mega','large','mid','small','micro'].forEach(t => {
+      const btn = document.getElementById('ovt-' + t);
+      if (!btn) return;
+      if (notReady) {
+        btn.disabled = true;
+        btn.title = running ? '分級計算中，請稍後再使用' : '分級資料尚未載入';
+        btn.style.opacity = '0.4';
+      } else {
+        btn.disabled = false;
+        btn.title = '';
+        btn.style.opacity = '';
+      }
+    });
+    // show grading progress hint in count area if grading not done
+    const countEl = document.getElementById('ov-stock-count');
+    if (notReady && countEl && !countEl.textContent.includes('掃描中')) {
+      const pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+      countEl.textContent = running
+        ? `分級計算中 ${d.done}/${d.total}（${pct}%），完成後可用規模篩選`
+        : '分級資料載入中…';
+    }
+  } catch(e) {}
+}
 
 function ovSetTier(tier) {
+  if (tier && _gradingReady === 0) {
+    // grading not ready: show inline warning, don't scan yet
+    const countEl = document.getElementById('ov-stock-count');
+    if (countEl) countEl.textContent = '分級計算中，請稍後再點規模篩選';
+    return;
+  }
   _ovTier = tier;
   document.querySelectorAll('[id^="ovt-"]').forEach(b => b.classList.remove('active'));
   document.getElementById('ovt-' + (tier || 'all'))?.classList.add('active');
