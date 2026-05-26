@@ -2138,7 +2138,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
         style="flex:1;overflow-y:auto;padding:12px;
                display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
                gap:10px;align-content:start">
-        <div class="empty" style="grid-column:1/-1">載入中…</div>
+        <div class="empty" style="grid-column:1/-1;color:var(--mut)">← 點左側規模按鈕開始掃描</div>
       </div>
     </div>
 
@@ -2225,11 +2225,7 @@ async function loadStockList() {
   document.getElementById('stock-badge').textContent = total;
   document.getElementById('d-badge').textContent = total;
   renderList();
-  // Auto-start scan if overview tab is already visible
-  if (document.getElementById('pane-overview')?.classList.contains('active') && _ovData === null) {
-    ovReload(false);
-  }
-  document.getElementById('ov-stock-count').textContent = `全部 ${allStocks.length} 支`;
+  document.getElementById('ov-stock-count').textContent = '點左側規模按鈕開始掃描';
 }
 
 function filterStocks(src) {
@@ -2670,8 +2666,8 @@ function switchTab(name) {
   }
   if (name === 'overview' && allStocks.length) {
     _ovLoadTierCounts();
-    if (_ovData === null) ovReload(false);
-    else _ovStartPoll();  // resume polling if scan is still running
+    if (_ovData !== null) _ovStartPoll();  // resume polling if scan is still running
+    // no auto-scan: user picks tier first
   }
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
@@ -2896,12 +2892,26 @@ let _ovData         = null;
 let _ovPollTimer    = null;
 let _ovTier         = '';
 
-function ovSetTier(tier) {
+async function ovSetTier(tier) {
   _ovTier = tier;
   document.querySelectorAll('[id^="ovt-"]').forEach(b => b.classList.remove('active'));
   document.getElementById('ovt-' + (tier || 'all'))?.classList.add('active');
-  // Client-side filter only — no new scan needed
-  if (_ovData) renderOverviewGrid();
+
+  if (tier) {
+    // Check grading readiness before tier-specific scan
+    const countEl = document.getElementById('ov-stock-count');
+    try {
+      const gr = await fetch('/api/grading/status').then(r => r.json());
+      if ((gr.ready || 0) === 0) {
+        const pct = gr.total ? Math.round(gr.done / gr.total * 100) : 0;
+        if (countEl) countEl.textContent = gr.running
+          ? `分級計算中 ${pct}%，完成後再點規模按鈕（約${Math.ceil((gr.total - gr.done) * 0.3 / 60)} 分鐘）`
+          : '分級資料尚未載入，請稍後再試';
+        return;
+      }
+    } catch(e) {}
+  }
+  ovReload(true);
 }
 
 async function _ovLoadTierCounts() {
@@ -3052,10 +3062,7 @@ function _ovCard(item) {
 
 function renderOverviewGrid() {
   const sort = document.getElementById('ov-sort').value;
-  let results = [...(_ovData?.results || [])];
-
-  // Client-side tier filter
-  if (_ovTier) results = results.filter(r => (r.tier || 'micro') === _ovTier);
+  const results = [...(_ovData?.results || [])];
 
   function sortGroup(arr) {
     if      (sort === 'buy')  arr.sort((a,b) => b.total_net  - a.total_net);
