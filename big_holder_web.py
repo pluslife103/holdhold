@@ -997,6 +997,7 @@ def api_multi_timeline(
         prev_close    = closes[-2]               if len(closes) > 1 else 0
         price_chg_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
 
+        g = _GRADING.get(stock_id, {})
         output.append({
             "stock_id":          stock_id,
             "timeline":          timeline,
@@ -1007,9 +1008,14 @@ def api_multi_timeline(
             "total_retail_sell": sum(t["retail_sell"] for t in timeline),
             "latest_close":      latest_close,
             "price_chg_pct":     price_chg_pct,
+            "tier":              g.get("tier", "micro"),
+            "market_cap_億":     g.get("market_cap_億", 0),
         })
 
-    output.sort(key=lambda x: -(x["total_buy"] + x["total_sell"]))
+    output.sort(key=lambda x: (
+        TIER_ORDER.get(x["tier"], 99),
+        -(x["total_buy"] + x["total_sell"])
+    ))
     return {"results": output, "dates": sorted(dates)}
 
 
@@ -2602,46 +2608,80 @@ async function loadOverview() {
 
 function ovSort() { if (_ovData) renderOverviewGrid(); }
 
+const OV_TIERS = [
+  { key: 'mega',  label: '超大型', icon: '🏢', range: '> 1兆'   },
+  { key: 'large', label: '大型',   icon: '🏗',  range: '> 1000億' },
+  { key: 'mid',   label: '中型',   icon: '🏬', range: '> 100億'  },
+  { key: 'small', label: '小型',   icon: '🏪', range: '> 20億'   },
+  { key: 'micro', label: '微型',   icon: '🏠', range: '< 20億'   },
+];
+
+function _ovCard(item) {
+  const info     = allStocks.find(s => s.stock_id === item.stock_id);
+  const name     = info?.stock_name || '';
+  const net      = item.total_net;
+  const netColor = net > 0 ? '#f85149' : net < 0 ? '#3fb950' : '#8b949e';
+  const netStr   = net > 0 ? '+'+net : ''+net;
+  const closeStr = item.latest_close > 0 ? item.latest_close.toFixed(1) : '—';
+  const chgPct   = item.price_chg_pct || 0;
+  const chgColor = chgPct > 0 ? '#f85149' : chgPct < 0 ? '#3fb950' : '#8b949e';
+  const chgSign  = chgPct > 0 ? '+' : '';
+  const rBuy     = item.total_retail_buy  || 0;
+  const rSell    = item.total_retail_sell || 0;
+  const cap      = item.market_cap_億 >= 10000
+    ? `${(item.market_cap_億/10000).toFixed(1)}兆`
+    : item.market_cap_億 > 0 ? `${Math.round(item.market_cap_億)}億` : '';
+  const spark    = _ovSpark(item.timeline, 188);
+  return `<div class="ov-card" onclick="jumpToTimeline('${item.stock_id}')">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">
+      <div>
+        <span style="font-weight:700;font-size:13px">${item.stock_id}</span>
+        <span style="font-size:10px;color:var(--mut);margin-left:4px">${name}</span>
+      </div>
+      <span style="font-size:12px;font-weight:700;color:${netColor}">${netStr}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:4px">
+      <span><span style="color:var(--blu)">${closeStr}</span><span style="color:${chgColor};margin-left:4px">${chgSign}${chgPct}%</span></span>
+      <span style="color:var(--mut)">${cap}</span>
+    </div>
+    ${spark}
+    <div style="display:flex;justify-content:space-between;font-size:10px;margin-top:4px">
+      <span style="color:var(--mut)">主 <span style="color:#f85149">+${item.total_buy}</span><span style="color:#3fb950"> -${item.total_sell}</span></span>
+      <span style="color:var(--mut)">散 <span style="color:#f85149">+${rBuy}</span><span style="color:#3fb950"> -${rSell}</span></span>
+    </div>
+  </div>`;
+}
+
 function renderOverviewGrid() {
   const sort = document.getElementById('ov-sort').value;
-  let results = [...(_ovData?.results || [])];
-  if      (sort === 'buy')  results.sort((a,b) => b.total_net  - a.total_net);
-  else if (sort === 'sell') results.sort((a,b) => a.total_net  - b.total_net);
-  else                      results.sort((a,b) => (b.total_buy+b.total_sell) - (a.total_buy+a.total_sell));
+  const results = [...(_ovData?.results || [])];
 
-  const cards = results.map(item => {
-    const info     = allStocks.find(s => s.stock_id === item.stock_id);
-    const name     = info?.stock_name || '';
-    const net      = item.total_net;
-    const netColor = net > 0 ? '#f85149' : net < 0 ? '#3fb950' : '#8b949e';
-    const netStr   = net > 0 ? '+'+net : ''+net;
-    const closeStr = item.latest_close > 0 ? item.latest_close.toFixed(1) : '—';
-    const chgPct   = item.price_chg_pct || 0;
-    const chgColor = chgPct > 0 ? '#f85149' : chgPct < 0 ? '#3fb950' : '#8b949e';
-    const chgSign  = chgPct > 0 ? '+' : '';
-    const rBuy     = item.total_retail_buy  || 0;
-    const rSell    = item.total_retail_sell || 0;
-    const spark    = _ovSpark(item.timeline, 188);
-    return `<div class="ov-card" onclick="jumpToTimeline('${item.stock_id}')">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">
-        <div>
-          <span style="font-weight:700;font-size:13px">${item.stock_id}</span>
-          <span style="font-size:10px;color:var(--mut);margin-left:4px">${name}</span>
-        </div>
-        <span style="font-size:12px;font-weight:700;color:${netColor}">${netStr}</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:4px">
-        <span style="color:var(--blu)">${closeStr}</span>
-        <span style="color:${chgColor}">${chgSign}${chgPct}%</span>
-      </div>
-      ${spark}
-      <div style="display:flex;justify-content:space-between;font-size:10px;margin-top:4px">
-        <span style="color:var(--mut)">主 <span style="color:#f85149">+${item.total_buy}</span><span style="color:#3fb950"> -${item.total_sell}</span></span>
-        <span style="color:var(--mut)">散 <span style="color:#f85149">+${rBuy}</span><span style="color:#3fb950"> -${rSell}</span></span>
-      </div>
+  function sortGroup(arr) {
+    if      (sort === 'buy')  arr.sort((a,b) => b.total_net  - a.total_net);
+    else if (sort === 'sell') arr.sort((a,b) => a.total_net  - b.total_net);
+    else                      arr.sort((a,b) => (b.total_buy+b.total_sell) - (a.total_buy+a.total_sell));
+    return arr;
+  }
+
+  // Group by tier
+  const byTier = {};
+  for (const item of results) byTier[item.tier || 'micro'] = (byTier[item.tier || 'micro'] || []).concat(item);
+
+  let html = '';
+  for (const t of OV_TIERS) {
+    const group = byTier[t.key];
+    if (!group || !group.length) continue;
+    sortGroup(group);
+    html += `<div style="grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:6px 2px;border-bottom:1px solid var(--bor);margin-bottom:2px">
+      <span style="font-size:15px">${t.icon}</span>
+      <span style="font-weight:700;font-size:13px">${t.label}</span>
+      <span style="font-size:10px;color:var(--mut)">${t.range}</span>
+      <span style="font-size:11px;color:var(--acc);margin-left:4px">${group.length} 支</span>
     </div>`;
-  }).join('');
-  document.getElementById('overview-grid').innerHTML = cards || '<div class="empty" style="grid-column:1/-1">無大戶活動資料</div>';
+    html += group.map(_ovCard).join('');
+  }
+
+  document.getElementById('overview-grid').innerHTML = html || '<div class="empty" style="grid-column:1/-1">無大戶活動資料</div>';
 }
 
 function _ovSpark(timeline, w) {
