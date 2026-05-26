@@ -907,6 +907,7 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
 _OV_SCAN: dict = {
     "running": False, "done": 0, "total": 0,
     "results": {}, "error": "", "days": 15, "started": "", "tier": "",
+    "skip": 0, "last_err": "",
 }
 _OV_SCAN_LOCK = threading.Lock()
 
@@ -1049,9 +1050,13 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int):
                 else:
                     with _OV_SCAN_LOCK:
                         _OV_SCAN["done"] += 1
-            except Exception:
+            except Exception as exc:
+                import traceback
                 with _OV_SCAN_LOCK:
                     _OV_SCAN["done"] += 1
+                    _OV_SCAN["skip"] += 1
+                    _OV_SCAN["last_err"] = f"{stock_id}: {exc}"
+                print(f"  [OV] {stock_id} error: {traceback.format_exc()[:300]}")
                 break
 
         time.sleep(0.6)   # ~1.6 stocks/s ≈ 3.2 FinMind calls/s, well under 600/min
@@ -1087,7 +1092,7 @@ def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: s
     # Set running=True BEFORE the thread starts so the first poll tick sees it
     with _OV_SCAN_LOCK:
         _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
-                         "error": "", "days": days,
+                         "error": "", "days": days, "skip": 0, "last_err": "",
                          "started": datetime.now().strftime("%H:%M")})
     threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days),
                      daemon=True).start()
@@ -1115,8 +1120,49 @@ def api_ov_scan_status():
         "running": _OV_SCAN["running"], "done": _OV_SCAN["done"],
         "total":   _OV_SCAN["total"],   "days":  _OV_SCAN["days"],
         "started": _OV_SCAN["started"], "error": _OV_SCAN["error"],
+        "skip":    _OV_SCAN.get("skip", 0), "last_err": _OV_SCAN.get("last_err", ""),
         "tier":    _OV_SCAN["tier"],
         "results": results,
+    }
+
+
+@app.get("/api/debug")
+def api_debug():
+    """診斷：stocks/grading 狀態 + 測試一支股票 broker data。"""
+    import os, traceback as tb
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    # Test one stock
+    test_sid = "2330"
+    test_result = {}
+    try:
+        from datetime import date as dt_date, timedelta as td
+        end_d   = dt_date.today()
+        start_d = end_d - td(days=22)
+        raw_r = requests.get(
+            FINMIND_BASE,
+            params={"dataset": "TaiwanStockTradingDailyReport", "data_id": test_sid,
+                    "start_date": start_d.isoformat(), "end_date": end_d.isoformat(),
+                    "token": token},
+            timeout=15,
+        )
+        j = raw_r.json()
+        rows = j.get("data", [])
+        sample = rows[:3] if rows else []
+        test_result = {"status": j.get("status"), "row_count": len(rows),
+                       "sample": sample, "msg": j.get("msg", "")}
+    except Exception as exc:
+        test_result = {"error": str(exc), "trace": tb.format_exc()[:400]}
+
+    with _OV_SCAN_LOCK:
+        scan_snap = {k: v for k, v in _OV_SCAN.items() if k != "results"}
+        scan_snap["results_count"] = len(_OV_SCAN["results"])
+
+    return {
+        "stocks_count":  len(_STOCKS),
+        "grading_count": len(_GRADING),
+        "grade_prog":    _GRADE_PROG,
+        "scan":          scan_snap,
+        "test_2330":     test_result,
     }
 
 
@@ -2878,10 +2924,12 @@ async function _ovPollTick() {
     renderOverviewGrid();
 
     const pct  = st.total ? Math.round(st.done / st.total * 100) : 0;
+    const skip = st.skip || 0;
     const info = st.running
-      ? `掃描中 ${st.done}/${st.total}（${pct}%）`
-      : `共 ${st.results.length} 支・${st.started} 完成`;
+      ? `掃描中 ${st.done}/${st.total}（${pct}%）${skip ? ' 跳過'+skip : ''}`
+      : `共 ${st.results.length} 支・${st.started} 完成${skip ? ' 跳過'+skip : ''}`;
     if (countEl) countEl.textContent = info;
+    if (st.last_err) console.warn('[OV scan error]', st.last_err);
 
     if (!st.running) _ovStopPoll();
   } catch(e) { /* ignore transient errors */ }
