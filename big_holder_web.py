@@ -1026,11 +1026,6 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int):
         d += td(days=1)
     start, end = start_d.isoformat(), end_d.isoformat()
 
-    with _OV_SCAN_LOCK:
-        _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
-                         "error": "", "days": days,
-                         "started": datetime.now().strftime("%H:%M")})
-
     for stock_id in stock_ids:
         ckey = f"ov_item|{stock_id}|{days}"
         cached = _cget(ckey, ttl_h=6)
@@ -1089,6 +1084,11 @@ def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: s
             stock_ids = [s["stock_id"] for s in _STOCKS]
     else:
         stock_ids = [s["stock_id"] for s in _STOCKS]
+    # Set running=True BEFORE the thread starts so the first poll tick sees it
+    with _OV_SCAN_LOCK:
+        _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
+                         "error": "", "days": days,
+                         "started": datetime.now().strftime("%H:%M")})
     threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days),
                      daemon=True).start()
     return {"status": "started", "total": len(stock_ids), "tier": tier}
