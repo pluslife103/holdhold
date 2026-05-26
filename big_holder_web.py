@@ -943,13 +943,16 @@ def _fetch_broker_range(token: str, stock_id: str, start: str, end: str) -> dict
         lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0, "buy_amt": 0.0, "sell_amt": 0.0}
     ))
     for row in rows_raw:
-        d   = str(row.get("date", ""))[:10]
-        bid = row.get("securities_trader_id", "")
+        d     = str(row.get("date", ""))[:10]
+        bid   = row.get("securities_trader_id", "")
+        buy_s = float(row.get("buy",   0) or 0)
+        sel_s = float(row.get("sell",  0) or 0)
+        px    = float(row.get("price", 0) or 0)
         agg[d][bid]["name"]     = row.get("securities_trader", "")
-        agg[d][bid]["buy_s"]   += float(row.get("buy",          0) or 0)
-        agg[d][bid]["sell_s"]  += float(row.get("sell",         0) or 0)
-        agg[d][bid]["buy_amt"] += float(row.get("buy_amount",   0) or 0)
-        agg[d][bid]["sell_amt"]+= float(row.get("sell_amount",  0) or 0)
+        agg[d][bid]["buy_s"]   += buy_s
+        agg[d][bid]["sell_s"]  += sel_s
+        agg[d][bid]["buy_amt"] += buy_s * px   # shares × price = NTD amount
+        agg[d][bid]["sell_amt"]+= sel_s * px
     by_date: dict = {}
     for d, brokers in agg.items():
         processed = []
@@ -957,8 +960,9 @@ def _fetch_broker_range(token: str, stock_id: str, start: str, end: str) -> dict
             is_retail = v["buy_amt"] <= THOLD and v["sell_amt"] <= THOLD
             processed.append({
                 "name": v["name"], "id": bid,
-                "buy": round(v["buy_s"]), "sell": round(v["sell_s"]),
-                "net": round(v["buy_s"] - v["sell_s"]),
+                "buy":  round(v["buy_s"] / 1000),   # shares → 張
+                "sell": round(v["sell_s"] / 1000),
+                "net":  round((v["buy_s"] - v["sell_s"]) / 1000),
                 "buy_amount": v["buy_amt"], "sell_amount": v["sell_amt"],
                 "is_retail": is_retail,
             })
