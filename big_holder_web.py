@@ -1122,8 +1122,10 @@ def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: s
         with _CLOCK:
             stock_ids = [sid for sid, g in _GRADING.items() if g.get("tier") == tier]
         if not stock_ids:
-            # grading not ready yet — scan all and let results filter by tier label
-            stock_ids = [s["stock_id"] for s in _STOCKS]
+            return {"status": "grading_not_ready",
+                    "total": 0, "tier": tier,
+                    "running": _GRADE_PROG.get("running", False),
+                    "ready": len(_GRADING)}
     else:
         stock_ids = [s["stock_id"] for s in _STOCKS]
     # Set running=True BEFORE the thread starts so the first poll tick sees it
@@ -2898,11 +2900,10 @@ async function ovSetTier(tier) {
   document.getElementById('ovt-' + (tier || 'all'))?.classList.add('active');
 
   if (tier) {
-    // Check grading readiness before tier-specific scan
     const countEl = document.getElementById('ov-stock-count');
     try {
       const gr = await fetch('/api/grading/status').then(r => r.json());
-      if ((gr.ready || 0) === 0) {
+      if (gr.running || (gr.ready || 0) === 0) {
         const pct = gr.total ? Math.round(gr.done / gr.total * 100) : 0;
         if (countEl) countEl.textContent = gr.running
           ? `分級計算中 ${pct}%，完成後再點規模按鈕（約${Math.ceil((gr.total - gr.done) * 0.3 / 60)} 分鐘）`
@@ -2946,7 +2947,15 @@ async function ovReload(force = true) {
   if (countEl) countEl.textContent = '啟動掃描…';
   document.getElementById('overview-grid').innerHTML =
     '<div class="empty" style="grid-column:1/-1;padding:30px">後台掃描中，每完成一批即更新…</div>';
-  await fetch(`/api/overview_scan/start?days=${days}&force=${force}&tier=${_ovTier}`, { method: 'POST' });
+  const resp = await fetch(`/api/overview_scan/start?days=${days}&force=${force}&tier=${_ovTier}`, { method: 'POST' });
+  const data = await resp.json();
+  if (data.status === 'grading_not_ready') {
+    const pct = data.ready && _ovTier ? `（已有 ${data.ready} 支，分級計算中）` : '';
+    if (countEl) countEl.textContent = `分級資料尚未準備好${pct}，請稍後再試`;
+    document.getElementById('overview-grid').innerHTML =
+      '<div class="empty" style="grid-column:1/-1;color:var(--mut)">← 點左側規模按鈕開始掃描</div>';
+    return;
+  }
   _ovStartPoll();
 }
 
