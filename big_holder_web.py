@@ -1097,7 +1097,16 @@ def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: s
 @app.get("/api/overview_scan/status")
 def api_ov_scan_status():
     with _OV_SCAN_LOCK:
-        results = list(_OV_SCAN["results"].values())
+        results = [dict(v) for v in _OV_SCAN["results"].values()]
+    # Refresh tier/market_cap from latest _GRADING so stale cache doesn't
+    # misclassify stocks scanned before grading completed
+    with _CLOCK:
+        grading_snap = dict(_GRADING)
+    for item in results:
+        g = grading_snap.get(item["stock_id"])
+        if g:
+            item["tier"] = g["tier"]
+            item["market_cap_億"] = g["market_cap_億"]
     results.sort(key=lambda x: (
         TIER_ORDER.get(x.get("tier", "micro"), 99),
         -(x["total_buy"] + x["total_sell"])
