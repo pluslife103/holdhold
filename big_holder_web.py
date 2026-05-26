@@ -1737,10 +1737,11 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 
     <!-- 大戶總覽 pane -->
     <div class="pane" id="pane-overview">
-      <div style="padding:10px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;display:flex;flex-direction:column;gap:8px">
+      <div style="padding:8px 16px;border-bottom:1px solid var(--bor);flex-shrink:0">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <span style="font-weight:700;font-size:13px">大戶總覽</span>
-          <select id="ov-days" class="search" style="width:130px">
+          <span id="ov-stock-count" style="font-size:10px;color:var(--mut)"></span>
+          <select id="ov-days" class="search" style="width:130px" onchange="ovReload()">
             <option value="10">近10交易日</option>
             <option value="15" selected>近15交易日</option>
             <option value="20">近20交易日</option>
@@ -1751,24 +1752,23 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             <option value="buy">主力淨買多</option>
             <option value="sell">主力淨賣多</option>
           </select>
-          <button class="sort-btn" onclick="loadOverview()"
-            style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">查詢</button>
-          <button class="sort-btn" onclick="ovImportSidebar()"
-            style="font-size:11px;padding:3px 10px">匯入側邊欄</button>
-          <span style="font-size:10px;color:var(--mut)">每批50檔・每格=800萬</span>
+          <button class="sort-btn" onclick="ovReload()"
+            style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">重新載入</button>
+          <button class="sort-btn" onclick="ovToggleCustom()"
+            style="font-size:11px;padding:3px 10px" id="ov-custom-btn">自訂股票</button>
         </div>
-        <textarea id="ov-stocks" class="search"
-          style="width:100%;height:52px;resize:vertical;font-family:monospace;font-size:11px;line-height:1.5"
-          placeholder="輸入股票代號，逗號或換行分隔（支援全部股票）"
->2330, 2454, 2317, 2382, 2395, 2412, 2308, 3711, 2303, 6505,
-2881, 2882, 2886, 2891, 2892, 1301, 1303, 1326, 2002, 2357,
-2379, 3008, 2408, 2327, 2376, 2345, 2615, 2603, 2609, 2610</textarea>
+        <div id="ov-custom-area" style="display:none;margin-top:6px">
+          <textarea id="ov-stocks" class="search"
+            style="width:100%;height:52px;resize:vertical;font-family:monospace;font-size:11px;line-height:1.5"
+            placeholder="輸入股票代號，逗號或換行分隔（留空=全部股票）"></textarea>
+          <button class="sort-btn" onclick="loadOverview()" style="margin-top:4px;font-size:11px">套用</button>
+        </div>
       </div>
       <div id="overview-grid"
         style="flex:1;overflow-y:auto;padding:12px;
                display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
                gap:10px;align-content:start">
-        <div class="empty" style="grid-column:1/-1">點擊「查詢」載入大戶時間軸總覽</div>
+        <div class="empty" style="grid-column:1/-1">載入中…</div>
       </div>
     </div>
 
@@ -1855,6 +1855,12 @@ async function loadStockList() {
   document.getElementById('stock-badge').textContent = total;
   document.getElementById('d-badge').textContent = total;
   renderList();
+  // Auto-load overview if that tab is already visible
+  if (document.getElementById('pane-overview')?.classList.contains('active') && _ovData === null) {
+    document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
+    loadOverview();
+  }
+  document.getElementById('ov-stock-count').textContent = `全部 ${allStocks.length} 支`;
 }
 
 function filterStocks(src) {
@@ -2293,6 +2299,10 @@ function switchTab(name) {
     const inp = document.getElementById('broker-date');
     if (!inp.value) inp.value = new Date().toISOString().slice(0,10);
   }
+  if (name === 'overview' && _ovData === null && allStocks.length) {
+    document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
+    loadOverview();
+  }
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
 
@@ -2514,14 +2524,27 @@ function renderTimeline(tl, stock) {
 // ── 大戶總覽 ──────────────────────────────────────────────────────────────
 let _ovData = null;
 
-function ovImportSidebar() {
-  if (!allStocks.length) { showToast('側邊欄尚未載入股票清單'); return; }
-  document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
-  showToast(`已匯入 ${allStocks.length} 檔`);
+function ovToggleCustom() {
+  const area = document.getElementById('ov-custom-area');
+  const btn  = document.getElementById('ov-custom-btn');
+  const open = area.style.display === 'none';
+  area.style.display = open ? 'block' : 'none';
+  btn.style.background = open ? 'var(--acc)' : '';
+  btn.style.color      = open ? '#000' : '';
+}
+
+function ovReload() {
+  _ovData = null;
+  const customRaw = document.getElementById('ov-stocks').value.trim();
+  if (!customRaw) {
+    // use all stocks
+    document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
+  }
+  loadOverview();
 }
 
 async function loadOverview() {
-  const raw = document.getElementById('ov-stocks').value;
+  const raw    = document.getElementById('ov-stocks').value;
   const allIds = raw.split(/[\s,\n]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
   if (!allIds.length) {
     document.getElementById('overview-grid').innerHTML = '<div class="empty" style="grid-column:1/-1">請輸入股票代號</div>';
@@ -2536,6 +2559,8 @@ async function loadOverview() {
   _ovData = { results: [], dates: [] };
   let loaded = 0;
 
+  const countEl = document.getElementById('ov-stock-count');
+
   function setProgress(msg) {
     let el = document.getElementById('ov-progress');
     if (!el) {
@@ -2546,13 +2571,14 @@ async function loadOverview() {
       grid.appendChild(el);
     }
     el.textContent = msg;
+    if (countEl) countEl.textContent = msg;
   }
 
   grid.innerHTML = '';
-  setProgress(`準備載入 ${allIds.length} 檔…`);
+  setProgress(`準備載入 ${allIds.length} 支…`);
 
   for (const batch of batches) {
-    setProgress(`載入中 ${loaded} / ${allIds.length} 檔，請稍候…`);
+    setProgress(`載入中 ${loaded} / ${allIds.length} 支…`);
     try {
       const res = await fetch(`/api/multi_timeline?stocks=${batch.join(',')}&days=${days}`);
       if (res.ok) {
@@ -2569,6 +2595,7 @@ async function loadOverview() {
 
   const prog = document.getElementById('ov-progress');
   if (prog) prog.remove();
+  if (countEl) countEl.textContent = `共 ${_ovData.results.length} 支`;
   if (!_ovData.results.length)
     grid.innerHTML = '<div class="empty" style="grid-column:1/-1;color:var(--red)">無資料，請確認股票代號</div>';
 }
