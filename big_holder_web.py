@@ -903,6 +903,198 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
     return processed
 
 
+# ── 大戶總覽後台掃描 ──────────────────────────────────────────────────────
+_OV_SCAN: dict = {
+    "running": False, "done": 0, "total": 0,
+    "results": {}, "error": "", "days": 15, "started": "",
+}
+_OV_SCAN_LOCK = threading.Lock()
+
+
+def _fetch_broker_range(token: str, stock_id: str, start: str, end: str) -> dict:
+    """One API call: all broker rows for stock_id between start–end.
+    Returns {date_str: [processed_rows]}. Cached 6h."""
+    from collections import defaultdict
+    ckey = f"brange|{stock_id}|{start}|{end}"
+    cached = _cget(ckey, ttl_h=6)
+    if cached is not None:
+        return cached
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                    "start_date": start, "end_date": end, "token": token},
+            timeout=30,
+        )
+        j = r.json()
+    except Exception:
+        return {}
+    fm_status = j.get("status")
+    if r.status_code == 402 or fm_status == 402:
+        raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
+    if r.status_code != 200 or fm_status not in (200, None):
+        return {}
+    rows_raw = j.get("data", [])
+    if not rows_raw:
+        _cset(ckey, {})
+        return {}
+    THOLD = 8_000_000
+    agg: dict = defaultdict(lambda: defaultdict(
+        lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0, "buy_amt": 0.0, "sell_amt": 0.0}
+    ))
+    for row in rows_raw:
+        d   = str(row.get("date", ""))[:10]
+        bid = row.get("securities_trader_id", "")
+        agg[d][bid]["name"]     = row.get("securities_trader", "")
+        agg[d][bid]["buy_s"]   += float(row.get("buy",          0) or 0)
+        agg[d][bid]["sell_s"]  += float(row.get("sell",         0) or 0)
+        agg[d][bid]["buy_amt"] += float(row.get("buy_amount",   0) or 0)
+        agg[d][bid]["sell_amt"]+= float(row.get("sell_amount",  0) or 0)
+    by_date: dict = {}
+    for d, brokers in agg.items():
+        processed = []
+        for bid, v in brokers.items():
+            is_retail = v["buy_amt"] <= THOLD and v["sell_amt"] <= THOLD
+            processed.append({
+                "name": v["name"], "id": bid,
+                "buy": round(v["buy_s"]), "sell": round(v["sell_s"]),
+                "net": round(v["buy_s"] - v["sell_s"]),
+                "buy_amount": v["buy_amt"], "sell_amount": v["sell_amt"],
+                "is_retail": is_retail,
+            })
+        by_date[d] = processed
+    _cset(ckey, by_date)
+    return by_date
+
+
+def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str) -> dict:
+    """Fetch + compute overview item for one stock."""
+    broker_data = _fetch_broker_range(token, stock_id, start, end)
+    price_map   = _fetch_price_range(stock_id, start, end)
+    THOLD = 8_000_000
+    timeline = []
+    for dt in sorted(dates):
+        rows = broker_data.get(dt, [])
+        bs = ss = rb = rs = 0
+        for row in rows:
+            if row.get("is_retail"):
+                rb += row.get("buy",  0)
+                rs += row.get("sell", 0)
+            else:
+                bs += int(row.get("buy_amount",  0) // THOLD)
+                ss += int(row.get("sell_amount", 0) // THOLD)
+        pm = price_map.get(dt, {})
+        timeline.append({"date": dt, "buy_score": bs, "sell_score": ss,
+                         "net_score": bs - ss, "retail_buy": rb, "retail_sell": rs,
+                         "close": pm.get("close", 0), "volume": pm.get("volume", 0)})
+    while timeline and not any([
+        timeline[-1]["buy_score"], timeline[-1]["sell_score"],
+        timeline[-1]["retail_buy"], timeline[-1]["retail_sell"], timeline[-1]["close"],
+    ]):
+        timeline.pop()
+    total_buy  = sum(t["buy_score"]  for t in timeline)
+    total_sell = sum(t["sell_score"] for t in timeline)
+    closes = [t["close"] for t in timeline if t["close"] > 0]
+    latest_close  = closes[-1]               if closes          else 0
+    prev_close    = closes[-2]               if len(closes) > 1 else 0
+    price_chg_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
+    g = _GRADING.get(stock_id, {})
+    return {
+        "stock_id": stock_id, "timeline": timeline,
+        "total_buy": total_buy, "total_sell": total_sell,
+        "total_net": total_buy - total_sell,
+        "total_retail_buy":  sum(t["retail_buy"]  for t in timeline),
+        "total_retail_sell": sum(t["retail_sell"] for t in timeline),
+        "latest_close": latest_close, "price_chg_pct": price_chg_pct,
+        "tier": g.get("tier", "micro"), "market_cap_億": g.get("market_cap_億", 0),
+    }
+
+
+def _ov_scan_worker(token: str, stock_ids: list, days: int):
+    from datetime import date as dt_date, timedelta as td
+    end_d   = dt_date.today()
+    start_d = end_d - td(days=round(days * 1.5))
+    dates: list = []
+    d = start_d
+    while d <= end_d:
+        if d.weekday() < 5:
+            dates.append(d.isoformat())
+        d += td(days=1)
+    start, end = start_d.isoformat(), end_d.isoformat()
+
+    with _OV_SCAN_LOCK:
+        _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
+                         "error": "", "days": days,
+                         "started": datetime.now().strftime("%H:%M")})
+
+    for stock_id in stock_ids:
+        ckey = f"ov_item|{stock_id}|{days}"
+        cached = _cget(ckey, ttl_h=6)
+        if cached is not None:
+            with _OV_SCAN_LOCK:
+                _OV_SCAN["results"][stock_id] = cached
+                _OV_SCAN["done"] += 1
+            continue
+
+        for attempt in range(3):
+            try:
+                item = _scan_one_stock(token, stock_id, dates, start, end)
+                _cset(ckey, item)
+                with _OV_SCAN_LOCK:
+                    _OV_SCAN["results"][stock_id] = item
+                    _OV_SCAN["done"] += 1
+                break
+            except _FinMindRateLimit:
+                if attempt < 2:
+                    time.sleep(60)
+                else:
+                    with _OV_SCAN_LOCK:
+                        _OV_SCAN["done"] += 1
+            except Exception:
+                with _OV_SCAN_LOCK:
+                    _OV_SCAN["done"] += 1
+                break
+
+        time.sleep(0.6)   # ~1.6 stocks/s ≈ 3.2 FinMind calls/s, well under 600/min
+
+    with _OV_SCAN_LOCK:
+        _OV_SCAN["running"] = False
+
+
+@app.post("/api/overview_scan/start")
+def api_ov_scan_start(days: int = Query(15), force: bool = Query(False)):
+    import os
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+    with _OV_SCAN_LOCK:
+        if _OV_SCAN["running"]:
+            return {"status": "already_running", "done": _OV_SCAN["done"],
+                    "total": _OV_SCAN["total"]}
+        if force or _OV_SCAN["days"] != days:
+            _OV_SCAN["results"] = {}
+    stock_ids = [s["stock_id"] for s in _STOCKS]
+    threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days),
+                     daemon=True).start()
+    return {"status": "started", "total": len(stock_ids)}
+
+
+@app.get("/api/overview_scan/status")
+def api_ov_scan_status():
+    with _OV_SCAN_LOCK:
+        results = list(_OV_SCAN["results"].values())
+    results.sort(key=lambda x: (
+        TIER_ORDER.get(x.get("tier", "micro"), 99),
+        -(x["total_buy"] + x["total_sell"])
+    ))
+    return {
+        "running": _OV_SCAN["running"], "done": _OV_SCAN["done"],
+        "total":   _OV_SCAN["total"],   "days":  _OV_SCAN["days"],
+        "started": _OV_SCAN["started"], "error": _OV_SCAN["error"],
+        "results": results,
+    }
+
+
 def _fetch_price_range(stock_id: str, start: str, end: str) -> dict:
     """Fetch daily close+volume for one stock over a date range. Returns {date_str: {close, volume}}."""
     df = _fm("TaiwanStockPrice", stock_id, start, end)
@@ -1782,8 +1974,8 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             <option value="buy">主力淨買多</option>
             <option value="sell">主力淨賣多</option>
           </select>
-          <button class="sort-btn" onclick="ovReload()"
-            style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">重新載入</button>
+          <button class="sort-btn" onclick="ovReload(true)"
+            style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">重新掃描</button>
           <button class="sort-btn" onclick="ovToggleCustom()"
             style="font-size:11px;padding:3px 10px" id="ov-custom-btn">自訂股票</button>
         </div>
@@ -1885,10 +2077,9 @@ async function loadStockList() {
   document.getElementById('stock-badge').textContent = total;
   document.getElementById('d-badge').textContent = total;
   renderList();
-  // Auto-load overview if that tab is already visible
+  // Auto-start scan if overview tab is already visible
   if (document.getElementById('pane-overview')?.classList.contains('active') && _ovData === null) {
-    document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
-    loadOverview();
+    ovReload(false);
   }
   document.getElementById('ov-stock-count').textContent = `全部 ${allStocks.length} 支`;
 }
@@ -2329,9 +2520,9 @@ function switchTab(name) {
     const inp = document.getElementById('broker-date');
     if (!inp.value) inp.value = new Date().toISOString().slice(0,10);
   }
-  if (name === 'overview' && _ovData === null && allStocks.length) {
-    document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
-    loadOverview();
+  if (name === 'overview' && allStocks.length) {
+    if (_ovData === null) ovReload(false);
+    else _ovStartPoll();  // resume polling if scan is still running
   }
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
@@ -2552,7 +2743,8 @@ function renderTimeline(tl, stock) {
 }
 
 // ── 大戶總覽 ──────────────────────────────────────────────────────────────
-let _ovData = null;
+let _ovData      = null;
+let _ovPollTimer = null;
 
 function ovToggleCustom() {
   const area = document.getElementById('ov-custom-area');
@@ -2563,81 +2755,81 @@ function ovToggleCustom() {
   btn.style.color      = open ? '#000' : '';
 }
 
-function ovReload() {
-  _ovData = null;
-  const customRaw = document.getElementById('ov-stocks').value.trim();
-  if (!customRaw) {
-    // use all stocks
-    document.getElementById('ov-stocks').value = allStocks.map(s => s.stock_id).join(', ');
-  }
-  loadOverview();
+function _ovStopPoll() {
+  if (_ovPollTimer) { clearInterval(_ovPollTimer); _ovPollTimer = null; }
 }
 
+async function ovReload(force = true) {
+  _ovStopPoll();
+  const days = document.getElementById('ov-days').value;
+  const countEl = document.getElementById('ov-stock-count');
+  if (countEl) countEl.textContent = '啟動掃描…';
+  document.getElementById('overview-grid').innerHTML =
+    '<div class="empty" style="grid-column:1/-1;padding:30px">後台掃描中，每完成一批即更新…</div>';
+  await fetch(`/api/overview_scan/start?days=${days}&force=${force}`, { method: 'POST' });
+  _ovStartPoll();
+}
+
+// For custom stock list, fall back to the old batched approach
 async function loadOverview() {
   const raw    = document.getElementById('ov-stocks').value;
   const allIds = raw.split(/[\s,\n]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
-  if (!allIds.length) {
-    document.getElementById('overview-grid').innerHTML = '<div class="empty" style="grid-column:1/-1">請輸入股票代號</div>';
-    return;
-  }
-  const days = document.getElementById('ov-days').value;
-  const grid = document.getElementById('overview-grid');
-  const BATCH = 50;
+  if (!allIds.length) { ovReload(false); return; }
+  _ovStopPoll();
+  const days    = document.getElementById('ov-days').value;
+  const grid    = document.getElementById('overview-grid');
+  const countEl = document.getElementById('ov-stock-count');
+  const BATCH   = 50;
   const batches = [];
   for (let i = 0; i < allIds.length; i += BATCH) batches.push(allIds.slice(i, i + BATCH));
-
   _ovData = { results: [], dates: [] };
   let loaded = 0;
-
-  const countEl = document.getElementById('ov-stock-count');
-
-  function setProgress(msg) {
-    let el = document.getElementById('ov-progress');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'ov-progress';
-      el.className = 'empty';
-      el.style.cssText = 'grid-column:1/-1;padding:20px;font-size:12px';
-      grid.appendChild(el);
-    }
-    el.textContent = msg;
-    if (countEl) countEl.textContent = msg;
-  }
-
   grid.innerHTML = '';
-  setProgress(`準備載入 ${allIds.length} 支…`);
-
+  const progDiv = Object.assign(document.createElement('div'),
+    { id: 'ov-progress', className: 'empty',
+      style: 'grid-column:1/-1;padding:20px;font-size:12px' });
+  grid.appendChild(progDiv);
   for (const batch of batches) {
-    setProgress(`載入中 ${loaded} / ${allIds.length} 支…`);
+    progDiv.textContent = `載入中 ${loaded} / ${allIds.length} 支…`;
+    if (countEl) countEl.textContent = progDiv.textContent;
     try {
       const res = await fetch(`/api/multi_timeline?stocks=${batch.join(',')}&days=${days}`);
       if (res.ok) {
         const bd = await res.json();
         _ovData.results.push(...bd.results);
         if ((bd.dates || []).length > _ovData.dates.length) _ovData.dates = bd.dates;
-      } else if (res.status === 429) {
-        const err = await res.json().catch(() => ({}));
-        const prog = document.getElementById('ov-progress');
-        if (prog) prog.remove();
-        grid.insertAdjacentHTML('beforeend',
-          `<div class="empty" style="grid-column:1/-1;color:var(--red);padding:16px">
-            FinMind 速率限制（402）：${err.detail || '請求過於頻繁，請稍後再試'}
-          </div>`);
-        if (countEl) countEl.textContent = '速率限制';
-        return;
       }
-    } catch(e) { /* skip failed batch */ }
+    } catch(e) { /* skip */ }
     loaded += batch.length;
-    const prog = document.getElementById('ov-progress');
-    if (prog) prog.remove();
+    progDiv.remove();
     renderOverviewGrid();
+    if (loaded < allIds.length) grid.appendChild(progDiv);
   }
-
-  const prog = document.getElementById('ov-progress');
-  if (prog) prog.remove();
   if (countEl) countEl.textContent = `共 ${_ovData.results.length} 支`;
-  if (!_ovData.results.length)
-    grid.innerHTML = '<div class="empty" style="grid-column:1/-1;color:var(--red)">無資料，請確認股票代號</div>';
+}
+
+function _ovStartPoll() {
+  _ovPollTimer = setInterval(_ovPollTick, 3000);
+  _ovPollTick();
+}
+
+async function _ovPollTick() {
+  try {
+    const r  = await fetch('/api/overview_scan/status');
+    const st = await r.json();
+    const countEl = document.getElementById('ov-stock-count');
+
+    _ovData = { results: st.results, dates: [] };
+    renderOverviewGrid();
+
+    const pct  = st.total ? Math.round(st.done / st.total * 100) : 0;
+    const info = st.running
+      ? `掃描中 ${st.done}/${st.total}（${pct}%）`
+      : `共 ${st.results.length} 支・${st.started} 完成`;
+    if (countEl) countEl.textContent = info;
+
+    if (!st.running) _ovStopPoll();
+  } catch(e) { /* ignore transient errors */ }
 }
 
 function ovSort() { if (_ovData) renderOverviewGrid(); }
