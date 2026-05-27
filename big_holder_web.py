@@ -141,6 +141,29 @@ def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataF
 _STOCKS: list[dict] = []
 _STOCK_MAP: dict[str, str] = {}      # id -> name
 _STOCK_INDUSTRY: dict[str, str] = {} # id -> industry category
+_STOCK_MCAP: dict[str, float] = {}   # id -> market_cap 億 NTD (快速分層用)
+
+
+def _parse_cap_億(v_raw) -> "float | None":
+    """將各種單位的市值原始值轉換成億 NTD。
+    FinMind 可能用千元；TPEX 用億元；本函式自動偵測量級。"""
+    try:
+        v = float(str(v_raw).replace(",", "").replace("--", "").replace("N/A", "").strip())
+        if v <= 0:
+            return None
+        # 自動偵測單位：> 1e10 → 千元, > 1e7 → 百萬元, > 1e4 → 億 (but still very large),
+        # 合理的 億 值大約在 1~500,000 之間
+        if v > 1e10:   # 千元 → 億
+            return v / 1e5
+        elif v > 1e7:  # 百萬元 → 億
+            return v / 100
+        elif v > 1e4:  # 可能已是億，但數值很大（> 10000 億），直接用
+            return v
+        elif v > 0:    # 小於 1e4 億，也直接用
+            return v
+        return None
+    except Exception:
+        return None
 
 
 def _load_stocks() -> None:
@@ -154,6 +177,8 @@ def _load_stocks() -> None:
             cols = ["stock_id", "stock_name", "type"]
             if "industry_category" in df.columns:
                 cols.append("industry_category")
+            if "market_capitalization" in df.columns:
+                cols.append("market_capitalization")
             df = df[cols].drop_duplicates("stock_id")
         else:
             df = pd.DataFrame(columns=["stock_id", "stock_name", "type"])
@@ -173,12 +198,22 @@ def _load_stocks() -> None:
         print("  ✗ 所有股票清單來源均失敗！")
     _STOCKS = df.to_dict(orient="records")
     _STOCK_MAP = dict(zip(df["stock_id"], df["stock_name"]))
-    global _STOCK_INDUSTRY
+    global _STOCK_INDUSTRY, _STOCK_MCAP
     if "industry_category" in df.columns:
         _STOCK_INDUSTRY = {r["stock_id"]: (r.get("industry_category") or "") for r in _STOCKS}
     elif "industry" in df.columns:
         _STOCK_INDUSTRY = {r["stock_id"]: (r.get("industry") or "") for r in _STOCKS}
-    print(f"  股票清單：{len(_STOCKS)} 支，產業別已知：{sum(1 for v in _STOCK_INDUSTRY.values() if v)} 支")
+    # 從 FinMind market_capitalization 或 TPEX market_cap_億 預先建立市值 dict
+    mcap: dict[str, float] = {}
+    for r in _STOCKS:
+        sid = r["stock_id"]
+        raw = r.get("market_capitalization") or r.get("market_cap_億")
+        if raw:
+            cap = _parse_cap_億(raw)
+            if cap and cap > 0:
+                mcap[sid] = cap
+    _STOCK_MCAP = mcap
+    print(f"  股票清單：{len(_STOCKS)} 支，產業別已知：{sum(1 for v in _STOCK_INDUSTRY.values() if v)} 支，市值已知：{len(_STOCK_MCAP)} 支")
 
 
 def _load_stocks_from_twse_openapi() -> pd.DataFrame:
@@ -200,7 +235,13 @@ def _load_stocks_from_twse_openapi() -> pd.DataFrame:
                 name = str(item.get("公司簡稱", item.get("CompanyAbbreviation", item.get("Name", "")))).strip()
                 if re.match(r"^\d{4}$", sid) and name:
                     industry = str(item.get("產業別", item.get("industry_category", ""))).strip()
-                    rows.append({"stock_id": sid, "stock_name": name, "type": market, "industry": industry})
+                    # TPEX quotes 有 市值(億元) 欄；TWSE t187ap03_L 沒有市值
+                    cap_raw = (item.get("市值(億元)") or item.get("市值") or
+                               item.get("MarketCapitalization") or item.get("市值(百萬元)") or "")
+                    row: dict = {"stock_id": sid, "stock_name": name, "type": market, "industry": industry}
+                    if cap_raw:
+                        row["market_cap_億"] = cap_raw
+                    rows.append(row)
             print(f"  OpenAPI {market}: {len(rows)} 筆")
         except Exception as e:
             print(f"  OpenAPI {market} 失敗：{e}")
@@ -369,6 +410,7 @@ def _run_grading() -> None:
     print(f"  開始分級計算：{len(sids)} 支股票，{GRADE_WORKERS} 並發…")
 
     raw: list[dict] = []
+    BATCH = 50   # 每累積 50 支就重算 grade 並更新 _GRADING
     with ThreadPoolExecutor(max_workers=GRADE_WORKERS) as ex:
         futs = {ex.submit(_fetch_one_grading, sid): sid for sid in sids}
         for fut in as_completed(futs):
@@ -377,14 +419,22 @@ def _run_grading() -> None:
                 raw.append(result)
             with _CLOCK:
                 _GRADE_PROG["done"] += 1
+            # 批次更新：讓前端 grade badge 逐漸填入
+            if len(raw) % BATCH == 0 and raw:
+                snapshot = list(raw)
+                _assign_grades_inplace(snapshot)
+                with _CLOCK:
+                    for r in snapshot:
+                        _GRADING[r["stock_id"]] = r
 
+    # 最終完整計算
     _assign_grades_inplace(raw)
-
     with _CLOCK:
-        _GRADING = {r["stock_id"]: r for r in raw}
+        for r in raw:
+            _GRADING[r["stock_id"]] = r   # 更新，不取代（保留預分層但無詳細資料的股票）
 
     _GRADE_PROG["running"] = False
-    print(f"  分級完成：{len(_GRADING)}/{len(sids)} 支股票")
+    print(f"  分級完成：{len(raw)}/{len(sids)} 支股票有詳細資料，_GRADING 共 {len(_GRADING)} 支")
 
 
 # ── 資料處理 ──────────────────────────────────────────────────────────────
@@ -533,11 +583,52 @@ def _process_compare(sids: list[str], years: int) -> dict:
     return {"stocks": result}
 
 
+def _init_tier_grading() -> None:
+    """從 _STOCK_MCAP 預先將所有股票分層，填入 _GRADING 讓 tier 按鈕立即可用。
+    grade 欄位標記為 '?' placeholder，等 _run_grading() 完成後再覆蓋。"""
+    global _GRADING
+    if not _STOCK_MCAP:
+        print("  ⚠ _STOCK_MCAP 空，跳過快速分層")
+        return
+    pre: dict[str, dict] = {}
+    for s in _STOCKS:
+        sid = s["stock_id"]
+        cap_億 = _STOCK_MCAP.get(sid)
+        if cap_億 is None:
+            continue
+        pre[sid] = {
+            "stock_id":      sid,
+            "stock_name":    _STOCK_MAP.get(sid, sid),
+            "market_cap_億": round(cap_億, 1),
+            "tier":          _tier_of(cap_億),
+            "industry":      _STOCK_INDUSTRY.get(sid, ""),
+            "volatility":    0.0,
+            "grade":         "?",
+            "latest_bpct":   0.0,
+            "bpct_chg":      0.0,
+            "latest_bp":     0,
+            "latest_price":  0.0,
+            "n_weeks":       0,
+            "bpct_spark":    [],
+            "price_spark":   [],
+        }
+    if pre:
+        with _CLOCK:
+            if not _GRADING:
+                _GRADING.update(pre)
+        tier_counts = {}
+        for v in pre.values():
+            t = v["tier"]
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        print(f"  快速市值分層：{len(pre)} 支，分布：{tier_counts}")
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────
 def _startup_tasks():
     """Run sequentially in a background thread: load stocks then start grading."""
     _load_stocks()
-    _run_grading()
+    _init_tier_grading()   # 立即從市值預分層，讓 tier 按鈕可用
+    _run_grading()         # 背景逐支抓詳細資料（更新 grade / sparkline）
 
 
 @asynccontextmanager
@@ -2958,12 +3049,15 @@ async function ovSetTier(tier) {
     const countEl = document.getElementById('ov-stock-count');
     try {
       const gr = await fetch('/api/grading/status').then(r => r.json());
-      if (gr.running || (gr.ready || 0) === 0) {
-        const pct = gr.total ? Math.round(gr.done / gr.total * 100) : 0;
-        if (countEl) countEl.textContent = gr.running
-          ? `分級計算中 ${pct}%，完成後再點規模按鈕（約${Math.ceil((gr.total - gr.done) * 0.3 / 60)} 分鐘）`
-          : '分級資料尚未載入，請稍後再試';
+      if ((gr.ready || 0) === 0) {
+        // 完全沒有分層資料（連市值預分層都沒有）才阻擋
+        if (countEl) countEl.textContent = '分級資料尚未載入，請稍後再試';
         return;
+      }
+      // gr.ready > 0：預分層已就緒，可以掃描；若 gr.running 還在跑則只顯示提示
+      if (gr.running && countEl) {
+        const pct = gr.total ? Math.round(gr.done / gr.total * 100) : 0;
+        countEl.textContent = `分層就緒（波動度計算中 ${pct}%）`;
       }
     } catch(e) {}
     _ovLoadIndustries(tier);  // async, shows industry buttons after load
