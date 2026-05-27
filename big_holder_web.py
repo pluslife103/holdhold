@@ -1316,14 +1316,14 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
                     _OV_SCAN["results"][stock_id] = item
                     _OV_SCAN["done"] += 1
                 break
-            except _FinMindRateLimit:
+            except _FinMindRateLimit as rl_exc:
                 if attempt < 2:
                     time.sleep(60)
                 else:
                     with _OV_SCAN_LOCK:
                         _OV_SCAN["done"] += 1
                         _OV_SCAN["skip"] += 1
-                        _OV_SCAN["last_err"] = f"{stock_id}: FinMind API 次數限制 (402)"
+                        _OV_SCAN["last_err"] = f"FinMind 402: {rl_exc or '每日API次數超限'}"
             except Exception as exc:
                 import traceback
                 with _OV_SCAN_LOCK:
@@ -1411,6 +1411,18 @@ def api_ov_scan_status():
         "industry": _OV_SCAN.get("industry", ""),
         "results": results,
     }
+
+
+@app.get("/api/debug_ov")
+def api_debug_ov():
+    """Debug endpoint: show raw scan state without timeline data."""
+    with _OV_SCAN_LOCK:
+        snap = {k: v for k, v in _OV_SCAN.items() if k != "results"}
+        snap["results_count"] = len(_OV_SCAN["results"])
+        snap["result_tiers"] = {sid: item.get("tier") for sid, item in _OV_SCAN["results"].items()}
+        snap["result_totals"] = {sid: (item.get("total_buy", 0), item.get("total_sell", 0))
+                                 for sid, item in _OV_SCAN["results"].items()}
+    return snap
 
 
 @app.get("/api/industries")
@@ -3470,28 +3482,39 @@ function renderOverviewGrid() {
   for (const item of results) byTier[item.tier || 'micro'] = (byTier[item.tier || 'micro'] || []).concat(item);
 
   let html = '';
-  for (const t of OV_TIERS) {
-    const group = byTier[t.key];
-    if (!group || !group.length) continue;
-    sortGroup(group);
-    html += `<div style="grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:6px 2px;border-bottom:1px solid var(--bor);margin-bottom:2px">
-      <span style="font-size:15px">${t.icon}</span>
-      <span style="font-weight:700;font-size:13px">${t.label}</span>
-      <span style="font-size:10px;color:var(--mut)">${t.range}</span>
-      <span style="font-size:11px;color:var(--acc);margin-left:4px">${group.length} 支</span>
-    </div>`;
-    html += group.map(_ovCard).join('');
+  try {
+    for (const t of OV_TIERS) {
+      const group = byTier[t.key];
+      if (!group || !group.length) continue;
+      sortGroup(group);
+      html += `<div style="grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:6px 2px;border-bottom:1px solid var(--bor);margin-bottom:2px">
+        <span style="font-size:15px">${t.icon}</span>
+        <span style="font-weight:700;font-size:13px">${t.label}</span>
+        <span style="font-size:10px;color:var(--mut)">${t.range}</span>
+        <span style="font-size:11px;color:var(--acc);margin-left:4px">${group.length} 支</span>
+      </div>`;
+      html += group.map(_ovCard).join('');
+    }
+  } catch(renderErr) {
+    console.error('[大戶總覽 render error]', renderErr);
+    document.getElementById('overview-grid').innerHTML =
+      `<div class="empty" style="grid-column:1/-1;padding:20px;color:var(--red)">
+        渲染錯誤（${results.length} 筆資料）：${renderErr.message}</div>`;
+    return;
   }
 
   if (!html) {
     const skip = _ovData?.skip || 0;
     const lastErr = _ovData?.last_err || '';
     const isRate = lastErr.includes('402');
-    const msg = skip > 0 && isRate
-      ? `⚠ FinMind API 每日呼叫次數已達上限（${skip} 支無法取得），請明天再試`
-      : skip > 0
-        ? `無大戶活動資料（${skip} 支跳過：${lastErr}）`
-        : '無大戶活動資料';
+    const cnt = results.length;
+    const msg = cnt > 0
+      ? `有 ${cnt} 筆資料但分級不符，請重新掃描`
+      : skip > 0 && isRate
+        ? `⚠ FinMind API 每日呼叫次數已達上限（${skip} 支無法取得），請明天再試或升級方案`
+        : skip > 0
+          ? `無大戶活動資料（${skip} 支跳過：${lastErr}）`
+          : '無大戶活動資料';
     html = `<div class="empty" style="grid-column:1/-1;padding:20px;line-height:1.7">${msg}</div>`;
   }
   document.getElementById('overview-grid').innerHTML = html;
