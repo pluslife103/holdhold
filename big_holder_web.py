@@ -1215,17 +1215,18 @@ def _fetch_broker_range(token: str, stock_id: str, dates: list) -> dict:
             timeout=30,
         )
         j = r.json()
-    except Exception:
+    except Exception as exc:
+        print(f"[broker_range] {stock_id} EXCEPTION: {exc}")
         return {}
 
     fm_status = j.get("status")
+    print(f"[broker_range] {stock_id} {dates[0]}~{dates[-1]}: http={r.status_code} fm_status={fm_status} msg={j.get('msg','')!r} rows={len(j.get('data',[]))}")
     if r.status_code == 402 or fm_status == 402:
         raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
     if r.status_code != 200 or fm_status not in (200, None):
         return {}
 
     rows_raw = j.get("data", [])
-    print(f"[broker_range] {stock_id} {dates[0]}~{dates[-1]}: status={fm_status} rows={len(rows_raw)}")
     if not rows_raw:
         _cset(ckey, {})
         return {}
@@ -1538,6 +1539,50 @@ def api_debug():
         "test_twse_api":   twse_api_result,
         "test_broker_1day": broker_result,
         "test_broker_range": broker_range_result,
+    }
+
+
+@app.get("/api/debug_broker")
+def api_debug_broker(stock_id: str = Query("2330"), days: int = Query(5)):
+    """直接測試 _fetch_broker_range，回傳 raw API 結果供診斷。"""
+    import os
+    from datetime import date as dt_date, timedelta as td
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        return {"error": "no token"}
+    end_d   = dt_date.today()
+    start_d = end_d - td(days=round(days * 1.5))
+    dates: list = []
+    d = start_d
+    while d <= end_d:
+        if d.weekday() < 5:
+            dates.append(d.isoformat())
+        d += td(days=1)
+    # raw call
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                    "start_date": dates[0], "end_date": dates[-1], "token": token},
+            timeout=30,
+        )
+        j = r.json()
+    except Exception as exc:
+        return {"error": str(exc)}
+    rows = j.get("data", [])
+    dates_in_resp = sorted(set(str(rw.get("date",""))[:10] for rw in rows)) if rows else []
+    processed = _fetch_broker_range(token, stock_id, dates)
+    return {
+        "stock_id": stock_id,
+        "dates_requested": [dates[0], dates[-1]],
+        "http_status":   r.status_code,
+        "fm_status":     j.get("status"),
+        "fm_msg":        j.get("msg", ""),
+        "raw_row_count": len(rows),
+        "dates_in_response": dates_in_resp,
+        "sample_row":    rows[0] if rows else None,
+        "processed_dates": sorted(processed.keys()),
+        "processed_rows_per_date": {k: len(v) for k, v in processed.items()},
     }
 
 
