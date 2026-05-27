@@ -1209,33 +1209,35 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
     return processed
 
 
-def _fetch_broker_range(token: str, stock_id: str, dates: list) -> dict:
+def _fetch_broker_range(token: str, stock_id: str, dates: list, force: bool = False) -> dict:
     """Fetch broker data one day at a time using start_date=end_date per call.
     Returns {date_str: [processed_rows]}."""
     if not dates:
         return {}
 
-    ckey = f"broker_range|{stock_id}|{dates[0]}|{dates[-1]}"
-    cached = _cget(ckey, ttl_h=12)
-    if cached is not None:
-        return cached
-
     result: dict = {}
     for date_str in dates:
-        # Throttle only on actual API calls (skip if day already cached)
-        if _cget(f"broker_day|{stock_id}|{date_str}", ttl_h=12) is None:
+        day_ckey = f"broker_day|{stock_id}|{date_str}"
+        if force:
+            # Clear stale per-day cache so we re-fetch from API
+            with _CLOCK:
+                _CACHE.pop(day_ckey, None)
+        cached_day = _cget(day_ckey, ttl_h=12)
+        if cached_day is None:
             time.sleep(0.13)  # ~7 API calls/sec = 420/min, safely under 600/min
-        rows = _fetch_broker_day(token, stock_id, date_str)  # raises _FinMindRateLimit on 402
+            rows = _fetch_broker_day(token, stock_id, date_str)  # raises _FinMindRateLimit on 402
+        else:
+            rows = cached_day
         if rows:
             result[date_str] = rows
 
-    _cset(ckey, result)
     return result
 
 
-def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str) -> dict:
+def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str,
+                    force: bool = False) -> dict:
     """Fetch + compute overview item for one stock."""
-    broker_data = _fetch_broker_range(token, stock_id, dates)
+    broker_data = _fetch_broker_range(token, stock_id, dates, force=force)
     price_map   = _fetch_price_range(stock_id, start, end)
     THOLD = 8_000_000
     timeline = []
@@ -1308,7 +1310,7 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
 
         for attempt in range(3):
             try:
-                item = _scan_one_stock(token, stock_id, dates, start, end)
+                item = _scan_one_stock(token, stock_id, dates, start, end, force=force)
                 _cset(ckey, item)
                 with _OV_SCAN_LOCK:
                     _OV_SCAN["results"][stock_id] = item
