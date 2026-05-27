@@ -36,7 +36,7 @@ CACHE_TTL_H  = 12
 PORT         = 8001
 DEFAULT_YEARS  = 2
 MAX_LAG        = 8
-GRADE_WORKERS  = 8      # concurrent API requests (lower on cloud free tier)
+GRADE_WORKERS  = 2      # concurrent API requests — keep low to avoid OOM on Railway
 
 # ── 規模分層 & 波動等級 ────────────────────────────────────────────────────
 # 市值單位：億 NTD
@@ -86,12 +86,16 @@ def _load_token() -> str:
 
 # ── 記憶體快取 ────────────────────────────────────────────────────────────
 _CACHE: dict = {}
+_CACHE_MAX = 600          # max entries; evict oldest when exceeded
 _CLOCK = threading.Lock()
 
 
 def _cset(key: str, val) -> None:
     with _CLOCK:
         _CACHE[key] = (val, time.time())
+        if len(_CACHE) > _CACHE_MAX:
+            oldest = min(_CACHE, key=lambda k: _CACHE[k][1])
+            del _CACHE[oldest]
 
 
 def _cget(key: str, ttl_h: float = CACHE_TTL_H):
@@ -122,6 +126,10 @@ def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataF
     for attempt in range(3):
         try:
             r = requests.get(FINMIND_BASE, params=params, timeout=60)
+            if r.status_code in (400, 403):
+                # Permanent error (not subscribed / bad request) — cache empty to skip future calls
+                _cset(key, pd.DataFrame())
+                return pd.DataFrame()
             r.raise_for_status()
             body = r.json()
             if body.get("status") == 200:
@@ -435,6 +443,7 @@ def _run_grading() -> None:
 
     _GRADE_PROG["running"] = False
     print(f"  分級完成：{len(raw)}/{len(sids)} 支股票有詳細資料，_GRADING 共 {len(_GRADING)} 支")
+    import gc; gc.collect()  # release DataFrame memory held by grading workers
 
 
 # ── 資料處理 ──────────────────────────────────────────────────────────────
