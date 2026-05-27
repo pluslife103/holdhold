@@ -139,7 +139,8 @@ def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataF
 
 # ── 股票清單 ──────────────────────────────────────────────────────────────
 _STOCKS: list[dict] = []
-_STOCK_MAP: dict[str, str] = {}   # id -> name
+_STOCK_MAP: dict[str, str] = {}      # id -> name
+_STOCK_INDUSTRY: dict[str, str] = {} # id -> industry category
 
 
 def _load_stocks() -> None:
@@ -150,7 +151,10 @@ def _load_stocks() -> None:
     if not df.empty:
         df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
         if "stock_name" in df.columns and "type" in df.columns:
-            df = df[["stock_id", "stock_name", "type"]].drop_duplicates("stock_id")
+            cols = ["stock_id", "stock_name", "type"]
+            if "industry_category" in df.columns:
+                cols.append("industry_category")
+            df = df[cols].drop_duplicates("stock_id")
         else:
             df = pd.DataFrame(columns=["stock_id", "stock_name", "type"])
     print(f"  FinMind TaiwanStockInfo: {len(df)} 筆")
@@ -169,7 +173,12 @@ def _load_stocks() -> None:
         print("  ✗ 所有股票清單來源均失敗！")
     _STOCKS = df.to_dict(orient="records")
     _STOCK_MAP = dict(zip(df["stock_id"], df["stock_name"]))
-    print(f"  股票清單：{len(_STOCKS)} 支")
+    global _STOCK_INDUSTRY
+    if "industry_category" in df.columns:
+        _STOCK_INDUSTRY = {r["stock_id"]: (r.get("industry_category") or "") for r in _STOCKS}
+    elif "industry" in df.columns:
+        _STOCK_INDUSTRY = {r["stock_id"]: (r.get("industry") or "") for r in _STOCKS}
+    print(f"  股票清單：{len(_STOCKS)} 支，產業別已知：{sum(1 for v in _STOCK_INDUSTRY.values() if v)} 支")
 
 
 def _load_stocks_from_twse_openapi() -> pd.DataFrame:
@@ -190,7 +199,8 @@ def _load_stocks_from_twse_openapi() -> pd.DataFrame:
                 sid  = str(item.get("公司代號", item.get("SecuritiesCompanyCode", item.get("Code", "")))).strip()
                 name = str(item.get("公司簡稱", item.get("CompanyAbbreviation", item.get("Name", "")))).strip()
                 if re.match(r"^\d{4}$", sid) and name:
-                    rows.append({"stock_id": sid, "stock_name": name, "type": market})
+                    industry = str(item.get("產業別", item.get("industry_category", ""))).strip()
+                    rows.append({"stock_id": sid, "stock_name": name, "type": market, "industry": industry})
             print(f"  OpenAPI {market}: {len(rows)} 筆")
         except Exception as e:
             print(f"  OpenAPI {market} 失敗：{e}")
@@ -335,8 +345,9 @@ def _fetch_one_grading(sid: str) -> dict | None:
         "latest_bp":     latest_bp,
         "latest_price":  round(latest_close, 2),
         "n_weeks":       len(big),
-        "bpct_spark":    bpct_spark,   # 近 12 週千張大戶% sparkline
-        "price_spark":   price_spark,  # 近 12 週股價 sparkline
+        "industry":      _STOCK_INDUSTRY.get(sid, ""),
+        "bpct_spark":    bpct_spark,
+        "price_spark":   price_spark,
     }
 
 
@@ -944,7 +955,7 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
 _OV_SCAN: dict = {
     "running": False, "done": 0, "total": 0,
     "results": {}, "error": "", "days": 15, "started": "", "tier": "",
-    "skip": 0, "last_err": "",
+    "industry": "", "skip": 0, "last_err": "",
 }
 _OV_SCAN_LOCK = threading.Lock()
 
@@ -1110,7 +1121,10 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int):
 
 
 @app.post("/api/overview_scan/start")
-def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: str = Query("")):
+def api_ov_scan_start(
+    days: int = Query(15), force: bool = Query(False),
+    tier: str = Query(""), industry: str = Query(""),
+):
     import os
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
     if not token:
@@ -1118,31 +1132,38 @@ def api_ov_scan_start(days: int = Query(15), force: bool = Query(False), tier: s
     tier = tier.strip().lower()
     if tier not in ({t[0] for t in TIERS} | {""}):
         tier = ""
+    industry = industry.strip()
     with _OV_SCAN_LOCK:
         if _OV_SCAN["running"]:
             return {"status": "already_running", "done": _OV_SCAN["done"],
                     "total": _OV_SCAN["total"]}
-        if force or _OV_SCAN["days"] != days or _OV_SCAN["tier"] != tier:
+        if (force or _OV_SCAN["days"] != days or _OV_SCAN["tier"] != tier
+                or _OV_SCAN.get("industry", "") != industry):
             _OV_SCAN["results"] = {}
         _OV_SCAN["tier"] = tier
+        _OV_SCAN["industry"] = industry
     if tier:
         with _CLOCK:
-            stock_ids = [sid for sid, g in _GRADING.items() if g.get("tier") == tier]
-        if not stock_ids:
+            tier_stocks = [sid for sid, g in _GRADING.items() if g.get("tier") == tier]
+        if not tier_stocks:
             return {"status": "grading_not_ready",
                     "total": 0, "tier": tier,
                     "running": _GRADE_PROG.get("running", False),
                     "ready": len(_GRADING)}
+        if industry:
+            stock_ids = [sid for sid in tier_stocks
+                         if _GRADING.get(sid, {}).get("industry") == industry]
+        else:
+            stock_ids = tier_stocks
     else:
         stock_ids = [s["stock_id"] for s in _STOCKS]
-    # Set running=True BEFORE the thread starts so the first poll tick sees it
     with _OV_SCAN_LOCK:
         _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
                          "error": "", "days": days, "skip": 0, "last_err": "",
                          "started": datetime.now().strftime("%H:%M")})
     threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days),
                      daemon=True).start()
-    return {"status": "started", "total": len(stock_ids), "tier": tier}
+    return {"status": "started", "total": len(stock_ids), "tier": tier, "industry": industry}
 
 
 @app.get("/api/overview_scan/status")
@@ -1167,8 +1188,29 @@ def api_ov_scan_status():
         "total":   _OV_SCAN["total"],   "days":  _OV_SCAN["days"],
         "started": _OV_SCAN["started"], "error": _OV_SCAN["error"],
         "skip":    _OV_SCAN.get("skip", 0), "last_err": _OV_SCAN.get("last_err", ""),
-        "tier":    _OV_SCAN["tier"],
+        "tier":     _OV_SCAN["tier"],
+        "industry": _OV_SCAN.get("industry", ""),
         "results": results,
+    }
+
+
+@app.get("/api/industries")
+def api_industries(tier: str = Query("")):
+    """Return industry categories with counts for a given tier (from _GRADING)."""
+    with _CLOCK:
+        stocks = list(_GRADING.values())
+    if tier:
+        stocks = [s for s in stocks if s.get("tier") == tier]
+    counts: dict[str, int] = {}
+    for s in stocks:
+        ind = s.get("industry", "") or ""
+        if ind:
+            counts[ind] = counts.get(ind, 0) + 1
+    result = sorted(counts.items(), key=lambda x: -x[1])
+    return {
+        "tier": tier,
+        "total": len(stocks),
+        "industries": [{"name": n, "count": c} for n, c in result],
     }
 
 
@@ -2136,6 +2178,9 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           <button class="gf-btn" id="ovt-small" onclick="ovSetTier('small')">🏪 小型<small   id="ovt-cnt-small" style="opacity:.6;margin-left:3px"></small></button>
           <button class="gf-btn" id="ovt-micro" onclick="ovSetTier('micro')">🏠 微型<small   id="ovt-cnt-micro" style="opacity:.6;margin-left:3px"></small></button>
         </div>
+        <!-- 產業類別篩選（規模選定後動態出現） -->
+        <div id="ov-industry-row" style="display:none;gap:4px;flex-wrap:wrap;margin-top:6px;align-items:center">
+        </div>
         <div id="ov-custom-area" style="display:none;margin-top:6px">
           <textarea id="ov-stocks" class="search"
             style="width:100%;height:52px;resize:vertical;font-family:monospace;font-size:11px;line-height:1.5"
@@ -2900,11 +2945,14 @@ function renderTimeline(tl, stock) {
 let _ovData         = null;
 let _ovPollTimer    = null;
 let _ovTier         = '';
+let _ovIndustry     = '';
 
 async function ovSetTier(tier) {
   _ovTier = tier;
+  _ovIndustry = '';
   document.querySelectorAll('[id^="ovt-"]').forEach(b => b.classList.remove('active'));
   document.getElementById('ovt-' + (tier || 'all'))?.classList.add('active');
+  document.getElementById('ov-industry-row').style.display = 'none';
 
   if (tier) {
     const countEl = document.getElementById('ov-stock-count');
@@ -2918,6 +2966,7 @@ async function ovSetTier(tier) {
         return;
       }
     } catch(e) {}
+    _ovLoadIndustries(tier);  // async, shows industry buttons after load
   }
   ovReload(true);
 }
@@ -2932,6 +2981,41 @@ async function _ovLoadTierCounts() {
       if (el) el.textContent = t.count;
     }
   } catch(e) {}
+}
+
+async function _ovLoadIndustries(tier) {
+  const row = document.getElementById('ov-industry-row');
+  row.style.display = 'none';
+  if (!tier) return;
+  try {
+    const r = await fetch(`/api/industries?tier=${tier}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    const inds = (d.industries || []);
+    if (!inds.length) return;
+    row.innerHTML = '<span style="font-size:11px;color:var(--mut);flex-shrink:0;margin-right:2px">產業：</span>'
+      + '<button class="gf-btn active" id="ovi-all" onclick="ovSetIndustry(\'\')">全部</button>'
+      + inds.map(({name, count}) => {
+          const safe = name.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+          return `<button class="gf-btn ovi-btn" data-ind="${name}"
+            onclick="ovSetIndustry('${safe}')">${name}<small style="opacity:.6;margin-left:3px">${count}</small></button>`;
+        }).join('');
+    row.style.display = 'flex';
+  } catch(e) {}
+}
+
+function ovSetIndustry(industry) {
+  _ovIndustry = industry;
+  const row = document.getElementById('ov-industry-row');
+  row.querySelectorAll('.gf-btn').forEach(b => b.classList.remove('active'));
+  if (!industry) {
+    document.getElementById('ovi-all')?.classList.add('active');
+  } else {
+    row.querySelectorAll('.ovi-btn').forEach(b => {
+      if (b.dataset.ind === industry) b.classList.add('active');
+    });
+  }
+  ovReload(true);
 }
 
 function ovToggleCustom() {
@@ -2954,7 +3038,7 @@ async function ovReload(force = true) {
   if (countEl) countEl.textContent = '啟動掃描…';
   document.getElementById('overview-grid').innerHTML =
     '<div class="empty" style="grid-column:1/-1;padding:30px">後台掃描中，每完成一批即更新…</div>';
-  const resp = await fetch(`/api/overview_scan/start?days=${days}&force=${force}&tier=${_ovTier}`, { method: 'POST' });
+  const resp = await fetch(`/api/overview_scan/start?days=${days}&force=${force}&tier=${_ovTier}&industry=${encodeURIComponent(_ovIndustry)}`, { method: 'POST' });
   const data = await resp.json();
   if (data.status === 'grading_not_ready') {
     const pct = data.ready && _ovTier ? `（已有 ${data.ready} 支，分級計算中）` : '';
