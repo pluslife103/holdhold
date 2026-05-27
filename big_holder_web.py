@@ -1322,6 +1322,8 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
                 else:
                     with _OV_SCAN_LOCK:
                         _OV_SCAN["done"] += 1
+                        _OV_SCAN["skip"] += 1
+                        _OV_SCAN["last_err"] = f"{stock_id}: FinMind API 次數限制 (402)"
             except Exception as exc:
                 import traceback
                 with _OV_SCAN_LOCK:
@@ -3387,15 +3389,19 @@ async function _ovPollTick() {
     const st = await r.json();
     const countEl = document.getElementById('ov-stock-count');
 
-    _ovData = { results: st.results, dates: [] };
+    _ovData = { results: st.results, dates: [], skip: st.skip || 0, last_err: st.last_err || '' };
     renderOverviewGrid();
 
     const pct  = st.total ? Math.round(st.done / st.total * 100) : 0;
     const skip = st.skip || 0;
+    const rateErr = skip > 0 && (st.last_err || '').includes('402');
+    const skipTxt = skip ? (rateErr ? ` ⚠ API限制跳過${skip}支` : ` 跳過${skip}`) : '';
     const info = st.running
-      ? `掃描中 ${st.done}/${st.total}（${pct}%）${skip ? ' 跳過'+skip : ''}`
-      : `共 ${st.results.length} 支・${st.started} 完成${skip ? ' 跳過'+skip : ''}`;
+      ? `掃描中 ${st.done}/${st.total}（${pct}%）${skipTxt}`
+      : `共 ${st.results.length} 支・${st.started} 完成${skipTxt}`;
     if (countEl) countEl.textContent = info;
+    if (skip > 0 && rateErr && countEl) countEl.title = `FinMind API 每日呼叫次數已達上限，請明天再試或升級方案。\n最後錯誤：${st.last_err}`;
+    else if (countEl) countEl.title = st.last_err || '';
     if (st.last_err) console.warn('[OV scan error]', st.last_err);
 
     if (!st.running) _ovStopPoll();
@@ -3477,7 +3483,18 @@ function renderOverviewGrid() {
     html += group.map(_ovCard).join('');
   }
 
-  document.getElementById('overview-grid').innerHTML = html || '<div class="empty" style="grid-column:1/-1">無大戶活動資料</div>';
+  if (!html) {
+    const skip = _ovData?.skip || 0;
+    const lastErr = _ovData?.last_err || '';
+    const isRate = lastErr.includes('402');
+    const msg = skip > 0 && isRate
+      ? `⚠ FinMind API 每日呼叫次數已達上限（${skip} 支無法取得），請明天再試`
+      : skip > 0
+        ? `無大戶活動資料（${skip} 支跳過：${lastErr}）`
+        : '無大戶活動資料';
+    html = `<div class="empty" style="grid-column:1/-1;padding:20px;line-height:1.7">${msg}</div>`;
+  }
+  document.getElementById('overview-grid').innerHTML = html;
 }
 
 function _ovSpark(timeline, w) {
