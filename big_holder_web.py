@@ -1213,15 +1213,22 @@ def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str
     THOLD = 8_000_000
     timeline = []
     for dt in sorted(dates):
-        rows = broker_data.get(dt, [])
+        rows  = broker_data.get(dt, [])
+        close = price_map.get(dt, {}).get("close", 0)
         bs = ss = rb = rs = 0
         for row in rows:
-            if row.get("is_retail"):
-                rb += row.get("buy",  0)
-                rs += row.get("sell", 0)
+            buy_lots  = row.get("buy",  0)
+            sell_lots = row.get("sell", 0)
+            # FinMind TaiwanStockTradingDailyReport has no price field;
+            # use closing price to estimate NTD amount for institutional classification.
+            buy_amt  = buy_lots  * 1000 * close if close > 0 else row.get("buy_amount",  0)
+            sell_amt = sell_lots * 1000 * close if close > 0 else row.get("sell_amount", 0)
+            if buy_amt > THOLD or sell_amt > THOLD:
+                bs += int(buy_amt  // THOLD)
+                ss += int(sell_amt // THOLD)
             else:
-                bs += int(row.get("buy_amount",  0) // THOLD)
-                ss += int(row.get("sell_amount", 0) // THOLD)
+                rb += buy_lots
+                rs += sell_lots
         pm = price_map.get(dt, {})
         timeline.append({"date": dt, "buy_score": bs, "sell_score": ss,
                          "net_score": bs - ss, "retail_buy": rb, "retail_sell": rs,
@@ -1545,15 +1552,20 @@ def api_multi_timeline(
     for stock_id in stock_list:
         timeline = []
         for dt in sorted(dates):
-            rows = raw[stock_id].get(dt, [])
+            rows  = raw[stock_id].get(dt, [])
+            close = price_raw[stock_id].get(dt, {}).get("close", 0)
             bs = ss = rb = rs = 0
             for row in rows:
-                if row.get("is_retail"):
-                    rb += row.get("buy",  0)
-                    rs += row.get("sell", 0)
+                buy_lots  = row.get("buy",  0)
+                sell_lots = row.get("sell", 0)
+                buy_amt  = buy_lots  * 1000 * close if close > 0 else row.get("buy_amount",  0)
+                sell_amt = sell_lots * 1000 * close if close > 0 else row.get("sell_amount", 0)
+                if buy_amt > THOLD or sell_amt > THOLD:
+                    bs += int(buy_amt  // THOLD)
+                    ss += int(sell_amt // THOLD)
                 else:
-                    bs += int(row.get("buy_amount",  0) // THOLD)
-                    ss += int(row.get("sell_amount", 0) // THOLD)
+                    rb += buy_lots
+                    rs += sell_lots
             pm = price_raw[stock_id].get(dt, {})
             timeline.append({
                 "date":        dt,
@@ -1714,27 +1726,7 @@ def api_big_player_timeline(
             date, rows = fut.result()
             day_map[date] = rows
 
-    # ── broker scores per day (主力 + 散戶) ───────────────────────────────
-    score_map: dict = {}
-    for date in day_map:
-        rows = day_map[date]
-        if not rows:
-            continue
-        bs = ss = rb = rs = 0
-        for row in rows:
-            if row.get("is_retail"):
-                rb += row.get("buy",  0)
-                rs += row.get("sell", 0)
-            else:
-                bs += int(row.get("buy_amount",  0) // THRESHOLD)
-                ss += int(row.get("sell_amount", 0) // THRESHOLD)
-        if bs or ss or rb or rs:
-            score_map[date] = {
-                "buy_score": bs, "sell_score": ss,
-                "retail_buy": rb, "retail_sell": rs,
-            }
-
-    # ── fetch price + volume for the whole range (one call, cached) ───────
+    # ── fetch price + volume first so we can use close for broker scoring ──
     pdf = _fm("TaiwanStockPrice", stock_id, start_d.isoformat(), end_d.isoformat())
     price_map: dict = {}
     if not pdf.empty:
@@ -1748,18 +1740,34 @@ def api_big_player_timeline(
                 "volume": round(float(pr.get("Trading_Volume", 0) or 0) / 1000),
             }
 
-    all_dates = sorted(set(price_map.keys()) | set(score_map.keys()))
+    # ── compute broker scores per day using close price ───────────────────
+    # FinMind TaiwanStockTradingDailyReport has no price field, so buy_amount
+    # in the cached rows is 0. Recalculate using closing price.
+    all_dates = sorted(set(price_map.keys()) | set(day_map.keys()))
     timeline = []
     for date in all_dates:
-        sc = score_map.get(date, {"buy_score": 0, "sell_score": 0, "retail_buy": 0, "retail_sell": 0})
-        pr = price_map.get(date, {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0})
+        rows  = day_map.get(date) or []
+        pr    = price_map.get(date, {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0})
+        close = pr["close"]
+        bs = ss = rb = rs = 0
+        for row in rows:
+            buy_lots  = row.get("buy",  0)
+            sell_lots = row.get("sell", 0)
+            buy_amt  = buy_lots  * 1000 * close if close > 0 else row.get("buy_amount",  0)
+            sell_amt = sell_lots * 1000 * close if close > 0 else row.get("sell_amount", 0)
+            if buy_amt > THRESHOLD or sell_amt > THRESHOLD:
+                bs += int(buy_amt  // THRESHOLD)
+                ss += int(sell_amt // THRESHOLD)
+            else:
+                rb += buy_lots
+                rs += sell_lots
         timeline.append({
             "date":        date,
-            "buy_score":   sc["buy_score"],
-            "sell_score":  sc["sell_score"],
-            "net_score":   sc["buy_score"] - sc["sell_score"],
-            "retail_buy":  sc["retail_buy"],
-            "retail_sell": sc["retail_sell"],
+            "buy_score":   bs,
+            "sell_score":  ss,
+            "net_score":   bs - ss,
+            "retail_buy":  rb,
+            "retail_sell": rs,
             "open":        pr["open"],
             "high":        pr["high"],
             "low":         pr["low"],
