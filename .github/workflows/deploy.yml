@@ -1,0 +1,22 @@
+name: Deploy Big Holder Web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'big_holder_web.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Railway
+        # 在 Railway dashboard 取得 RAILWAY_TOKEN 後設定在 GitHub Secrets
+        uses: bervProject/railway-deploy@main
+        with:
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          service: big-holder-web
