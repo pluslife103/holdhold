@@ -1196,13 +1196,68 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
 
 
 def _fetch_broker_range(token: str, stock_id: str, dates: list) -> dict:
-    """Fetch broker data for each date individually (free-tier compatible).
+    """Fetch broker data for the full date range in ONE API call, then split by date.
     Returns {date_str: [processed_rows]}."""
+    if not dates:
+        return {}
+    from collections import defaultdict
+
+    ckey = f"broker_range|{stock_id}|{dates[0]}|{dates[-1]}"
+    cached = _cget(ckey, ttl_h=12)
+    if cached is not None:
+        return cached
+
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                    "start_date": dates[0], "end_date": dates[-1], "token": token},
+            timeout=30,
+        )
+        j = r.json()
+    except Exception:
+        return {}
+
+    fm_status = j.get("status")
+    if r.status_code == 402 or fm_status == 402:
+        raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
+    if r.status_code != 200 or fm_status not in (200, None):
+        return {}
+
+    rows_raw = j.get("data", [])
+    if not rows_raw:
+        _cset(ckey, {})
+        return {}
+
+    date_set = set(dates)
+    by_date_raw: dict = defaultdict(list)
+    for row in rows_raw:
+        d = str(row.get("date", ""))[:10]
+        if d in date_set:
+            by_date_raw[d].append(row)
+
     by_date: dict = {}
-    for date_str in dates:
-        rows = _fetch_broker_day(token, stock_id, date_str)
-        if rows:
-            by_date[date_str] = rows
+    for d, day_rows in by_date_raw.items():
+        agg: dict = defaultdict(lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0})
+        for row in day_rows:
+            bid   = row.get("securities_trader_id", "")
+            buy_s = float(row.get("buy",  0) or 0)
+            sel_s = float(row.get("sell", 0) or 0)
+            agg[bid]["name"]   = row.get("securities_trader", "")
+            agg[bid]["buy_s"] += buy_s
+            agg[bid]["sell_s"]+= sel_s
+        processed = [
+            {"name": v["name"], "id": bid,
+             "buy":  round(v["buy_s"] / 1000),
+             "sell": round(v["sell_s"] / 1000),
+             "net":  round((v["buy_s"] - v["sell_s"]) / 1000),
+             "buy_amount": 0.0, "sell_amount": 0.0}
+            for bid, v in agg.items()
+        ]
+        if processed:
+            by_date[d] = processed
+
+    _cset(ckey, by_date)
     return by_date
 
 
@@ -1300,7 +1355,7 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int):
                 print(f"  [OV] {stock_id} error: {traceback.format_exc()[:300]}")
                 break
 
-        time.sleep(0.6)   # ~1.6 stocks/s ≈ 3.2 FinMind calls/s, well under 600/min
+        time.sleep(0.3)   # bulk broker call: 2 FinMind calls/stock ≈ 3 stocks/s
 
     with _OV_SCAN_LOCK:
         _OV_SCAN["running"] = False
