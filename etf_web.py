@@ -4,10 +4,11 @@
 """
 
 from __future__ import annotations
-import asyncio, json, time
+import asyncio, json, os, time
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator
 
+import requests
 import uvicorn
 import yfinance as yf
 import pandas as pd
@@ -19,6 +20,7 @@ _cache:           dict = {"df": None, "loaded_at": 0, "loading": False}
 _hist_cache:      dict[str, tuple[float, list]] = {}   # "{ticker}_{period}" -> (ts, data)
 _overtake_cache:  dict = {"ts": 0.0, "data": [], "days": 0}
 _overtake_v2_cache: dict[str, tuple[float, dict]] = {}  # "date_mode" -> (ts, result)
+_broker_cache:    dict[str, tuple[float, dict]] = {}   # "{stock_id}_{date}" -> (ts, result)
 _executor = ThreadPoolExecutor(max_workers=14)
 
 # period 代號 → yfinance period 字串
@@ -460,7 +462,408 @@ def api_status():
     return {"loaded": df is not None, "count": len(df) if df is not None else 0,
             "loading": _cache["loading"], "loaded_at": _cache["loaded_at"]}
 
+# ── 分點資料（FinMind TaiwanStockTradingDailyReport）─────────────────────────
+
+def _fetch_broker_data(stock_id: str, date: str) -> dict:
+    token = os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        return {"error": "未設定 FINMIND_TOKEN 環境變數", "rows": [], "summary": {}}
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockTradingDailyReport",
+        "stock_id": stock_id,
+        "start_date": date,
+        "end_date": date,
+        "token": token,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        j = r.json()
+        if j.get("status") != 200:
+            return {"error": j.get("msg", "FinMind API 錯誤"), "rows": [], "summary": {}}
+        rows_raw = j.get("data", [])
+        if not rows_raw:
+            return {"stock_id": stock_id, "date": date, "rows": [], "summary": {}}
+        RETAIL = 1_000_000  # 100萬 NTD
+        processed = []
+        for row in rows_raw:
+            buy       = float(row.get("buy", 0) or 0)
+            sell      = float(row.get("sell", 0) or 0)
+            buy_px    = float(row.get("buy_price", 0) or 0)
+            sell_px   = float(row.get("sell_price", 0) or 0)
+            buy_amt   = buy * 1000 * buy_px      # 張 × 1000股 × 均價
+            sell_amt  = sell * 1000 * sell_px
+            is_retail = buy_amt < RETAIL and sell_amt < RETAIL
+            processed.append({
+                "broker_id":   row.get("broker_id", ""),
+                "broker_name": row.get("broker_name", ""),
+                "buy":         int(buy),
+                "sell":        int(sell),
+                "net":         int(buy - sell),
+                "buy_price":   round(buy_px, 2),
+                "sell_price":  round(sell_px, 2),
+                "buy_amount":  round(buy_amt),
+                "sell_amount": round(sell_amt),
+                "is_retail":   is_retail,
+            })
+        processed.sort(key=lambda x: x["net"], reverse=True)
+        retail = [r for r in processed if r["is_retail"]]
+        inst   = [r for r in processed if not r["is_retail"]]
+        return {
+            "stock_id":   stock_id,
+            "stock_name": rows_raw[0].get("stock_name", stock_id),
+            "date":       date,
+            "rows":       processed,
+            "summary": {
+                "total":        len(processed),
+                "retail_count": len(retail),
+                "inst_count":   len(inst),
+                "retail_buy":   sum(r["buy"]  for r in retail),
+                "retail_sell":  sum(r["sell"] for r in retail),
+                "retail_net":   sum(r["net"]  for r in retail),
+                "inst_buy":     sum(r["buy"]  for r in inst),
+                "inst_sell":    sum(r["sell"] for r in inst),
+                "inst_net":     sum(r["net"]  for r in inst),
+            },
+        }
+    except Exception as e:
+        return {"error": str(e), "rows": [], "summary": {}}
+
+
+@app.get("/api/broker")
+async def api_broker(
+    stock_id: str = Query(""),
+    date:     str = Query(""),
+    force:    int = Query(0),
+):
+    from datetime import date as dt_date
+    stock_id = stock_id.strip().upper()
+    if not stock_id:
+        return JSONResponse({"error": "請輸入股票代號"}, status_code=400)
+    if not date:
+        date = dt_date.today().isoformat()
+    cache_key = f"{stock_id}_{date}"
+    now = time.time()
+    if not force and cache_key in _broker_cache:
+        ts, data = _broker_cache[cache_key]
+        if now - ts < 3600:
+            return JSONResponse(data)
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(_executor, _fetch_broker_data, stock_id, date)
+    _broker_cache[cache_key] = (now, data)
+    return JSONResponse(data)
+
 # ── 前端 HTML ─────────────────────────────────────────────────────────────────
+
+BROKER_HTML = r"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台股分點籌碼分析</title>
+<style>
+:root{--bg:#070b10;--surface:#0d1117;--card:#111927;--border:#1e2738;
+  --green:#10b981;--green-dim:#064e3b;--accent:#4f8ef7;--accent2:#7c5ff7;
+  --text:#eef2ff;--muted:#6b7280;--red:#ef4444;--yellow:#f7c948;
+  --retail:#4f8ef7;--inst:#f7c948;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;}
+
+/* header */
+header{background:#0a0f18;border-bottom:1px solid var(--border);
+  padding:9px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+.h-title{font-weight:700;font-size:.95rem;color:var(--green);white-space:nowrap;}
+.nav-links{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap;}
+.nav-link{padding:4px 12px;background:transparent;border:1px solid var(--border);
+  color:var(--muted);border-radius:6px;font-size:.78rem;cursor:pointer;
+  text-decoration:none;white-space:nowrap;transition:all .15s;}
+.nav-link:hover{border-color:var(--accent);color:var(--accent);}
+
+/* controls */
+.ctrl-bar{display:flex;align-items:center;gap:8px;padding:10px 20px;
+  background:var(--surface);border-bottom:1px solid var(--border);flex-wrap:wrap;}
+.stock-input{background:var(--card);border:1px solid var(--border);color:var(--text);
+  padding:5px 10px;border-radius:7px;font-size:.88rem;width:110px;outline:none;}
+.stock-input:focus{border-color:var(--accent);}
+.preset-btn{padding:4px 9px;background:var(--card);border:1px solid var(--border);
+  color:var(--muted);border-radius:6px;font-size:.76rem;cursor:pointer;transition:all .12s;}
+.preset-btn:hover{border-color:var(--accent);color:var(--accent);}
+.date-nav{display:flex;align-items:center;gap:5px;}
+.nav-btn{width:28px;height:28px;border:1px solid var(--border);background:var(--card);
+  color:var(--text);border-radius:6px;cursor:pointer;font-size:.9rem;}
+.nav-btn:hover{background:#1a2438;}
+.date-sel{background:var(--card);border:1px solid var(--border);color:var(--text);
+  padding:4px 9px;border-radius:7px;font-size:.8rem;cursor:pointer;}
+.query-btn{padding:5px 16px;background:var(--green);color:#fff;border:none;
+  border-radius:7px;font-weight:600;font-size:.82rem;cursor:pointer;white-space:nowrap;}
+.query-btn:hover{background:#059669;}
+.filter-tabs{display:flex;gap:2px;background:#131b28;border-radius:7px;padding:3px;}
+.filter-tab{padding:3px 11px;border-radius:5px;font-size:.78rem;font-weight:600;
+  cursor:pointer;color:var(--muted);border:none;background:transparent;transition:all .15s;}
+.filter-tab.on{background:var(--accent);color:#fff;}
+
+/* summary cards */
+.summary{display:flex;gap:10px;padding:12px 20px;flex-wrap:wrap;}
+.scard{flex:1;min-width:160px;background:var(--card);border-radius:10px;
+  padding:10px 14px;border:1px solid var(--border);}
+.scard-label{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}
+.scard-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;font-size:.82rem;}
+.scard-key{color:var(--muted);}
+.scard-val{font-weight:700;font-variant-numeric:tabular-nums;}
+.green{color:var(--green);}
+.red{color:var(--red);}
+.muted{color:var(--muted);}
+.retail-color{color:var(--retail);}
+.inst-color{color:var(--inst);}
+
+/* flow bar */
+.flow-bar-wrap{padding:2px 20px 14px;}
+.flow-label{display:flex;justify-content:space-between;font-size:.7rem;margin-bottom:3px;}
+.flow-bar{height:8px;border-radius:4px;overflow:hidden;background:var(--border);display:flex;}
+.flow-seg-inst{background:var(--yellow);height:100%;transition:width .4s;}
+.flow-seg-retail{background:var(--retail);height:100%;transition:width .4s;}
+
+/* table wrap */
+.table-wrap{overflow-x:auto;padding:0 20px 20px;}
+table{width:100%;border-collapse:collapse;font-size:.82rem;white-space:nowrap;}
+thead th{position:sticky;top:0;background:#0a0f18;padding:8px 10px;text-align:right;
+  font-weight:600;color:var(--muted);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.06em;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;}
+thead th:first-child,thead th:nth-child(2),thead th:nth-child(3){text-align:left;}
+thead th:hover{color:var(--text);}
+tbody tr{border-bottom:1px solid #111a2a;transition:background .1s;}
+tbody tr:hover{background:#111927;}
+td{padding:7px 10px;text-align:right;font-variant-numeric:tabular-nums;}
+td:first-child,td:nth-child(2),td:nth-child(3){text-align:left;}
+.rank{color:var(--muted);font-size:.75rem;width:36px;}
+.broker-name{font-weight:600;max-width:160px;overflow:hidden;text-overflow:ellipsis;}
+.type-badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:.68rem;font-weight:700;}
+.type-retail{background:#4f8ef722;color:var(--retail);border:1px solid #4f8ef744;}
+.type-inst{background:#f7c94822;color:var(--inst);border:1px solid #f7c94844;}
+.net-pos{color:var(--green);font-weight:700;}
+.net-neg{color:var(--red);font-weight:700;}
+.amt{font-size:.75rem;color:var(--muted);}
+
+/* states */
+.wrap{max-width:1400px;margin:0 auto;}
+.empty{text-align:center;padding:50px;color:var(--muted);}
+.loading-dot{display:inline-block;animation:blink 1s infinite;}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.err-msg{color:#f87171;background:#2d1010;border:1px solid #5a1a1a;
+  border-radius:8px;padding:12px 16px;margin:12px 20px;font-size:.85rem;}
+</style>
+</head>
+<body>
+<header>
+  <span class="h-title">🏦 台股分點籌碼分析</span>
+  <span style="font-size:.75rem;color:var(--muted)">散戶 = 單筆金額 &lt; 100萬 NTD</span>
+  <div class="nav-links">
+    <a class="nav-link" href="/">ETF 篩選器</a>
+    <a class="nav-link" href="/overtake">超越事件</a>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="ctrl-bar">
+    <input class="stock-input" id="stockInput" placeholder="股票代號" value="0050">
+    <button class="preset-btn" onclick="setStock('0050')">0050</button>
+    <button class="preset-btn" onclick="setStock('2330')">2330</button>
+    <button class="preset-btn" onclick="setStock('006208')">006208</button>
+    <button class="preset-btn" onclick="setStock('00878')">00878</button>
+    <div class="date-nav">
+      <button class="nav-btn" onclick="prevDate()">←</button>
+      <select class="date-sel" id="dateSel" onchange="onDateSel()"></select>
+      <button class="nav-btn" onclick="nextDate()">→</button>
+    </div>
+    <button class="query-btn" onclick="load()">查詢</button>
+    <div class="filter-tabs">
+      <button class="filter-tab on" data-f="all"    onclick="setFilter('all')">全部</button>
+      <button class="filter-tab"    data-f="inst"   onclick="setFilter('inst')">主力</button>
+      <button class="filter-tab"    data-f="retail" onclick="setFilter('retail')">散戶</button>
+    </div>
+  </div>
+
+  <div id="summaryWrap"></div>
+  <div id="content"><div class="empty">請輸入股票代號並按查詢</div></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let _data = null;
+let _filter = 'all';
+let _sortCol = 'net';
+let _sortAsc = false;
+let _date = todayStr();
+
+const PRESETS = ['0050','2330','2454','006208','00878','2317','2412','1301'];
+
+function todayStr(){ return new Date().toISOString().slice(0,10); }
+function addDays(d,n){ const dt=new Date(d); dt.setDate(dt.getDate()+n); return dt.toISOString().slice(0,10); }
+
+function buildDateSel(){
+  const sel=$('dateSel'), today=todayStr();
+  const opts=[];
+  for(let i=0;i<=60;i++){
+    const d=addDays(today,-i);
+    opts.push(`<option value="${d}"${d===_date?' selected':''}>${i===0?d+' (今日)':d}</option>`);
+  }
+  sel.innerHTML=opts.join('');
+}
+
+function onDateSel(){ _date=$('dateSel').value; load(); }
+function prevDate(){ _date=addDays(_date,-1); buildDateSel(); load(); }
+function nextDate(){
+  const next=addDays(_date,1);
+  if(next>todayStr()) return;
+  _date=next; buildDateSel(); load();
+}
+function setStock(s){ $('stockInput').value=s; load(); }
+function setFilter(f){
+  _filter=f;
+  document.querySelectorAll('.filter-tab').forEach(b=>b.classList.toggle('on',b.dataset.f===f));
+  if(_data) renderTable(_data.rows||[]);
+}
+
+function fmtVol(v){ if(!v) return '—'; return v.toLocaleString()+'張'; }
+function fmtAmt(v){ if(!v) return '—'; return (v/1e4).toFixed(0)+'萬'; }
+function fmtNet(v){
+  if(!v) return '<span class="muted">0</span>';
+  return v>0 ? `<span class="net-pos">+${v.toLocaleString()}</span>`
+             : `<span class="net-neg">${v.toLocaleString()}</span>`;
+}
+
+async function load(){
+  const stock=$('stockInput').value.trim().toUpperCase();
+  if(!stock){ $('content').innerHTML='<div class="empty">請輸入股票代號</div>'; return; }
+  $('summaryWrap').innerHTML='';
+  $('content').innerHTML='<div class="empty"><span class="loading-dot">抓取分點資料…</span></div>';
+  try{
+    const res=await fetch(`/api/broker?stock_id=${encodeURIComponent(stock)}&date=${_date}`);
+    const d=await res.json();
+    if(d.error){ $('content').innerHTML=`<div class="err-msg">${d.error}</div>`; return; }
+    if(!d.rows||!d.rows.length){
+      $('summaryWrap').innerHTML='';
+      $('content').innerHTML=`<div class="empty">${_date} 無分點資料（非交易日或無資料）</div>`;
+      return;
+    }
+    _data=d;
+    renderSummary(d.summary, d.stock_name||stock, d.date||_date);
+    renderTable(d.rows);
+  }catch(e){
+    $('content').innerHTML=`<div class="err-msg">載入失敗：${e.message}</div>`;
+  }
+}
+
+function renderSummary(s, name, date){
+  if(!s||!s.total){ $('summaryWrap').innerHTML=''; return; }
+  const instNet   = s.inst_net   || 0;
+  const retailNet = s.retail_net || 0;
+  const totalVol  = (s.inst_buy+s.inst_sell+s.retail_buy+s.retail_sell)||1;
+  const instVol   = s.inst_buy+s.inst_sell;
+  const retailVol = s.retail_buy+s.retail_sell;
+  const instPct   = Math.round(instVol/totalVol*100);
+  const retailPct = 100-instPct;
+
+  $('summaryWrap').innerHTML=`
+    <div class="summary">
+      <div class="scard" style="border-color:#f7c94844">
+        <div class="scard-label" style="color:var(--inst-color)">🏦 主力 (${s.inst_count} 分點)</div>
+        <div class="scard-row"><span class="scard-key">買進</span><span class="scard-val green">${(s.inst_buy||0).toLocaleString()}張</span></div>
+        <div class="scard-row"><span class="scard-key">賣出</span><span class="scard-val red">${(s.inst_sell||0).toLocaleString()}張</span></div>
+        <div class="scard-row"><span class="scard-key">淨買超</span><span class="scard-val ${instNet>=0?'green':'red'}">${instNet>=0?'+':''}${instNet.toLocaleString()}張</span></div>
+      </div>
+      <div class="scard" style="border-color:#4f8ef744">
+        <div class="scard-label" style="color:var(--retail)">👥 散戶 (${s.retail_count} 分點)</div>
+        <div class="scard-row"><span class="scard-key">買進</span><span class="scard-val green">${(s.retail_buy||0).toLocaleString()}張</span></div>
+        <div class="scard-row"><span class="scard-key">賣出</span><span class="scard-val red">${(s.retail_sell||0).toLocaleString()}張</span></div>
+        <div class="scard-row"><span class="scard-key">淨買超</span><span class="scard-val ${retailNet>=0?'green':'red'}">${retailNet>=0?'+':''}${retailNet.toLocaleString()}張</span></div>
+      </div>
+      <div class="scard">
+        <div class="scard-label">📊 ${name} · ${date} · ${s.total} 分點</div>
+        <div class="scard-row"><span class="scard-key">主力佔比</span><span class="scard-val inst-color">${instPct}%</span></div>
+        <div class="scard-row"><span class="scard-key">散戶佔比</span><span class="scard-val retail-color">${retailPct}%</span></div>
+        <div class="scard-row"><span class="scard-key">合計成交</span><span class="scard-val">${((s.inst_buy+s.inst_sell+s.retail_buy+s.retail_sell)/2||0).toLocaleString()}張</span></div>
+      </div>
+    </div>
+    <div class="flow-bar-wrap">
+      <div class="flow-label">
+        <span style="color:var(--inst)">主力 ${instPct}%</span>
+        <span style="color:var(--retail)">散戶 ${retailPct}%</span>
+      </div>
+      <div class="flow-bar">
+        <div class="flow-seg-inst" style="width:${instPct}%"></div>
+        <div class="flow-seg-retail" style="width:${retailPct}%"></div>
+      </div>
+    </div>`;
+}
+
+function sortRows(rows){
+  const col=_sortCol;
+  return [...rows].sort((a,b)=>{
+    const av=a[col]??0, bv=b[col]??0;
+    return _sortAsc ? av-bv : bv-av;
+  });
+}
+
+function renderTable(rows){
+  const filtered = rows.filter(r=>{
+    if(_filter==='inst')   return !r.is_retail;
+    if(_filter==='retail') return r.is_retail;
+    return true;
+  });
+  const sorted=sortRows(filtered);
+  if(!sorted.length){
+    $('content').innerHTML='<div class="empty">此分類下無資料</div>';
+    return;
+  }
+  const si = col => col===_sortCol ? (_sortAsc?'↑':'↓') : '↕';
+  const th = (col,label,extra='') =>
+    `<th onclick="sortBy('${col}')" ${extra}>${label} <span style="opacity:.4">${si(col)}</span></th>`;
+
+  const rows_html=sorted.map((r,i)=>`
+    <tr>
+      <td class="rank">${i+1}</td>
+      <td class="broker-name" title="${r.broker_name}">${r.broker_name||r.broker_id}</td>
+      <td><span class="type-badge ${r.is_retail?'type-retail':'type-inst'}">${r.is_retail?'散戶':'主力'}</span></td>
+      <td class="green">${r.buy?r.buy.toLocaleString():'—'}</td>
+      <td class="red">${r.sell?r.sell.toLocaleString():'—'}</td>
+      <td>${fmtNet(r.net)}</td>
+      <td class="muted">${r.buy_price||'—'}</td>
+      <td class="muted">${r.sell_price||'—'}</td>
+      <td class="amt">${fmtAmt(r.buy_amount)}</td>
+      <td class="amt">${fmtAmt(r.sell_amount)}</td>
+    </tr>`).join('');
+
+  $('content').innerHTML=`
+    <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th style="text-align:left">#</th>
+        <th style="text-align:left">分點名稱</th>
+        <th style="text-align:left">類型</th>
+        ${th('buy','買進(張)')}
+        ${th('sell','賣出(張)')}
+        ${th('net','淨買超(張)')}
+        ${th('buy_price','買均價')}
+        ${th('sell_price','賣均價')}
+        ${th('buy_amount','買進金額')}
+        ${th('sell_amount','賣出金額')}
+      </tr></thead>
+      <tbody>${rows_html}</tbody>
+    </table></div>`;
+}
+
+function sortBy(col){
+  if(_sortCol===col) _sortAsc=!_sortAsc; else { _sortCol=col; _sortAsc=false; }
+  if(_data) renderTable(_data.rows||[]);
+}
+
+// init
+buildDateSel();
+</script>
+</body>
+</html>"""
 
 OVERTAKE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-TW">
@@ -572,6 +975,7 @@ header{background:#0a0f18;border-bottom:1px solid var(--border);
     <button class="nav-btn" onclick="nextDate()">→</button>
     <button class="today-btn" onclick="gotoToday()">今日</button>
     <button class="refresh-btn" onclick="refresh()">⟳ 重新整理</button>
+    <button class="back-btn" onclick="location.href='/broker'">🏦 分點</button>
     <button class="back-btn" onclick="location.href='/'">← 篩選器</button>
   </div>
 </header>
@@ -830,18 +1234,30 @@ HTML = r"""<!DOCTYPE html>
   --text:#e2e5f0; --muted:#666c85; --green:#3dd68c; --red:#f55;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
-body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;height:100vh;overflow:hidden;}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;height:100vh;overflow:hidden;display:flex;flex-direction:column;}
 
 /* ── header ── */
 header{background:linear-gradient(135deg,#1a1d27,#12141e);border-bottom:1px solid var(--border);
-  padding:14px 24px;display:flex;align-items:center;gap:14px;height:54px;}
+  padding:14px 24px;display:flex;align-items:center;gap:14px;height:54px;flex-shrink:0;}
 header h1{font-size:1.15rem;font-weight:700;}
 header span{font-size:.78rem;color:var(--muted);}
 .status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--muted);margin-right:5px;vertical-align:middle;}
 .status-dot.ok{background:var(--green);}
 
+/* ── tier legend bar ── */
+.tier-bar{background:#0c0f1a;border-bottom:1px solid var(--border);padding:5px 24px;
+  display:flex;align-items:center;gap:5px;flex-shrink:0;flex-wrap:wrap;}
+.tl-lbl{font-size:.68rem;color:var(--muted);margin-right:3px;white-space:nowrap;}
+.tl-badge{font-size:.69rem;padding:2px 8px;border-radius:10px;font-weight:600;white-space:nowrap;}
+.tl-S{color:#f7c948;background:#f7c94818;border:1px solid #f7c94845;}
+.tl-A{color:#4f8ef7;background:#4f8ef718;border:1px solid #4f8ef745;}
+.tl-B{color:#3dd68c;background:#3dd68c18;border:1px solid #3dd68c45;}
+.tl-C{color:#ff9f43;background:#ff9f4318;border:1px solid #ff9f4345;}
+.tl-D{color:#8892a4;background:#8892a418;border:1px solid #8892a445;}
+.tl-sep{color:var(--border);font-size:.75rem;user-select:none;}
+
 /* ── layout ── */
-.layout{display:flex;height:calc(100vh - 54px);}
+.layout{display:flex;flex:1;min-height:0;}
 
 /* ── sidebar ── */
 aside{width:268px;min-width:220px;background:var(--surface);border-right:1px solid var(--border);
@@ -1068,6 +1484,11 @@ td{padding:8px 10px;}
     <span>依 AUM 篩選美國掛牌 ETF・點擊 + 比較 60 天規模曲線</span>
   </div>
   <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+    <a href="/broker" style="display:inline-flex;align-items:center;gap:5px;padding:5px 12px;
+      background:#4f8ef718;border:1px solid #4f8ef750;border-radius:7px;color:#4f8ef7;
+      font-size:.78rem;font-weight:700;text-decoration:none;" title="台股分點籌碼分析">
+      🏦 分點籌碼
+    </a>
     <a href="/overtake" style="display:inline-flex;align-items:center;gap:5px;padding:5px 12px;
       background:#10b98118;border:1px solid #10b98150;border-radius:7px;color:#10b981;
       font-size:.78rem;font-weight:700;text-decoration:none;" title="超越事件追蹤">
@@ -1077,6 +1498,19 @@ td{padding:8px 10px;}
     <span id="statusText" style="font-size:.78rem;color:var(--muted)">未載入</span>
   </div>
 </header>
+
+<div class="tier-bar">
+  <span class="tl-lbl">規模分級：</span>
+  <span class="tl-badge tl-S">S 超大型 ≥$100B</span>
+  <span class="tl-sep">·</span>
+  <span class="tl-badge tl-A">A 大型 $10B–$100B</span>
+  <span class="tl-sep">·</span>
+  <span class="tl-badge tl-B">B 中型 $1B–$10B</span>
+  <span class="tl-sep">·</span>
+  <span class="tl-badge tl-C">C 小型 $100M–$1B</span>
+  <span class="tl-sep">·</span>
+  <span class="tl-badge tl-D">D 微型 &lt;$100M</span>
+</div>
 
 <div class="layout">
 <!-- ── sidebar ── -->
@@ -2088,6 +2522,10 @@ async def index():
 @app.get("/overtake", response_class=HTMLResponse)
 async def overtake_page():
     return OVERTAKE_HTML
+
+@app.get("/broker", response_class=HTMLResponse)
+async def broker_page():
+    return BROKER_HTML
 
 if __name__ == "__main__":
     import os
