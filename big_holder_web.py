@@ -1225,6 +1225,7 @@ def _fetch_broker_range(token: str, stock_id: str, dates: list) -> dict:
         return {}
 
     rows_raw = j.get("data", [])
+    print(f"[broker_range] {stock_id} {dates[0]}~{dates[-1]}: status={fm_status} rows={len(rows_raw)}")
     if not rows_raw:
         _cset(ckey, {})
         return {}
@@ -1311,7 +1312,7 @@ def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str
     }
 
 
-def _ov_scan_worker(token: str, stock_ids: list, days: int):
+def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False):
     from datetime import date as dt_date, timedelta as td
     end_d   = dt_date.today()
     start_d = end_d - td(days=round(days * 1.5))
@@ -1322,15 +1323,17 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int):
             dates.append(d.isoformat())
         d += td(days=1)
     start, end = start_d.isoformat(), end_d.isoformat()
+    print(f"[OV] scan {len(stock_ids)} stocks, dates {dates[0]}~{dates[-1]} ({len(dates)} days), force={force}")
 
     for stock_id in stock_ids:
         ckey = f"ov_item|{stock_id}|{days}"
-        cached = _cget(ckey, ttl_h=6)
-        if cached is not None:
-            with _OV_SCAN_LOCK:
-                _OV_SCAN["results"][stock_id] = cached
-                _OV_SCAN["done"] += 1
-            continue
+        if not force:
+            cached = _cget(ckey, ttl_h=6)
+            if cached is not None:
+                with _OV_SCAN_LOCK:
+                    _OV_SCAN["results"][stock_id] = cached
+                    _OV_SCAN["done"] += 1
+                continue
 
         for attempt in range(3):
             try:
@@ -1402,7 +1405,7 @@ def api_ov_scan_start(
         _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
                          "error": "", "days": days, "skip": 0, "last_err": "",
                          "started": datetime.now().strftime("%H:%M")})
-    threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days),
+    threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, days, force),
                      daemon=True).start()
     return {"status": "started", "total": len(stock_ids), "tier": tier, "industry": industry}
 
@@ -1484,10 +1487,10 @@ def api_debug():
     except Exception as exc:
         twse_api_result = {"error": str(exc)}
 
-    # Test TaiwanStockTradingDailyReport (single day)
+    # Test TaiwanStockTradingDailyReport (single day = today)
     broker_result = {}
     try:
-        from datetime import date as dt_date
+        from datetime import date as dt_date, timedelta as td
         today = dt_date.today().isoformat()
         r2 = requests.get(FINMIND_BASE,
                           params={"dataset": "TaiwanStockTradingDailyReport",
@@ -1499,6 +1502,28 @@ def api_debug():
                          "msg": j2.get("msg", ""), "sample": rows2[:2]}
     except Exception as exc:
         broker_result = {"error": str(exc)}
+
+    # Test TaiwanStockTradingDailyReport (range = last 5 trading days)
+    broker_range_result = {}
+    try:
+        end_d   = dt_date.today()
+        start_d = end_d - td(days=10)
+        r3 = requests.get(FINMIND_BASE,
+                          params={"dataset": "TaiwanStockTradingDailyReport",
+                                  "data_id": "2330",
+                                  "start_date": start_d.isoformat(),
+                                  "end_date":   end_d.isoformat(),
+                                  "token": token},
+                          timeout=20)
+        j3 = r3.json()
+        rows3 = j3.get("data", [])
+        dates_in_resp = sorted(set(str(r.get("date",""))[:10] for r in rows3)) if rows3 else []
+        broker_range_result = {"status": j3.get("status"), "row_count": len(rows3),
+                               "msg": j3.get("msg", ""),
+                               "dates_covered": dates_in_resp,
+                               "sample": rows3[:2]}
+    except Exception as exc:
+        broker_range_result = {"error": str(exc)}
 
     with _OV_SCAN_LOCK:
         scan_snap = {k: v for k, v in _OV_SCAN.items() if k != "results"}
@@ -1512,6 +1537,7 @@ def api_debug():
         "test_stock_info": stock_info_result,
         "test_twse_api":   twse_api_result,
         "test_broker_1day": broker_result,
+        "test_broker_range": broker_range_result,
     }
 
 
