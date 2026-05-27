@@ -1149,7 +1149,7 @@ _OV_SCAN_LOCK = threading.Lock()
 
 
 def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
-    """Fetch + aggregate broker data for ONE trading day (free-tier FinMind compatible).
+    """Fetch + aggregate broker data for ONE trading day.
     Returns list of processed broker rows; result cached 12h per day."""
     from collections import defaultdict
     ckey = f"broker_day|{stock_id}|{date_str}"
@@ -1159,19 +1159,24 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
     try:
         r = requests.get(
             FINMIND_BASE,
+            # Use start_date=end_date to pin to exactly one day (same as 分點籌碼 tab)
             params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
-                    "start_date": date_str, "token": token},
+                    "start_date": date_str, "end_date": date_str, "token": token},
             timeout=20,
         )
         j = r.json()
-    except Exception:
+    except Exception as exc:
+        print(f"  [broker_day] {stock_id} {date_str}: exception {exc}")
         return []
     fm_status = j.get("status")
+    rows_all = j.get("data", [])
+    print(f"  [broker_day] {stock_id} {date_str}: http={r.status_code} fm={fm_status} rows={len(rows_all)}")
     if r.status_code == 402 or fm_status == 402:
         raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
     if r.status_code != 200 or fm_status not in (200, None):
+        print(f"  [broker_day] {stock_id} {date_str}: error msg={j.get('msg','')}")
         return []
-    rows_raw = [rw for rw in j.get("data", []) if str(rw.get("date", ""))[:10] == date_str]
+    rows_raw = rows_all  # end_date=date_str guarantees all rows are for this date
     if not rows_raw:
         _cset(ckey, [])
         return []
@@ -1205,8 +1210,7 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
 
 
 def _fetch_broker_range(token: str, stock_id: str, dates: list) -> dict:
-    """Fetch broker data one day at a time (FinMind TaiwanStockTradingDailyReport
-    does not support end_date; returns only one day per call).
+    """Fetch broker data one day at a time using start_date=end_date per call.
     Returns {date_str: [processed_rows]}."""
     if not dates:
         return {}
