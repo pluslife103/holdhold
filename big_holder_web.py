@@ -29,7 +29,9 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ── 設定 ──────────────────────────────────────────────────────────────────
-FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
+_FM_HOST        = os.getenv("FINMIND_PROXY_HOST", "https://api.finmindtrade.com")
+FINMIND_BASE    = f"{_FM_HOST}/api/v4/data"
+FINMIND_BROKER_URL = f"{_FM_HOST}/api/v4/taiwan_stock_trading_daily_report"
 BIG_BRACKET  = "more than 1,000,001"
 TOKEN_PATH   = Path(__file__).parent / "finmind_chip_screener" / ".env"
 CACHE_TTL_H  = 12
@@ -982,7 +984,7 @@ def api_broker_trader(
         raise HTTPException(500, "未設定 FINMIND_TOKEN")
     try:
         r = requests.get(
-            "https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report",
+            FINMIND_BROKER_URL,
             headers={"Authorization": f"Bearer {token}"},
             params={
                 "securities_trader_id": trader_id,
