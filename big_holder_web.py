@@ -2455,13 +2455,13 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             style="font-size:11px;padding:3px 10px" id="ov-custom-btn">自訂股票</button>
         </div>
         <!-- 規模篩選 -->
-        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
+        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;align-items:center">
           <button class="gf-btn active" id="ovt-all"   onclick="ovSetTier('')">全部</button>
-          <button class="gf-btn" id="ovt-mega"  onclick="ovSetTier('mega')" >🏢 超大型<small id="ovt-cnt-mega"  style="opacity:.6;margin-left:3px"></small></button>
-          <button class="gf-btn" id="ovt-large" onclick="ovSetTier('large')">🏗 大型<small   id="ovt-cnt-large" style="opacity:.6;margin-left:3px"></small></button>
-          <button class="gf-btn" id="ovt-mid"   onclick="ovSetTier('mid')"  >🏬 中型<small   id="ovt-cnt-mid"   style="opacity:.6;margin-left:3px"></small></button>
-          <button class="gf-btn" id="ovt-small" onclick="ovSetTier('small')">🏪 小型<small   id="ovt-cnt-small" style="opacity:.6;margin-left:3px"></small></button>
-          <button class="gf-btn" id="ovt-micro" onclick="ovSetTier('micro')">🏠 微型<small   id="ovt-cnt-micro" style="opacity:.6;margin-left:3px"></small></button>
+          <button class="gf-btn" id="ovt-mega"  onclick="ovSetTier('mega')" >🏢 超大型<small id="ovt-cnt-mega"  style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">≥1兆</span></button>
+          <button class="gf-btn" id="ovt-large" onclick="ovSetTier('large')">🏗 大型<small   id="ovt-cnt-large" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">1000–10000億</span></button>
+          <button class="gf-btn" id="ovt-mid"   onclick="ovSetTier('mid')"  >🏬 中型<small   id="ovt-cnt-mid"   style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">100–1000億</span></button>
+          <button class="gf-btn" id="ovt-small" onclick="ovSetTier('small')">🏪 小型<small   id="ovt-cnt-small" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">20–100億</span></button>
+          <button class="gf-btn" id="ovt-micro" onclick="ovSetTier('micro')">🏠 微型<small   id="ovt-cnt-micro" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">&lt;20億</span></button>
         </div>
         <!-- 產業類別篩選（規模選定後動態出現） -->
         <div id="ov-industry-row" style="display:none;gap:4px;flex-wrap:wrap;margin-top:6px;align-items:center">
