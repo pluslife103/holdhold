@@ -583,12 +583,100 @@ def _process_compare(sids: list[str], years: int) -> dict:
     return {"stocks": result}
 
 
+def _fill_mcap_from_twse() -> None:
+    """Fallback: populate _STOCK_MCAP from TWSE (已發行股數×收盤價) + TPEX (市值(億元))."""
+    import re as _re
+    global _STOCK_MCAP
+    mcap: dict[str, float] = {}
+
+    # TPEX OTC: 市值(億元) is returned directly
+    try:
+        r = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=20,
+        )
+        for item in r.json():
+            sid = str(item.get("SecuritiesCompanyCode", "")).strip()
+            if not _re.match(r"^\d{4}$", sid):
+                continue
+            cap_raw = str(item.get("市值(億元)", "")).replace(",", "")
+            try:
+                cap = float(cap_raw)
+                if cap > 0:
+                    mcap[sid] = cap
+            except Exception:
+                pass
+        print(f"  TPEX 市值：{len(mcap)} 支")
+    except Exception as e:
+        print(f"  TPEX 市值失敗：{e}")
+
+    # TWSE listed: issued_shares × close_price / 1e8
+    try:
+        # Step 1: issued shares from t187ap03_L
+        r1 = requests.get(
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=20,
+        )
+        shares: dict[str, float] = {}
+        for item in r1.json():
+            sid = str(item.get("公司代號", "")).strip()
+            if not _re.match(r"^\d{4}$", sid):
+                continue
+            raw = str(
+                item.get("已發行普通股數或TDR原股發行股數") or
+                item.get("已發行普通股數") or ""
+            ).replace(",", "")
+            try:
+                s = float(raw)
+                if s > 0:
+                    shares[sid] = s
+            except Exception:
+                pass
+        print(f"  TWSE 已發行股數：{len(shares)} 支")
+
+        # Step 2: closing prices from STOCK_DAY_ALL
+        r2 = requests.get(
+            "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL",
+            params={"response": "json"}, timeout=20,
+        )
+        body = r2.json()
+        fields = body.get("fields", [])
+        code_idx  = next((i for i, f in enumerate(fields) if "代號" in f), 0)
+        price_idx = next((i for i, f in enumerate(fields) if "收盤價" in f), -1)
+        cnt = 0
+        if price_idx >= 0:
+            for row in body.get("data", []):
+                sid = str(row[code_idx]).strip()
+                if sid not in shares:
+                    continue
+                try:
+                    price = float(str(row[price_idx]).replace(",", ""))
+                    if price > 0:
+                        mcap[sid] = round(shares[sid] * price / 1e8, 1)
+                        cnt += 1
+                except Exception:
+                    pass
+        print(f"  TWSE 市值計算：{cnt} 支")
+    except Exception as e:
+        print(f"  TWSE 市值失敗：{e}")
+
+    if mcap:
+        with _CLOCK:
+            _STOCK_MCAP.update(mcap)
+        print(f"  市值資料合計：{len(_STOCK_MCAP)} 支")
+    else:
+        print("  ⚠ TWSE/TPEX 市值補充均失敗")
+
+
 def _init_tier_grading() -> None:
     """從 _STOCK_MCAP 預先將所有股票分層，填入 _GRADING 讓 tier 按鈕立即可用。
     grade 欄位標記為 '?' placeholder，等 _run_grading() 完成後再覆蓋。"""
     global _GRADING
     if not _STOCK_MCAP:
-        print("  ⚠ _STOCK_MCAP 空，跳過快速分層")
+        print("  _STOCK_MCAP 空，嘗試從 TWSE/TPEX 補充市值…")
+        _fill_mcap_from_twse()
+    if not _STOCK_MCAP:
+        print("  ⚠ _STOCK_MCAP 仍空，跳過快速分層")
         return
     pre: dict[str, dict] = {}
     for s in _STOCKS:
