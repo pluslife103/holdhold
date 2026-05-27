@@ -3504,16 +3504,19 @@ function _ovSpark(timeline, w) {
     });
   }
 
+  const hasI = timeline.some(d => (d.buy_score || 0) + (d.sell_score || 0) > 0);
   return `<svg width="${w}" height="${h}" style="display:block;border-radius:3px">
     <rect width="${w}" height="${h}" fill="#161b22"/>
-    <line x1="0" y1="${iY0 - 1}" x2="${w}" y2="${iY0 - 1}" stroke="#21262d" stroke-width="1"/>
+    <rect x="0" y="${iY0}" width="${w}" height="${iH}" fill="${hasI ? 'rgba(248,81,73,0.03)' : 'rgba(255,255,255,0.01)'}"/>
+    <rect x="0" y="${rY0}" width="${w}" height="${rH}" fill="${hasR ? 'rgba(63,185,80,0.03)' : 'rgba(255,255,255,0.01)'}"/>
+    <line x1="0" y1="${iY0}" x2="${w}" y2="${iY0}" stroke="#30363d" stroke-width="1"/>
     <line x1="0" y1="${iMid}" x2="${w}" y2="${iMid}" stroke="#30363d" stroke-width="0.5"/>
-    <line x1="0" y1="${rY0 - 1}" x2="${w}" y2="${rY0 - 1}" stroke="#21262d" stroke-width="1"/>
+    <line x1="0" y1="${rY0}" x2="${w}" y2="${rY0}" stroke="#30363d" stroke-width="1"/>
     <line x1="0" y1="${rMid}" x2="${w}" y2="${rMid}" stroke="#30363d" stroke-width="0.5"/>
     ${s}
-    <text x="2" y="${pH - 2}" font-size="7" fill="#444c56">量</text>
-    <text x="2" y="${iY0 + 9}" font-size="7" fill="#444c56">主力</text>
-    <text x="2" y="${rY0 + 9}" font-size="7" fill="#444c56">散戶</text>
+    <text x="2" y="${pH - 2}" font-size="7" fill="#6e7681">量</text>
+    <text x="2" y="${iY0 + 9}" font-size="7" fill="${hasI ? '#f85149' : '#6e7681'}">主力</text>
+    <text x="2" y="${rY0 + 9}" font-size="7" fill="${hasR ? '#3fb950' : '#6e7681'}">散戶</text>
   </svg>`;
 }
 
