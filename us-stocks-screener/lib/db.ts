@@ -11,7 +11,7 @@ export function getClient(): Client {
   if (_client) return _client;
 
   const url =
-    process.env.TURSO_DATABASE_URL ??
+    process.env.TURSO_DATABASE_URL ||
     `file:${path.join(process.cwd(), "data", "history.db")}`;
 
   _client = createClient({

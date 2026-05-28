@@ -21,35 +21,9 @@ jobs:
       - name: Install Python dependencies
         run: pip install "yfinance>=1.3.0" requests pandas
 
-      - name: Fetch stock data → history.db
+      - name: Fetch stock data → Turso
         working-directory: us-stocks-screener
-        run: python backfill.py
-
-      - name: Verify DB has today's data
-        working-directory: us-stocks-screener
-        run: |
-          python - <<'EOF'
-          import sqlite3, sys
-          from datetime import date
-          conn = sqlite3.connect("data/history.db")
-          dates = [r[0] for r in conn.execute("SELECT DISTINCT date FROM snapshots ORDER BY date DESC LIMIT 5").fetchall()]
-          count = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-          conn.close()
-          print(f"Total rows: {count:,}")
-          print(f"Latest 5 dates: {dates}")
-          today = str(date.today())
-          if not dates:
-              print("ERROR: DB is empty!", file=sys.stderr); sys.exit(1)
-          EOF
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Deploy to Vercel
-        working-directory: us-stocks-screener
-        run: npx vercel deploy --prod --token ${{ secrets.VERCEL_TOKEN }} --yes
         env:
-          VERCEL_ORG_ID: team_CvHKBdrRcWNPvRlwdU5FeKw1
-          VERCEL_PROJECT_ID: prj_dfftdyMBEeZIDRgLSbLALTVcPTdO
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python backfill.py
