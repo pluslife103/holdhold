@@ -723,10 +723,56 @@ def _init_tier_grading() -> None:
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────
+def _prefetch_industry_chain() -> None:
+    """Pre-warm industry chain cache before _run_grading consumes the API quota."""
+    ckey = "industry_chain"
+    if _cget(ckey, ttl_h=24) is not None:
+        return
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    try:
+        r = requests.get(FINMIND_BASE,
+            params={"dataset": "TaiwanStockIndustryChain", "token": token},
+            timeout=30)
+        j = r.json()
+        if j.get("status") not in (200, None):
+            print(f"  ⚠ 産業鏈 prefetch: {j.get('msg')}")
+            return
+        rows_raw = j.get("data") or []
+        if not rows_raw:
+            return
+        from collections import defaultdict
+        tree: dict = defaultdict(lambda: defaultdict(list))
+        seen: set = set()
+        nm = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
+        for row in rows_raw:
+            sid = str(row.get("stock_id", ""))
+            ind = str(row.get("industry", ""))
+            sub = str(row.get("sub_industry", ""))
+            key = (sid, ind, sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            cap = _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
+            tree[ind][sub].append({"id": sid, "name": nm.get(sid, ""), "cap": round(cap, 0) if cap else None})
+        industry_counts = {i: sum(len(v) for v in s.values()) for i, s in tree.items()}
+        industry_list = sorted(tree.keys(), key=lambda x: -industry_counts[x])
+        result = {
+            "total": len(rows_raw),
+            "industries": {i: dict(s) for i, s in tree.items()},
+            "industry_list": industry_list,
+            "industry_counts": industry_counts,
+        }
+        _cset(ckey, result)
+        print(f"  産業鏈 prefetch OK: {len(industry_list)} 產業, {len(rows_raw)} 條目")
+    except Exception as e:
+        print(f"  ⚠ 産業鏈 prefetch error: {e}")
+
+
 def _startup_tasks():
     """Run sequentially in a background thread: load stocks then start grading."""
     _load_stocks()
     _init_tier_grading()   # 立即從市值預分層，讓 tier 按鈕可用
+    _prefetch_industry_chain()  # 預熱 cache，避免 grading 耗盡 quota 後使用者遇到 rate limit
     _run_grading()         # 背景逐支抓詳細資料（更新 grade / sparkline）
 
 
@@ -1648,7 +1694,7 @@ def api_kline_data(stock_id: str = Query("2330"), days: int = Query(90)):
 def api_industry_chain():
     """Taiwan stock industry chain (TaiwanStockIndustryChain) via FinMind REST API."""
     ckey = "industry_chain"
-    cached = _cget(ckey, ttl_h=12)
+    cached = _cget(ckey, ttl_h=24)
     if cached is not None:
         return cached
 
@@ -1715,7 +1761,7 @@ def _fmt_cap_py(cap: float | None) -> str:
 def api_treemap():
     """Return Plotly treemap data: industry→sub_industry→stock, sized by mcap, colored by % change."""
     ckey = "treemap"
-    cached = _cget(ckey, ttl_h=1)
+    cached = _cget(ckey, ttl_h=2)
     if cached is not None:
         return cached
 
@@ -1752,7 +1798,7 @@ def api_treemap():
             continue
 
     # ── Industry chain (reuse cache or fetch inline) ──────────────────────
-    chain = _cget("industry_chain", ttl_h=12)
+    chain = _cget("industry_chain", ttl_h=24)
     if chain is None:
         try:
             r2 = requests.get(FINMIND_BASE, params={
