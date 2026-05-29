@@ -1574,6 +1574,76 @@ def api_debug_broker(stock_id: str = Query("2330"), days: int = Query(5)):
     }
 
 
+@app.get("/api/kline_data")
+def api_kline_data(stock_id: str = Query("2330"), days: int = Query(90)):
+    """Return OHLCV + 三大法人 + 融資融券 for K-line chart."""
+    end_dt  = datetime.now()
+    start_dt = end_dt - timedelta(days=days + 30)
+    start   = start_dt.strftime("%Y-%m-%d")
+    end     = end_dt.strftime("%Y-%m-%d")
+    cutoff  = (end_dt - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # ── OHLCV ────────────────────────────────────────────────────────────
+    price_df = _fm("TaiwanStockPrice", stock_id, start, end)
+    prices: list = []
+    if not price_df.empty:
+        for _, row in price_df.iterrows():
+            d = str(row.get("date", ""))[:10]
+            if d < cutoff:
+                continue
+            o = float(row.get("open",  0) or 0)
+            h = float(row.get("max",   0) or 0)   # FinMind field name
+            l = float(row.get("min",   0) or 0)
+            c = float(row.get("close", 0) or 0)
+            v = int(row.get("Trading_Volume", 0) or 0)
+            if o > 0 and c > 0:
+                prices.append({"date": d, "open": o, "high": h, "low": l, "close": c,
+                                "volume": round(v / 1000)})
+
+    # ── 三大法人 ──────────────────────────────────────────────────────────
+    inst_df = _fm("TaiwanStockInstitutionalInvestors", stock_id, start, end)
+    inst_map: dict = {}
+    if not inst_df.empty:
+        for _, row in inst_df.iterrows():
+            d = str(row.get("date", ""))[:10]
+            if d < cutoff:
+                continue
+            name = str(row.get("name", ""))
+            net  = int(row.get("net_buy", 0) or 0)
+            if d not in inst_map:
+                inst_map[d] = {"foreign": 0, "trust": 0, "dealer": 0}
+            if "外資" in name:
+                inst_map[d]["foreign"] = net
+            elif "投信" in name:
+                inst_map[d]["trust"]   = net
+            elif "自營" in name:
+                inst_map[d]["dealer"]  = net
+    institutional = [{"date": d, **v} for d, v in sorted(inst_map.items())]
+
+    # ── 融資融券 ──────────────────────────────────────────────────────────
+    margin_df = _fm("TaiwanStockMarginPurchaseShortSale", stock_id, start, end)
+    margins: list = []
+    if not margin_df.empty:
+        for _, row in margin_df.iterrows():
+            d = str(row.get("date", ""))[:10]
+            if d < cutoff:
+                continue
+            margins.append({
+                "date":           d,
+                "margin_balance": int(row.get("MarginPurchaseTodayBalance", 0) or 0),
+                "short_balance":  int(row.get("ShortSaleTodayBalance",     0) or 0),
+            })
+
+    name_info  = next((s for s in _STOCKS if s["stock_id"] == stock_id), {})
+    return {
+        "stock_id":       stock_id,
+        "stock_name":     name_info.get("stock_name", ""),
+        "prices":         prices,
+        "institutional":  institutional,
+        "margins":        margins,
+    }
+
+
 @app.post("/api/reload_stocks")
 def api_reload_stocks():
     """強制重新載入股票清單並重新計算分級。"""
@@ -1907,6 +1977,7 @@ _HTML = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>千張大戶分析</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root{
   --bg:#0d1117;--sur:#161b22;--sur2:#21262d;--bor:#30363d;
@@ -2217,6 +2288,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('grade')">分級排行</div>
       <div class="tab" onclick="switchTab('broker')">🏦 分點籌碼</div>
       <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
+      <div class="tab" onclick="switchTab('kline')">📈 K線分析</div>
     </div>
 
     <!-- 個股 pane -->
@@ -2497,6 +2569,61 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
+    <!-- K線分析 pane -->
+    <div class="pane" id="pane-kline">
+      <div style="padding:10px 14px;display:flex;flex-direction:column;gap:8px;height:100%;overflow-y:auto">
+        <!-- Controls -->
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0">
+          <input id="kline-input" class="search" style="width:110px;font-size:13px" placeholder="代號 e.g. 2330"
+            onkeydown="if(event.key==='Enter')klineLoad()"
+            oninput="klineAutocomplete(this.value)" autocomplete="off"/>
+          <div id="kline-ac" style="display:none;position:absolute;top:42px;left:14px;z-index:200;background:var(--sur2);border:1px solid var(--bor);border-radius:6px;min-width:160px;max-height:180px;overflow-y:auto;box-shadow:0 4px 16px #0006"></div>
+          <span id="kline-name" style="font-size:12px;color:var(--mut);min-width:60px"></span>
+          <div style="display:flex;gap:4px;margin-left:auto;flex-wrap:wrap">
+            <button class="sort-btn kl-range active" id="klr-90"  onclick="klineSetRange(90)">3M</button>
+            <button class="sort-btn kl-range"        id="klr-180" onclick="klineSetRange(180)">6M</button>
+            <button class="sort-btn kl-range"        id="klr-365" onclick="klineSetRange(365)">1Y</button>
+            <button class="sort-btn kl-range"        id="klr-730" onclick="klineSetRange(730)">2Y</button>
+          </div>
+          <button class="sort-btn" style="background:var(--acc);color:#000;font-weight:700" onclick="klineLoad()">查詢</button>
+        </div>
+        <!-- Status -->
+        <div id="kline-status" style="font-size:11px;color:var(--mut);flex-shrink:0"></div>
+        <!-- Candlestick + Volume chart -->
+        <div style="flex-shrink:0">
+          <div style="font-size:11px;color:var(--mut);margin-bottom:4px;font-weight:600">K線 &amp; 成交量</div>
+          <div id="kline-chart-wrap" style="height:320px;border-radius:6px;overflow:hidden;background:#0d1117;position:relative">
+            <div id="kline-chart" style="width:100%;height:100%"></div>
+          </div>
+        </div>
+        <!-- Institutional investors chart -->
+        <div style="flex-shrink:0">
+          <div style="font-size:11px;color:var(--mut);margin-bottom:4px;font-weight:600">三大法人 淨買超（張）
+            <span style="margin-left:8px">
+              <span style="color:#3b82f6">■</span><span style="font-size:10px">外資</span>
+              <span style="margin-left:6px;color:#a855f7">■</span><span style="font-size:10px">投信</span>
+              <span style="margin-left:6px;color:#f59e0b">■</span><span style="font-size:10px">自營</span>
+            </span>
+          </div>
+          <div id="kline-inst-wrap" style="height:120px;border-radius:6px;overflow:hidden;background:#0d1117">
+            <div id="kline-inst" style="width:100%;height:100%"></div>
+          </div>
+        </div>
+        <!-- Margin chart -->
+        <div style="flex-shrink:0;margin-bottom:12px">
+          <div style="font-size:11px;color:var(--mut);margin-bottom:4px;font-weight:600">融資融券 餘額（張）
+            <span style="margin-left:8px">
+              <span style="color:#f87171">■</span><span style="font-size:10px">融資</span>
+              <span style="margin-left:6px;color:#34d399">■</span><span style="font-size:10px">融券</span>
+            </span>
+          </div>
+          <div id="kline-margin-wrap" style="height:100px;border-radius:6px;overflow:hidden;background:#0d1117">
+            <div id="kline-margin" style="width:100%;height:100%"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -2541,6 +2668,12 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
     </svg>
     <span>總覽</span>
+  </button>
+  <button class="bnav-btn" id="bnav-kline" onclick="switchTab('kline')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M9 3v4M9 10v11M15 3v11M15 17v4M6 7h6M12 14h6"/>
+    </svg>
+    <span>K線</span>
   </button>
 </nav>
 
@@ -2990,7 +3123,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview'];
+  const tabNames = ['single','compare','grade','broker','overview','kline'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -4125,6 +4258,202 @@ async function refreshGrading() {
     gradePolling = setInterval(pollGradingProgress, 3000);
   }
 }
+
+// ── K線分析 ─────────────────────────────────────────────────────────────
+let _klRange  = 90;
+let _klChart  = null;  // main chart
+let _klInstC  = null;  // institutional chart
+let _klMargC  = null;  // margin chart
+
+function klineSetRange(days) {
+  _klRange = days;
+  document.querySelectorAll('.kl-range').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById(`klr-${days}`);
+  if (btn) btn.classList.add('active');
+}
+
+function klineAutocomplete(q) {
+  const ac = document.getElementById('kline-ac');
+  if (!q || q.length < 1) { ac.style.display = 'none'; return; }
+  const hits = allStocks.filter(s =>
+    s.stock_id.startsWith(q) ||
+    (s.stock_name || '').includes(q)
+  ).slice(0, 8);
+  if (!hits.length) { ac.style.display = 'none'; return; }
+  ac.innerHTML = hits.map(s =>
+    `<div onclick="klinePickStock('${s.stock_id}','${s.stock_name||''}')"
+       style="padding:7px 12px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--bor)"
+       onmouseover="this.style.background='var(--sur)'" onmouseout="this.style.background=''">
+      <b>${s.stock_id}</b> ${s.stock_name||''}
+    </div>`
+  ).join('');
+  ac.style.display = 'block';
+}
+
+function klinePickStock(id, name) {
+  document.getElementById('kline-input').value = id;
+  document.getElementById('kline-name').textContent = name;
+  document.getElementById('kline-ac').style.display = 'none';
+  klineLoad();
+}
+
+const _klChartOpts = {
+  layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
+  grid:   { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  rightPriceScale: { borderColor: '#30363d' },
+  timeScale: { borderColor: '#30363d', timeVisible: false },
+  handleScroll: true, handleScale: true,
+};
+
+function _klDestroyAll() {
+  if (_klChart)  { try { _klChart.remove();  } catch(e){} _klChart  = null; }
+  if (_klInstC)  { try { _klInstC.remove();  } catch(e){} _klInstC  = null; }
+  if (_klMargC)  { try { _klMargC.remove();  } catch(e){} _klMargC  = null; }
+}
+
+function _klCreateChart(containerId, height) {
+  const el = document.getElementById(containerId);
+  if (!el) return null;
+  el.innerHTML = '';
+  return LightweightCharts.createChart(el, {
+    ..._klChartOpts,
+    width:  el.clientWidth,
+    height: height,
+  });
+}
+
+async function klineLoad() {
+  const stockId = (document.getElementById('kline-input').value || '').trim();
+  if (!stockId) { showToast('請輸入股票代號'); return; }
+  document.getElementById('kline-ac').style.display = 'none';
+  document.getElementById('kline-status').textContent = '載入中…';
+  _klDestroyAll();
+
+  let data;
+  try {
+    const r = await fetch(`/api/kline_data?stock_id=${encodeURIComponent(stockId)}&days=${_klRange}`);
+    data = await r.json();
+  } catch(e) {
+    document.getElementById('kline-status').textContent = '載入失敗：' + e;
+    return;
+  }
+  if (data.error) {
+    document.getElementById('kline-status').textContent = data.error;
+    return;
+  }
+
+  const name = data.stock_name || '';
+  document.getElementById('kline-name').textContent = name;
+  document.getElementById('kline-status').textContent =
+    `${data.stock_id} ${name} · ${data.prices.length} 交易日`;
+
+  _klRenderMain(data.prices);
+  _klRenderInst(data.institutional);
+  _klRenderMargin(data.margins);
+
+  // Sync time scales across all charts
+  _klSyncScales();
+}
+
+function _klRenderMain(prices) {
+  if (!prices.length) return;
+  const wrap = document.getElementById('kline-chart-wrap');
+  _klChart = _klCreateChart('kline-chart', wrap.clientHeight || 320);
+
+  // Candlestick series
+  const candle = _klChart.addCandlestickSeries({
+    upColor:        '#f85149', downColor:        '#3fb950',
+    borderUpColor:  '#f85149', borderDownColor:  '#3fb950',
+    wickUpColor:    '#f85149', wickDownColor:    '#3fb950',
+  });
+  candle.setData(prices.map(p => ({
+    time: p.date, open: p.open, high: p.high, low: p.low, close: p.close,
+  })));
+
+  // Volume histogram (secondary scale)
+  const vol = _klChart.addHistogramSeries({
+    color: '#3b82f680',
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'vol',
+    scaleMargins: { top: 0.82, bottom: 0 },
+  });
+  vol.setData(prices.map(p => ({
+    time: p.date, value: p.volume,
+    color: p.close >= p.open ? '#f8514940' : '#3fb95040',
+  })));
+
+  _klChart.timeScale().fitContent();
+}
+
+function _klRenderInst(inst) {
+  if (!inst.length) return;
+  const wrap = document.getElementById('kline-inst-wrap');
+  _klInstC = _klCreateChart('kline-inst', wrap.clientHeight || 120);
+
+  const addInstSeries = (field, color) => {
+    const s = _klInstC.addHistogramSeries({
+      color, priceScaleId: 'right', base: 0,
+    });
+    s.setData(inst.map(d => ({
+      time: d.date, value: d[field] || 0,
+      color: (d[field] || 0) >= 0 ? color : color.replace(/[^,]+\)/, '0.4)').replace('rgb','rgba'),
+    })));
+    return s;
+  };
+
+  // Stack: foreign (blue), trust (purple), dealer (amber)
+  _klInstC.addHistogramSeries({ color: '#3b82f6', priceScaleId: 'right', base: 0 })
+    .setData(inst.map(d => ({ time: d.date, value: d.foreign||0, color: (d.foreign||0)>=0?'#3b82f6':'#3b82f680' })));
+  _klInstC.addHistogramSeries({ color: '#a855f7', priceScaleId: 'right', base: 0 })
+    .setData(inst.map(d => ({ time: d.date, value: d.trust||0,   color: (d.trust||0)>=0?'#a855f7':'#a855f780'   })));
+  _klInstC.addHistogramSeries({ color: '#f59e0b', priceScaleId: 'right', base: 0 })
+    .setData(inst.map(d => ({ time: d.date, value: d.dealer||0,  color: (d.dealer||0)>=0?'#f59e0b':'#f59e0b80'  })));
+
+  _klInstC.timeScale().fitContent();
+}
+
+function _klRenderMargin(margins) {
+  if (!margins.length) return;
+  const wrap = document.getElementById('kline-margin-wrap');
+  _klMargC = _klCreateChart('kline-margin', wrap.clientHeight || 100);
+
+  const mSeries = _klMargC.addLineSeries({ color: '#f87171', lineWidth: 1.5, priceScaleId: 'right' });
+  mSeries.setData(margins.map(m => ({ time: m.date, value: m.margin_balance })));
+
+  const sSeries = _klMargC.addLineSeries({ color: '#34d399', lineWidth: 1.5, priceScaleId: 'left' });
+  sSeries.setData(margins.map(m => ({ time: m.date, value: m.short_balance })));
+
+  _klMargC.timeScale().fitContent();
+}
+
+function _klSyncScales() {
+  // Sync scroll/zoom of sub-charts to main chart
+  if (!_klChart) return;
+  const sub = [_klInstC, _klMargC].filter(Boolean);
+  _klChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (!range) return;
+    sub.forEach(c => c.timeScale().setVisibleLogicalRange(range));
+  });
+  sub.forEach(c => c.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (!range || !_klChart) return;
+    _klChart.timeScale().setVisibleLogicalRange(range);
+  }));
+}
+
+// Resize all K線 charts when window resizes
+window.addEventListener('resize', () => {
+  const charts = [
+    ['kline-chart',  _klChart],
+    ['kline-inst',   _klInstC],
+    ['kline-margin', _klMargC],
+  ];
+  charts.forEach(([id, c]) => {
+    if (!c) return;
+    const el = document.getElementById(id);
+    if (el) c.resize(el.clientWidth, el.clientHeight);
+  });
+});
 </script>
 </body>
 </html>
