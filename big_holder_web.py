@@ -1666,7 +1666,7 @@ def api_industry_chain():
     if r.status_code != 200 or j.get("status") not in (200, None):
         raise HTTPException(status_code=502, detail=j.get("msg", "FinMind error"))
 
-    rows_raw = j.get("data", [])
+    rows_raw = j.get("data") or []
     name_map = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
 
     from collections import defaultdict
@@ -1722,16 +1722,22 @@ def api_treemap():
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
 
     # ── Latest daily price (walk back up to 7 days for weekends/holidays) ──
+    # Budget 20 seconds total to avoid exceeding Railway's HTTP gateway timeout
+    import time as _time
     price_map: dict = {}
     trade_date = ""
+    _t0 = _time.monotonic()
     for delta in range(7):
+        _remaining = 20.0 - (_time.monotonic() - _t0)
+        if _remaining < 2:
+            break
         dt = (datetime.now() - timedelta(days=delta)).strftime("%Y-%m-%d")
         try:
             r = requests.get(FINMIND_BASE, params={
                 "dataset": "TaiwanStockPrice",
                 "start_date": dt, "end_date": dt, "token": token,
-            }, timeout=35)
-            rows = r.json().get("data", [])
+            }, timeout=min(_remaining - 1, 12))
+            rows = r.json().get("data") or []
             if rows:
                 trade_date = dt
                 for row in rows:
@@ -1752,7 +1758,12 @@ def api_treemap():
             r2 = requests.get(FINMIND_BASE, params={
                 "dataset": "TaiwanStockIndustryChain", "token": token,
             }, timeout=30)
-            raw2 = r2.json().get("data", [])
+            j2 = r2.json()
+            if r2.status_code != 200 or j2.get("status") not in (200, None):
+                raise HTTPException(status_code=502, detail=j2.get("msg", "FinMind chain error"))
+            raw2 = j2.get("data") or []
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
         from collections import defaultdict
@@ -4892,18 +4903,24 @@ function chainSetView(v) {
 
 async function chainLoadTreemap() {
   const msg = document.getElementById('chain-treemap-msg');
-  msg.textContent = '載入板塊圖資料…（首次約 3–5 秒）';
+  msg.textContent = '載入板塊圖資料…（首次約 5–15 秒）';
   msg.style.display = 'flex';
   try {
     const r = await fetch('/api/treemap');
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      let errText = await r.text();
+      try { errText = JSON.parse(errText).detail || errText; } catch(_) {}
+      throw new Error(`HTTP ${r.status}: ${errText}`);
+    }
     const data = await r.json();
     msg.style.display = 'none';
     chainRenderTreemap(data);
     _treemapLoaded = true;
+    const noPrice = !data.trade_date;
     document.getElementById('chain-status').textContent =
-      `資料日期：${data.trade_date}`;
+      noPrice ? '板塊圖（無漲跌色，價格資料未取得）' : `資料日期：${data.trade_date}`;
   } catch(e) {
+    msg.style.display = 'flex';
     msg.textContent = '板塊圖載入失敗：' + e.message;
   }
 }
