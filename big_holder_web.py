@@ -1687,7 +1687,7 @@ def api_industry_chain():
     industries = {ind: dict(subs) for ind, subs in tree.items()}
 
     result = {
-        "total": int(len(df)),
+        "total": len(rows_raw),
         "industries": industries,
         "industry_list": industry_list,
         "industry_counts": industry_counts,
