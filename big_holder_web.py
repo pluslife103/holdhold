@@ -1701,6 +1701,140 @@ def api_industry_chain():
     return result
 
 
+def _fmt_cap_py(cap: float | None) -> str:
+    if not cap or cap <= 0:
+        return "—"
+    if cap >= 10000:
+        return f"{cap/10000:.1f}兆"
+    if cap >= 1000:
+        return f"{cap/100:.0f}百億" if cap < 2000 else f"{cap/1000:.1f}千億"
+    return f"{cap:.0f}億"
+
+
+@app.get("/api/treemap")
+def api_treemap():
+    """Return Plotly treemap data: industry→sub_industry→stock, sized by mcap, colored by % change."""
+    ckey = "treemap"
+    cached = _cget(ckey, ttl_h=1)
+    if cached is not None:
+        return cached
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+
+    # ── Latest daily price (walk back up to 7 days for weekends/holidays) ──
+    price_map: dict = {}
+    trade_date = ""
+    for delta in range(7):
+        dt = (datetime.now() - timedelta(days=delta)).strftime("%Y-%m-%d")
+        try:
+            r = requests.get(FINMIND_BASE, params={
+                "dataset": "TaiwanStockPrice",
+                "start_date": dt, "end_date": dt, "token": token,
+            }, timeout=35)
+            rows = r.json().get("data", [])
+            if rows:
+                trade_date = dt
+                for row in rows:
+                    sid = str(row.get("stock_id", ""))
+                    close  = float(row.get("close",  0) or 0)
+                    spread = float(row.get("spread", 0) or 0)
+                    prev   = close - spread
+                    pct    = round(spread / prev * 100, 2) if prev != 0 and close > 0 else 0
+                    price_map[sid] = {"close": close, "pct": pct}
+                break
+        except Exception:
+            continue
+
+    # ── Industry chain (reuse cache or fetch inline) ──────────────────────
+    chain = _cget("industry_chain", ttl_h=12)
+    if chain is None:
+        try:
+            r2 = requests.get(FINMIND_BASE, params={
+                "dataset": "TaiwanStockIndustryChain", "token": token,
+            }, timeout=30)
+            raw2 = r2.json().get("data", [])
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        from collections import defaultdict
+        tree2: dict = defaultdict(lambda: defaultdict(list))
+        seen2: set = set()
+        nm = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
+        for row in raw2:
+            sid = str(row.get("stock_id", ""))
+            ind = str(row.get("industry", ""))
+            sub = str(row.get("sub_industry", ""))
+            key = (sid, ind, sub)
+            if key in seen2:
+                continue
+            seen2.add(key)
+            cap = _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
+            tree2[ind][sub].append({"id": sid, "name": nm.get(sid, ""), "cap": round(cap, 0) if cap else None})
+        icounts = {i: sum(len(v) for v in s.values()) for i, s in tree2.items()}
+        ilist   = sorted(tree2.keys(), key=lambda x: -icounts[x])
+        chain = {
+            "total": len(raw2), "industries": {i: dict(s) for i, s in tree2.items()},
+            "industry_list": ilist, "industry_counts": icounts,
+        }
+        _cset("industry_chain", chain)
+
+    # ── Build Plotly treemap arrays ───────────────────────────────────────
+    ids: list = []; labels: list = []; parents: list = []
+    values: list = []; colors: list = []; texts: list = []
+
+    ids.append("root"); labels.append("台灣股市"); parents.append("")
+    values.append(0);   colors.append(0);          texts.append(f"資料日期：{trade_date}")
+
+    industries = chain["industries"]
+
+    for ind in chain["industry_list"]:
+        subs = industries.get(ind, {})
+        ind_id = f"I|{ind}"
+        ind_cap = 0.0; ind_wpct = 0.0
+
+        for sub, stocks in subs.items():
+            sub_id = f"S|{ind}|{sub}"
+            sub_cap = 0.0; sub_wpct = 0.0
+
+            for s in stocks:
+                sid  = s["id"]
+                cap  = float(s.get("cap") or 0)
+                p    = price_map.get(sid, {})
+                pct  = p.get("pct", 0)
+                cls  = p.get("close", 0)
+                sign = "+" if pct > 0 else ""
+                stk_id = f"K|{sid}|{ind}|{sub}"
+                ids.append(stk_id)
+                labels.append(f"{sid}" + (f"<br>{s['name']}" if s.get("name") else ""))
+                parents.append(sub_id)
+                values.append(max(cap, 0.1))
+                colors.append(pct)
+                texts.append(f"{sid} {s.get('name','')}<br>收盤:{cls}<br>{sign}{pct:.2f}%<br>市值:{_fmt_cap_py(cap)}")
+                sub_cap += cap
+                sub_wpct += pct * cap
+
+            sub_avg = sub_wpct / sub_cap if sub_cap > 0 else 0
+            ids.append(sub_id); labels.append(sub); parents.append(ind_id)
+            values.append(max(sub_cap, 0.1))
+            colors.append(round(sub_avg, 2))
+            texts.append(f"{sub}<br>市值:{_fmt_cap_py(sub_cap)}<br>漲跌:{sub_avg:+.2f}%")
+            ind_cap  += sub_cap
+            ind_wpct += sub_avg * sub_cap
+
+        ind_avg = ind_wpct / ind_cap if ind_cap > 0 else 0
+        ids.append(ind_id); labels.append(ind); parents.append("root")
+        values.append(max(ind_cap, 0.1))
+        colors.append(round(ind_avg, 2))
+        texts.append(f"{ind}<br>市值:{_fmt_cap_py(ind_cap)}<br>漲跌:{ind_avg:+.2f}%")
+
+    result = {
+        "ids": ids, "labels": labels, "parents": parents,
+        "values": values, "colors": colors, "texts": texts,
+        "trade_date": trade_date,
+    }
+    _cset(ckey, result)
+    return result
+
+
 @app.post("/api/reload_stocks")
 def api_reload_stocks():
     """強制重新載入股票清單並重新計算分級。"""
@@ -2698,17 +2832,27 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             autocomplete="off"/>
           <span id="chain-stock-name" style="font-size:12px;color:var(--mut);min-width:50px"></span>
           <button class="sort-btn" onclick="chainClearStock()">清除</button>
+          <!-- View toggle -->
+          <div style="display:flex;gap:4px;margin-left:8px">
+            <button class="sort-btn active" id="chain-view-list" onclick="chainSetView('list')">📋 清單</button>
+            <button class="sort-btn" id="chain-view-map"  onclick="chainSetView('map')">📊 板塊圖</button>
+          </div>
           <span id="chain-status" style="font-size:11px;color:var(--mut);margin-left:auto"></span>
           <div id="chain-ac" style="display:none;position:absolute;top:34px;left:0;z-index:200;background:var(--sur2);border:1px solid var(--bor);border-radius:6px;min-width:160px;max-height:180px;overflow-y:auto;box-shadow:0 4px 16px #0006"></div>
         </div>
         <!-- Stock chain result -->
-        <div id="chain-stock-result" style="display:none;flex-shrink:0;overflow-y:auto;max-height:220px;padding:4px 0"></div>
-        <!-- Industry browser (two-column) -->
+        <div id="chain-stock-result" style="display:none;flex-shrink:0;overflow-y:auto;max-height:200px;padding:4px 0"></div>
+        <!-- Industry browser (two-column) — LIST view -->
         <div id="chain-browser" style="display:flex;gap:0;flex:1;min-height:0;overflow:hidden;border:1px solid var(--bor);border-radius:8px">
           <div id="chain-ind-list" style="width:130px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--bor);padding:4px"></div>
           <div id="chain-sub-panel" style="flex:1;overflow-y:auto;padding:8px 10px">
             <div style="color:var(--mut);font-size:12px;padding:20px;text-align:center">← 選擇左側產業</div>
           </div>
+        </div>
+        <!-- Treemap — MAP view -->
+        <div id="chain-treemap-wrap" style="display:none;flex:1;min-height:0;border:1px solid var(--bor);border-radius:8px;overflow:hidden;position:relative">
+          <div id="chain-treemap" style="width:100%;height:100%"></div>
+          <div id="chain-treemap-msg" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--mut)">載入中…</div>
         </div>
       </div>
     </div>
@@ -4731,6 +4875,94 @@ function chainGoStock(id) {
   } else {
     showToast('找不到 ' + id);
   }
+}
+
+// ── 產業鏈：板塊圖 view ───────────────────────────────────────────────
+let _chainView = 'list';
+let _treemapLoaded = false;
+
+function chainSetView(v) {
+  _chainView = v;
+  document.getElementById('chain-view-list').classList.toggle('active', v === 'list');
+  document.getElementById('chain-view-map').classList.toggle('active', v === 'map');
+  document.getElementById('chain-browser').style.display     = v === 'list' ? 'flex'  : 'none';
+  document.getElementById('chain-treemap-wrap').style.display = v === 'map'  ? 'block' : 'none';
+  if (v === 'map' && !_treemapLoaded) chainLoadTreemap();
+}
+
+async function chainLoadTreemap() {
+  const msg = document.getElementById('chain-treemap-msg');
+  msg.textContent = '載入板塊圖資料…（首次約 3–5 秒）';
+  msg.style.display = 'flex';
+  try {
+    const r = await fetch('/api/treemap');
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    msg.style.display = 'none';
+    chainRenderTreemap(data);
+    _treemapLoaded = true;
+    document.getElementById('chain-status').textContent =
+      `資料日期：${data.trade_date}`;
+  } catch(e) {
+    msg.textContent = '板塊圖載入失敗：' + e.message;
+  }
+}
+
+function chainRenderTreemap(data) {
+  const el = document.getElementById('chain-treemap');
+  const colorscale = [
+    [0.00, '#7f0000'], [0.20, '#c62828'], [0.35, '#ef5350'],
+    [0.45, '#ef9a9a'], [0.50, '#37474f'],
+    [0.55, '#a5d6a7'], [0.65, '#43a047'], [0.80, '#1b5e20'], [1.00, '#003300'],
+  ];
+  const trace = {
+    type: 'treemap',
+    branchvalues: 'total',
+    ids:     data.ids,
+    labels:  data.labels,
+    parents: data.parents,
+    values:  data.values,
+    text:    data.texts,
+    hovertemplate: '%{text}<extra></extra>',
+    textinfo: 'label',
+    marker: {
+      colors:     data.colors,
+      colorscale: colorscale,
+      cmin: -5, cmax: 5,
+      showscale: true,
+      colorbar: {
+        title: { text: '漲跌%', side: 'right' },
+        thickness: 12, len: 0.6,
+        tickvals: [-5, -3, -1, 0, 1, 3, 5],
+        ticktext: ['-5%', '-3%', '-1%', '0', '+1%', '+3%', '+5%'],
+        tickfont: { size: 9, color: '#8b949e' },
+        titlefont: { size: 10, color: '#8b949e' },
+        bgcolor: 'transparent', bordercolor: '#30363d',
+      },
+    },
+    pathbar: { visible: true, side: 'top', thickness: 22 },
+    tiling: { pad: 2 },
+  };
+  const layout = {
+    paper_bgcolor: 'transparent',
+    plot_bgcolor:  'transparent',
+    margin: { t: 0, r: 60, b: 0, l: 0 },
+    font:  { color: '#e6edf3', size: 11 },
+  };
+  Plotly.react(el, [trace], layout, {
+    responsive: true,
+    displayModeBar: false,
+    locale: 'zh-TW',
+  });
+  el.on('plotly_click', evt => {
+    const pt = evt.points[0];
+    if (!pt) return;
+    const id = String(pt.id || '');
+    if (id.startsWith('K|')) {
+      const sid = id.split('|')[1];
+      chainGoStock(sid);
+    }
+  });
 }
 </script>
 </body>
