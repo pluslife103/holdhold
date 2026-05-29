@@ -2985,10 +2985,12 @@ function renderSingle(d) {
           <b style="color:var(--yel)">★</b> 統計顯著 p&lt;0.05
         </div>
       </div>
-    </div>`;
+    </div>
+    <div id="single-chain" style="flex-shrink:0"></div>`;
 
   plotMain(d);
   plotLag(d);
+  singleLoadChain(d.stock_id, d.stock_name);
 }
 
 // ── Plotly: main dual-axis ─────────────────────────────────────────────
@@ -4541,6 +4543,53 @@ window.addEventListener('resize', () => {
     if (el) c.resize(el.clientWidth, el.clientHeight);
   });
 });
+
+// ── 個股分析：所屬產業鏈區塊 ──────────────────────────────────────────
+async function singleLoadChain(stockId, stockName) {
+  const el = document.getElementById('single-chain');
+  if (!el) return;
+  el.innerHTML = '<div style="color:var(--mut);font-size:11px;padding:4px 0">載入所屬產業鏈…</div>';
+
+  if (!_chainData) {
+    try {
+      const r = await fetch('/api/industry_chain');
+      if (!r.ok) throw new Error(await r.text());
+      _chainData = await r.json();
+      const st = document.getElementById('chain-status');
+      if (st) st.textContent = `${_chainData.industry_list.length} 產業｜${_chainData.total} 條目`;
+      chainRenderIndList();
+    } catch(e) {
+      el.innerHTML = '<div style="color:var(--mut);font-size:11px;padding:4px 0">產業鏈載入失敗</div>';
+      return;
+    }
+  }
+
+  const found = [];
+  for (const [ind, subs] of Object.entries(_chainData.industries)) {
+    for (const [sub, stocks] of Object.entries(subs)) {
+      if (stocks.some(s => s.id === stockId)) found.push({ ind, sub, peers: stocks });
+    }
+  }
+
+  if (!found.length) {
+    el.innerHTML = '<div style="color:var(--mut);font-size:11px;padding:4px 0 8px">此股無產業鏈資料</div>';
+    return;
+  }
+
+  el.innerHTML = `<div style="border:1px solid var(--bor);border-radius:8px;padding:10px 12px;margin-top:2px">
+    <div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--txt)">🏭 所屬產業鏈</div>
+    ${found.map(f => `
+      <div style="margin-bottom:10px">
+        <div style="font-size:10px;color:var(--mut);margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid var(--bor)">
+          <span style="color:var(--acc);font-weight:700">${f.ind}</span> › ${f.sub}
+          <span style="margin-left:4px;font-size:9px">(${f.peers.length} 家)</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px">
+          ${f.peers.map(s => `<button class="chain-chip${s.id===stockId?' active':''}" onclick="chainGoStock('${s.id}')">${s.id}${s.name?' '+s.name:''}</button>`).join('')}
+        </div>
+      </div>`).join('')}
+  </div>`;
+}
 
 // ── 產業鏈 ─────────────────────────────────────────────────────────────
 let _chainData = null;
