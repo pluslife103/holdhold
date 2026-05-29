@@ -1644,6 +1644,53 @@ def api_kline_data(stock_id: str = Query("2330"), days: int = Query(90)):
     }
 
 
+@app.get("/api/industry_chain")
+def api_industry_chain():
+    """Taiwan stock industry chain (TaiwanStockIndustryChain) via FinMind DataLoader."""
+    ckey = "industry_chain"
+    cached = _cget(ckey, ttl_h=12)
+    if cached is not None:
+        return cached
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    try:
+        from FinMind.data import DataLoader
+        dl = DataLoader()
+        if token:
+            dl.login_by_token(api_token=token)
+        df = dl.taiwan_stock_industry_chain()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"FinMind DataLoader error: {exc}")
+
+    name_map = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
+
+    from collections import defaultdict
+    tree: dict = defaultdict(lambda: defaultdict(list))
+    seen: set = set()
+    for _, row in df.iterrows():
+        sid = str(row["stock_id"])
+        ind = str(row["industry"])
+        sub = str(row["sub_industry"])
+        key = (sid, ind, sub)
+        if key in seen:
+            continue
+        seen.add(key)
+        tree[ind][sub].append({"id": sid, "name": name_map.get(sid, "")})
+
+    industry_counts = {ind: sum(len(v) for v in subs.values()) for ind, subs in tree.items()}
+    industry_list = sorted(tree.keys(), key=lambda x: -industry_counts[x])
+    industries = {ind: dict(subs) for ind, subs in tree.items()}
+
+    result = {
+        "total": int(len(df)),
+        "industries": industries,
+        "industry_list": industry_list,
+        "industry_counts": industry_counts,
+    }
+    _cset(ckey, result)
+    return result
+
+
 @app.post("/api/reload_stocks")
 def api_reload_stocks():
     """強制重新載入股票清單並重新計算分級。"""
@@ -2055,6 +2102,12 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 .chip{display:flex;align-items:center;gap:5px;padding:4px 10px;background:var(--sur2);border:1px solid var(--bor);border-radius:16px;font-size:11px}
 .chip-rm{cursor:pointer;color:var(--mut);font-size:14px;line-height:1}
 .chip-rm:hover{color:var(--red)}
+.chain-ind-item{padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:4px;border:1px solid transparent;transition:.12s}
+.chain-ind-item:hover{background:var(--sur2);border-color:var(--bor)}
+.chain-ind-item.active{background:var(--acc)22;border-color:var(--acc);color:var(--acc);font-weight:700}
+.chain-chip{padding:3px 8px;border-radius:12px;border:1px solid var(--bor);background:var(--sur2);color:var(--txt);font-size:11px;cursor:pointer;transition:.12s}
+.chain-chip:hover{border-color:var(--acc);color:var(--acc)}
+.chain-chip.active{background:var(--acc);border-color:var(--acc);color:#000;font-weight:700}
 .years-sel{background:var(--sur2);border:1px solid var(--bor);color:var(--txt);border-radius:var(--rad);padding:4px 8px;font-size:12px}
 .compare-charts{display:flex;gap:10px;flex:1;overflow:hidden;min-height:0;flex-direction:column}
 .compare-charts-row{display:flex;gap:10px;flex:1;min-height:0}
@@ -2289,6 +2342,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('broker')">🏦 分點籌碼</div>
       <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
       <div class="tab" onclick="switchTab('kline')">📈 K線分析</div>
+      <div class="tab" onclick="switchTab('chain')">🏭 產業鏈</div>
     </div>
 
     <!-- 個股 pane -->
@@ -2624,6 +2678,31 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
+    <!-- 產業鏈 pane -->
+    <div class="pane" id="pane-chain">
+      <div style="padding:10px 14px;display:flex;flex-direction:column;gap:8px;height:100%;overflow:hidden">
+        <!-- Controls -->
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0;position:relative">
+          <input id="chain-stock-input" class="search" style="width:110px;font-size:13px" placeholder="代號查產業鏈"
+            oninput="chainStockInput(this.value)" onkeydown="if(event.key==='Enter')chainStockCommit()"
+            autocomplete="off"/>
+          <span id="chain-stock-name" style="font-size:12px;color:var(--mut);min-width:50px"></span>
+          <button class="sort-btn" onclick="chainClearStock()">清除</button>
+          <span id="chain-status" style="font-size:11px;color:var(--mut);margin-left:auto"></span>
+          <div id="chain-ac" style="display:none;position:absolute;top:34px;left:0;z-index:200;background:var(--sur2);border:1px solid var(--bor);border-radius:6px;min-width:160px;max-height:180px;overflow-y:auto;box-shadow:0 4px 16px #0006"></div>
+        </div>
+        <!-- Stock chain result -->
+        <div id="chain-stock-result" style="display:none;flex-shrink:0;overflow-y:auto;max-height:220px;padding:4px 0"></div>
+        <!-- Industry browser (two-column) -->
+        <div id="chain-browser" style="display:flex;gap:0;flex:1;min-height:0;overflow:hidden;border:1px solid var(--bor);border-radius:8px">
+          <div id="chain-ind-list" style="width:130px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--bor);padding:4px"></div>
+          <div id="chain-sub-panel" style="flex:1;overflow-y:auto;padding:8px 10px">
+            <div style="color:var(--mut);font-size:12px;padding:20px;text-align:center">← 選擇左側產業</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -2674,6 +2753,13 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <path d="M9 3v4M9 10v11M15 3v11M15 17v4M6 7h6M12 14h6"/>
     </svg>
     <span>K線</span>
+  </button>
+  <button class="bnav-btn" id="bnav-chain" onclick="switchTab('chain')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <rect x="2" y="3" width="6" height="5" rx="1"/><rect x="9" y="3" width="6" height="5" rx="1"/><rect x="16" y="3" width="6" height="5" rx="1"/>
+      <path d="M5 8v3M5 11h14M19 11V8M12 8v3"/><rect x="9" y="14" width="6" height="5" rx="1"/>
+    </svg>
+    <span>產業鏈</span>
   </button>
 </nav>
 
@@ -3123,7 +3209,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview','kline'];
+  const tabNames = ['single','compare','grade','broker','overview','kline','chain'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -3157,6 +3243,7 @@ function switchTab(name) {
     if (_ovData !== null) _ovStartPoll();  // resume polling if scan is still running
     // no auto-scan: user picks tier first
   }
+  if (name === 'chain') chainLoad();
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
 
@@ -4454,6 +4541,126 @@ window.addEventListener('resize', () => {
     if (el) c.resize(el.clientWidth, el.clientHeight);
   });
 });
+
+// ── 產業鏈 ─────────────────────────────────────────────────────────────
+let _chainData = null;
+
+async function chainLoad() {
+  if (_chainData) return;
+  const statusEl = document.getElementById('chain-status');
+  statusEl.textContent = '載入中…';
+  try {
+    const r = await fetch('/api/industry_chain');
+    if (!r.ok) { const t = await r.text(); throw new Error(t); }
+    _chainData = await r.json();
+    chainRenderIndList();
+    statusEl.textContent = `${_chainData.industry_list.length} 產業｜${_chainData.total} 條目`;
+  } catch(e) {
+    statusEl.textContent = '載入失敗: ' + e.message;
+  }
+}
+
+function chainRenderIndList() {
+  if (!_chainData) return;
+  const el = document.getElementById('chain-ind-list');
+  el.innerHTML = _chainData.industry_list.map(ind => {
+    const cnt = _chainData.industry_counts[ind] || 0;
+    return `<div class="chain-ind-item" data-ind="${ind}" onclick="chainSelectInd(this,'${ind.replace(/'/g,"\\'")}')">`
+         + `<span style="flex:1;line-height:1.3">${ind}</span>`
+         + `<span style="font-size:9px;color:var(--mut)">${cnt}</span>`
+         + `</div>`;
+  }).join('');
+}
+
+function chainSelectInd(itemEl, ind) {
+  document.querySelectorAll('.chain-ind-item').forEach(el => el.classList.remove('active'));
+  itemEl.classList.add('active');
+  const subs = _chainData.industries[ind] || {};
+  const panel = document.getElementById('chain-sub-panel');
+  const sorted = Object.entries(subs).sort((a,b) => b[1].length - a[1].length);
+  panel.innerHTML = `<div style="font-size:13px;font-weight:700;margin-bottom:10px;color:var(--txt)">${ind}</div>`
+    + sorted.map(([sub, stocks]) =>
+        `<div style="margin-bottom:12px">`
+      + `<div style="font-size:10px;font-weight:700;color:var(--mut);margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid var(--bor)">`
+      + `${sub} <span style="font-weight:400">(${stocks.length})</span></div>`
+      + `<div style="display:flex;flex-wrap:wrap;gap:4px">`
+      + stocks.map(s => `<button class="chain-chip" onclick="chainGoStock('${s.id}')">${s.id}${s.name ? ' '+s.name : ''}</button>`).join('')
+      + `</div></div>`
+    ).join('');
+}
+
+function chainStockInput(q) {
+  q = q.trim();
+  if (!q) { document.getElementById('chain-ac').style.display='none'; return; }
+  const matches = allStocks.filter(s => s.stock_id.startsWith(q) || s.stock_name.includes(q)).slice(0,8);
+  const ac = document.getElementById('chain-ac');
+  if (matches.length) {
+    ac.style.display = 'block';
+    ac.innerHTML = matches.map(s =>
+      `<div class="ac-item" onclick="chainPickStock('${s.stock_id}','${s.stock_name.replace(/'/g,"\\'")}')">
+        ${s.stock_id} ${s.stock_name}</div>`
+    ).join('');
+  } else {
+    ac.style.display = 'none';
+  }
+}
+
+function chainStockCommit() {
+  const id = document.getElementById('chain-stock-input').value.trim();
+  if (!id) return;
+  const stock = allStocks.find(s => s.stock_id === id);
+  chainPickStock(id, stock ? stock.stock_name : '');
+}
+
+function chainPickStock(id, name) {
+  document.getElementById('chain-stock-input').value = id;
+  document.getElementById('chain-stock-name').textContent = name;
+  document.getElementById('chain-ac').style.display = 'none';
+  if (_chainData) chainShowStockChains(id, name);
+}
+
+function chainShowStockChains(id, name) {
+  const result = document.getElementById('chain-stock-result');
+  const found = [];
+  for (const [ind, subs] of Object.entries(_chainData.industries)) {
+    for (const [sub, stocks] of Object.entries(subs)) {
+      if (stocks.some(s => s.id === id)) found.push({ ind, sub, peers: stocks });
+    }
+  }
+  if (!found.length) {
+    result.innerHTML = `<div style="color:var(--mut);font-size:12px;padding:6px">${id} 無產業鏈資料</div>`;
+    result.style.display = 'block';
+    return;
+  }
+  result.innerHTML = `<div style="font-size:12px;font-weight:700;margin-bottom:6px">${id} ${name} 所屬產業鏈</div>`
+    + found.map(f =>
+        `<div style="margin-bottom:8px;padding:7px 10px;background:var(--sur2);border-radius:6px;border:1px solid var(--bor)">`
+      + `<div style="font-size:10px;color:var(--mut);margin-bottom:5px"><span style="color:var(--acc);font-weight:700">${f.ind}</span> › ${f.sub} (${f.peers.length}家)</div>`
+      + `<div style="display:flex;flex-wrap:wrap;gap:4px">`
+      + f.peers.map(s => `<button class="chain-chip${s.id===id?' active':''}" onclick="chainGoStock('${s.id}')">${s.id}${s.name?' '+s.name:''}</button>`).join('')
+      + `</div></div>`
+    ).join('');
+  result.style.display = 'block';
+}
+
+function chainClearStock() {
+  document.getElementById('chain-stock-input').value = '';
+  document.getElementById('chain-stock-name').textContent = '';
+  document.getElementById('chain-stock-result').style.display = 'none';
+  document.getElementById('chain-ac').style.display = 'none';
+}
+
+function chainGoStock(id) {
+  document.getElementById('chain-ac').style.display = 'none';
+  const stock = allStocks.find(s => s.stock_id === id);
+  if (stock) {
+    switchTab('single');
+    loadStock(id, stock.stock_name);
+    showToast(`${id} ${stock.stock_name}`);
+  } else {
+    showToast('找不到 ' + id);
+  }
+}
 </script>
 </body>
 </html>
