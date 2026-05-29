@@ -1680,7 +1680,12 @@ def api_industry_chain():
         if key in seen:
             continue
         seen.add(key)
-        tree[ind][sub].append({"id": sid, "name": name_map.get(sid, "")})
+        cap = _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
+        tree[ind][sub].append({
+            "id":   sid,
+            "name": name_map.get(sid, ""),
+            "cap":  round(cap, 0) if cap else None,
+        })
 
     industry_counts = {ind: sum(len(v) for v in subs.values()) for ind, subs in tree.items()}
     industry_list = sorted(tree.keys(), key=lambda x: -industry_counts[x])
@@ -4549,6 +4554,18 @@ window.addEventListener('resize', () => {
   });
 });
 
+function fmtCap(cap) {
+  if (!cap || cap <= 0) return '';
+  if (cap >= 10000) return (cap / 10000).toFixed(1) + '兆';
+  if (cap >= 1000)  return Math.round(cap / 100) / 10 + '千億';
+  return Math.round(cap) + '億';
+}
+function _chipLabel(s, activeId) {
+  const cap = s.cap ? `<span style="font-size:9px;opacity:.65;margin-left:3px">${fmtCap(s.cap)}</span>` : '';
+  const cls = s.id === activeId ? ' active' : '';
+  return `<button class="chain-chip${cls}" onclick="chainGoStock('${s.id}')">${s.id}${s.name?' '+s.name:''}${cap}</button>`;
+}
+
 // ── 個股分析：所屬產業鏈區塊 ──────────────────────────────────────────
 async function singleLoadChain(stockId, stockName) {
   const el = document.getElementById('single-chain');
@@ -4590,7 +4607,7 @@ async function singleLoadChain(stockId, stockName) {
           <span style="margin-left:4px;font-size:9px">(${f.peers.length} 家)</span>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:4px">
-          ${f.peers.map(s => `<button class="chain-chip${s.id===stockId?' active':''}" onclick="chainGoStock('${s.id}')">${s.id}${s.name?' '+s.name:''}</button>`).join('')}
+          ${f.peers.map(s => _chipLabel(s, stockId)).join('')}
         </div>
       </div>`).join('')}
   </div>`;
@@ -4638,7 +4655,7 @@ function chainSelectInd(itemEl, ind) {
       + `<div style="font-size:10px;font-weight:700;color:var(--mut);margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid var(--bor)">`
       + `${sub} <span style="font-weight:400">(${stocks.length})</span></div>`
       + `<div style="display:flex;flex-wrap:wrap;gap:4px">`
-      + stocks.map(s => `<button class="chain-chip" onclick="chainGoStock('${s.id}')">${s.id}${s.name ? ' '+s.name : ''}</button>`).join('')
+      + stocks.map(s => _chipLabel(s, null)).join('')
       + `</div></div>`
     ).join('');
 }
@@ -4691,7 +4708,7 @@ function chainShowStockChains(id, name) {
         `<div style="margin-bottom:8px;padding:7px 10px;background:var(--sur2);border-radius:6px;border:1px solid var(--bor)">`
       + `<div style="font-size:10px;color:var(--mut);margin-bottom:5px"><span style="color:var(--acc);font-weight:700">${f.ind}</span> › ${f.sub} (${f.peers.length}家)</div>`
       + `<div style="display:flex;flex-wrap:wrap;gap:4px">`
-      + f.peers.map(s => `<button class="chain-chip${s.id===id?' active':''}" onclick="chainGoStock('${s.id}')">${s.id}${s.name?' '+s.name:''}</button>`).join('')
+      + f.peers.map(s => _chipLabel(s, id)).join('')
       + `</div></div>`
     ).join('');
   result.style.display = 'block';
