@@ -1646,7 +1646,7 @@ def api_kline_data(stock_id: str = Query("2330"), days: int = Query(90)):
 
 @app.get("/api/industry_chain")
 def api_industry_chain():
-    """Taiwan stock industry chain (TaiwanStockIndustryChain) via FinMind DataLoader."""
+    """Taiwan stock industry chain (TaiwanStockIndustryChain) via FinMind REST API."""
     ckey = "industry_chain"
     cached = _cget(ckey, ttl_h=12)
     if cached is not None:
@@ -1654,23 +1654,28 @@ def api_industry_chain():
 
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
     try:
-        from FinMind.data import DataLoader
-        dl = DataLoader()
-        if token:
-            dl.login_by_token(api_token=token)
-        df = dl.taiwan_stock_industry_chain()
+        r = requests.get(
+            FINMIND_BASE,
+            params={"dataset": "TaiwanStockIndustryChain", "token": token},
+            timeout=30,
+        )
+        j = r.json()
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"FinMind DataLoader error: {exc}")
+        raise HTTPException(status_code=500, detail=f"FinMind request error: {exc}")
 
+    if r.status_code != 200 or j.get("status") not in (200, None):
+        raise HTTPException(status_code=502, detail=j.get("msg", "FinMind error"))
+
+    rows_raw = j.get("data", [])
     name_map = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
 
     from collections import defaultdict
     tree: dict = defaultdict(lambda: defaultdict(list))
     seen: set = set()
-    for _, row in df.iterrows():
-        sid = str(row["stock_id"])
-        ind = str(row["industry"])
-        sub = str(row["sub_industry"])
+    for row in rows_raw:
+        sid = str(row.get("stock_id", ""))
+        ind = str(row.get("industry", ""))
+        sub = str(row.get("sub_industry", ""))
         key = (sid, ind, sub)
         if key in seen:
             continue
