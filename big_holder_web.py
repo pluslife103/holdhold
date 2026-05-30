@@ -1761,41 +1761,28 @@ def _fmt_cap_py(cap: float | None) -> str:
 def api_treemap():
     """Return Plotly treemap data: industry→sub_industry→stock, sized by mcap, colored by % change."""
     ckey = "treemap"
-    cached = _cget(ckey, ttl_h=2)
+    cached = _cget(ckey, ttl_h=0.25)  # 15 min; real-time snapshot data
     if cached is not None:
         return cached
 
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
 
-    # ── Latest daily price (walk back up to 7 days for weekends/holidays) ──
-    # Budget 20 seconds total to avoid exceeding Railway's HTTP gateway timeout
-    import time as _time
+    # ── Real-time tick snapshot (single call, ~2800 stocks, change_rate included) ──
+    SNAPSHOT_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
     price_map: dict = {}
     trade_date = ""
-    _t0 = _time.monotonic()
-    for delta in range(7):
-        _remaining = 20.0 - (_time.monotonic() - _t0)
-        if _remaining < 2:
-            break
-        dt = (datetime.now() - timedelta(days=delta)).strftime("%Y-%m-%d")
-        try:
-            r = requests.get(FINMIND_BASE, params={
-                "dataset": "TaiwanStockPrice",
-                "start_date": dt, "end_date": dt, "token": token,
-            }, timeout=min(_remaining - 1, 12))
-            rows = r.json().get("data") or []
-            if rows:
-                trade_date = dt
-                for row in rows:
-                    sid = str(row.get("stock_id", ""))
-                    close  = float(row.get("close",  0) or 0)
-                    spread = float(row.get("spread", 0) or 0)
-                    prev   = close - spread
-                    pct    = round(spread / prev * 100, 2) if prev != 0 and close > 0 else 0
-                    price_map[sid] = {"close": close, "pct": pct}
-                break
-        except Exception:
-            continue
+    try:
+        r = requests.get(SNAPSHOT_URL, params={"token": token}, timeout=15)
+        rows = r.json().get("data") or []
+        if rows:
+            trade_date = str(rows[0].get("date", ""))[:10]
+            for row in rows:
+                sid  = str(row.get("stock_id", ""))
+                close = float(row.get("close", 0) or 0)
+                pct   = float(row.get("change_rate", 0) or 0)
+                price_map[sid] = {"close": close, "pct": pct}
+    except Exception:
+        pass  # render treemap without color if snapshot unavailable
 
     # ── Industry chain (reuse cache or fetch inline) ──────────────────────
     chain = _cget("industry_chain", ttl_h=24)
