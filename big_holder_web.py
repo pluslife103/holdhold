@@ -1758,31 +1758,55 @@ def _fmt_cap_py(cap: float | None) -> str:
 
 
 @app.get("/api/treemap")
-def api_treemap():
-    """Return Plotly treemap data: industry→sub_industry→stock, sized by mcap, colored by % change."""
-    ckey = "treemap"
-    cached = _cget(ckey, ttl_h=0.25)  # 15 min; real-time snapshot data
+def api_treemap(date: str = ""):
+    """Return Plotly treemap data. date=YYYY-MM-DD for historical, empty for live snapshot."""
+    is_hist = bool(date)
+    ckey  = f"treemap:{date}" if is_hist else "treemap"
+    ttl_h = 999.0 if is_hist else 0.25
+    cached = _cget(ckey, ttl_h=ttl_h)
     if cached is not None:
         return cached
 
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
-
-    # ── Real-time tick snapshot (single call, ~2800 stocks, change_rate included) ──
-    SNAPSHOT_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
     price_map: dict = {}
     trade_date = ""
-    try:
-        r = requests.get(SNAPSHOT_URL, params={"token": token}, timeout=15)
-        rows = r.json().get("data") or []
-        if rows:
-            trade_date = str(rows[0].get("date", ""))[:10]
+
+    if is_hist:
+        # Historical: fetch TaiwanStockPrice for the requested date
+        try:
+            r = requests.get(FINMIND_BASE, params={
+                "dataset": "TaiwanStockPrice",
+                "start_date": date, "end_date": date, "token": token,
+            }, timeout=20)
+            rows = r.json().get("data") or []
+            if not rows:
+                return {"ids": [], "labels": [], "parents": [], "values": [],
+                        "colors": [], "texts": [], "trade_date": "", "no_data": True}
+            trade_date = date
             for row in rows:
-                sid  = str(row.get("stock_id", ""))
-                close = float(row.get("close", 0) or 0)
-                pct   = float(row.get("change_rate", 0) or 0)
+                sid    = str(row.get("stock_id", ""))
+                close  = float(row.get("close",  0) or 0)
+                spread = float(row.get("spread", 0) or 0)
+                prev   = close - spread
+                pct    = round(spread / prev * 100, 2) if prev != 0 and close > 0 else 0
                 price_map[sid] = {"close": close, "pct": pct}
-    except Exception:
-        pass  # render treemap without color if snapshot unavailable
+        except Exception:
+            pass
+    else:
+        # Live: real-time tick snapshot (single call, ~2800 stocks, change_rate included)
+        SNAPSHOT_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
+        try:
+            r = requests.get(SNAPSHOT_URL, params={"token": token}, timeout=15)
+            rows = r.json().get("data") or []
+            if rows:
+                trade_date = str(rows[0].get("date", ""))[:10]
+                for row in rows:
+                    sid   = str(row.get("stock_id", ""))
+                    close = float(row.get("close", 0) or 0)
+                    pct   = float(row.get("change_rate", 0) or 0)
+                    price_map[sid] = {"close": close, "pct": pct}
+        except Exception:
+            pass  # render treemap without color if snapshot unavailable
 
     # ── Industry chain (reuse cache or fetch inline) ──────────────────────
     chain = _cget("industry_chain", ttl_h=24)
@@ -1873,7 +1897,7 @@ def api_treemap():
     result = {
         "ids": ids, "labels": labels, "parents": parents,
         "values": values, "colors": colors, "texts": texts,
-        "trade_date": trade_date,
+        "trade_date": trade_date, "is_hist": is_hist,
     }
     _cset(ckey, result)
     return result
@@ -2894,8 +2918,18 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           </div>
         </div>
         <!-- Treemap — MAP view -->
-        <div id="chain-treemap-wrap" style="display:none;flex:1;min-height:0;border:1px solid var(--bor);border-radius:8px;overflow:hidden;position:relative">
-          <div id="chain-treemap" style="width:100%;height:100%"></div>
+        <div id="chain-treemap-wrap" style="display:none;flex-direction:column;flex:1;min-height:0;border:1px solid var(--bor);border-radius:8px;overflow:hidden;position:relative">
+          <!-- Date navigation bar -->
+          <div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur2)">
+            <button class="sort-btn" onclick="treemapNav(-1)" title="前一個交易日">◀</button>
+            <input type="date" id="treemap-date-input"
+              style="background:var(--sur);color:var(--txt);border:1px solid var(--bor);border-radius:4px;padding:2px 6px;font-size:11px;cursor:pointer"
+              onchange="treemapGoDate(this.value)">
+            <button class="sort-btn" onclick="treemapNav(1)" title="後一個交易日">▶</button>
+            <button class="sort-btn active" id="treemap-live-btn" onclick="treemapGoLive()">今日</button>
+            <span id="treemap-hist-label" style="font-size:11px;color:var(--mut);margin-left:4px"></span>
+          </div>
+          <div id="chain-treemap" style="width:100%;flex:1;min-height:0"></div>
           <div id="chain-treemap-msg" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--mut)">載入中…</div>
         </div>
       </div>
@@ -4925,33 +4959,76 @@ function chainGoStock(id) {
 let _chainView = 'list';
 let _treemapLoaded = false;
 
+let _treemapDate = ''; // '' = live, 'YYYY-MM-DD' = historical
+
 function chainSetView(v) {
   _chainView = v;
   document.getElementById('chain-view-list').classList.toggle('active', v === 'list');
   document.getElementById('chain-view-map').classList.toggle('active', v === 'map');
-  document.getElementById('chain-browser').style.display     = v === 'list' ? 'flex'  : 'none';
-  document.getElementById('chain-treemap-wrap').style.display = v === 'map'  ? 'block' : 'none';
+  document.getElementById('chain-browser').style.display      = v === 'list' ? 'flex'  : 'none';
+  document.getElementById('chain-treemap-wrap').style.display = v === 'map'  ? 'flex'  : 'none';
   if (v === 'map' && !_treemapLoaded) chainLoadTreemap();
+}
+
+function treemapNav(delta) {
+  const base = _treemapDate || new Date().toISOString().slice(0, 10);
+  const d = new Date(base + 'T12:00:00');
+  d.setDate(d.getDate() + delta);
+  // skip weekends
+  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + delta);
+  const ds = d.toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+  if (ds >= today) { treemapGoLive(); return; }
+  treemapGoDate(ds);
+}
+
+function treemapGoDate(date) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (!date || date >= today) { treemapGoLive(); return; }
+  _treemapDate = date;
+  document.getElementById('treemap-date-input').value = date;
+  document.getElementById('treemap-live-btn').classList.remove('active');
+  chainLoadTreemap();
+}
+
+function treemapGoLive() {
+  _treemapDate = '';
+  document.getElementById('treemap-date-input').value = '';
+  document.getElementById('treemap-live-btn').classList.add('active');
+  _treemapLoaded = false;
+  chainLoadTreemap();
 }
 
 async function chainLoadTreemap() {
   const msg = document.getElementById('chain-treemap-msg');
-  msg.textContent = '載入板塊圖資料…（首次約 5–15 秒）';
+  const isHist = !!_treemapDate;
+  msg.textContent = isHist ? `載入 ${_treemapDate} 歷史資料…` : '載入板塊圖資料…（首次約 5–15 秒）';
   msg.style.display = 'flex';
+  const url = isHist ? `/api/treemap?date=${_treemapDate}` : '/api/treemap';
   try {
-    const r = await fetch('/api/treemap');
+    const r = await fetch(url);
     if (!r.ok) {
       let errText = await r.text();
       try { errText = JSON.parse(errText).detail || errText; } catch(_) {}
       throw new Error(`HTTP ${r.status}: ${errText}`);
     }
     const data = await r.json();
+    if (data.no_data) {
+      msg.textContent = `${_treemapDate} 無交易資料（假日或未來日期）`;
+      return;
+    }
     msg.style.display = 'none';
     chainRenderTreemap(data);
-    _treemapLoaded = true;
-    const noPrice = !data.trade_date;
-    document.getElementById('chain-status').textContent =
-      noPrice ? '板塊圖（無漲跌色，價格資料未取得）' : `資料日期：${data.trade_date}`;
+    _treemapLoaded = !isHist;
+    const label = document.getElementById('treemap-hist-label');
+    if (isHist) {
+      label.textContent = '歷史資料';
+      document.getElementById('chain-status').textContent = `歷史日期：${data.trade_date}`;
+    } else {
+      label.textContent = '';
+      document.getElementById('chain-status').textContent =
+        data.trade_date ? `資料日期：${data.trade_date}` : '板塊圖（無漲跌色，價格資料未取得）';
+    }
   } catch(e) {
     msg.style.display = 'flex';
     msg.textContent = '板塊圖載入失敗：' + e.message;
