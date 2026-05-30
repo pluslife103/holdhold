@@ -1858,7 +1858,7 @@ def api_treemap():
 
             sub_avg = sub_wpct / sub_cap if sub_cap > 0 else 0
             ids.append(sub_id); labels.append(sub); parents.append(ind_id)
-            values.append(max(sub_cap, 0.1))
+            values.append(0)  # branchvalues='remainder': inner nodes get 0, Plotly auto-sums children
             colors.append(round(sub_avg, 2))
             texts.append(f"{sub}<br>市值:{_fmt_cap_py(sub_cap)}<br>漲跌:{sub_avg:+.2f}%")
             ind_cap  += sub_cap
@@ -1866,13 +1866,9 @@ def api_treemap():
 
         ind_avg = ind_wpct / ind_cap if ind_cap > 0 else 0
         ids.append(ind_id); labels.append(ind); parents.append("root")
-        values.append(max(ind_cap, 0.1))
+        values.append(0)  # branchvalues='remainder'
         colors.append(round(ind_avg, 2))
         texts.append(f"{ind}<br>市值:{_fmt_cap_py(ind_cap)}<br>漲跌:{ind_avg:+.2f}%")
-
-    # branchvalues='total' requires root value >= sum of children
-    root_cap = sum(v for v, p in zip(values, parents) if p == "root")
-    values[0] = root_cap
 
     result = {
         "ids": ids, "labels": labels, "parents": parents,
@@ -4971,7 +4967,7 @@ function chainRenderTreemap(data) {
   ];
   const trace = {
     type: 'treemap',
-    branchvalues: 'total',
+    branchvalues: 'remainder',
     ids:     data.ids,
     labels:  data.labels,
     parents: data.parents,
