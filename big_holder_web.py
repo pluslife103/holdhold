@@ -1757,6 +1757,91 @@ def _fmt_cap_py(cap: float | None) -> str:
     return f"{cap:.0f}億"
 
 
+def _build_treemap_arrays(price_map: dict, chain: dict, trade_date: str, is_hist: bool) -> dict:
+    """Build Plotly treemap arrays from price_map + industry chain."""
+    ids: list = []; labels: list = []; parents: list = []
+    values: list = []; colors: list = []; texts: list = []
+
+    ids.append("root"); labels.append("台灣股市"); parents.append("")
+    values.append(0);   colors.append(0);          texts.append(f"資料日期：{trade_date}")
+
+    industries = chain["industries"]
+    for ind in chain["industry_list"]:
+        subs = industries.get(ind, {})
+        ind_id = f"I|{ind}"
+        ind_cap = 0.0; ind_wpct = 0.0
+
+        for sub, stocks in subs.items():
+            sub_id = f"S|{ind}|{sub}"
+            sub_cap = 0.0; sub_wpct = 0.0
+
+            for s in stocks:
+                sid  = s["id"]
+                cap  = float(s.get("cap") or 0)
+                p    = price_map.get(sid, {})
+                pct  = p.get("pct", 0)
+                cls  = p.get("close", 0)
+                sign = "+" if pct > 0 else ""
+                ids.append(f"K|{sid}|{ind}|{sub}")
+                labels.append(f"{sid}" + (f"<br>{s['name']}" if s.get("name") else ""))
+                parents.append(sub_id)
+                values.append(max(cap, 0.1))
+                colors.append(pct)
+                texts.append(f"{sid} {s.get('name','')}<br>收盤:{cls}<br>{sign}{pct:.2f}%<br>市值:{_fmt_cap_py(cap)}")
+                sub_cap += cap
+                sub_wpct += pct * cap
+
+            sub_avg = sub_wpct / sub_cap if sub_cap > 0 else 0
+            ids.append(sub_id); labels.append(sub); parents.append(ind_id)
+            values.append(0);   colors.append(round(sub_avg, 2))
+            texts.append(f"{sub}<br>市值:{_fmt_cap_py(sub_cap)}<br>漲跌:{sub_avg:+.2f}%")
+            ind_cap  += sub_cap
+            ind_wpct += sub_avg * sub_cap
+
+        ind_avg = ind_wpct / ind_cap if ind_cap > 0 else 0
+        ids.append(ind_id); labels.append(ind); parents.append("root")
+        values.append(0);   colors.append(round(ind_avg, 2))
+        texts.append(f"{ind}<br>市值:{_fmt_cap_py(ind_cap)}<br>漲跌:{ind_avg:+.2f}%")
+
+    return {"ids": ids, "labels": labels, "parents": parents,
+            "values": values, "colors": colors, "texts": texts,
+            "trade_date": trade_date, "is_hist": is_hist}
+
+
+def _get_or_build_chain(token: str) -> dict:
+    """Return industry chain from cache, fetching inline if missing."""
+    chain = _cget("industry_chain", ttl_h=24)
+    if chain is not None:
+        return chain
+    r2 = requests.get(FINMIND_BASE, params={
+        "dataset": "TaiwanStockIndustryChain", "token": token,
+    }, timeout=30)
+    j2 = r2.json()
+    if r2.status_code != 200 or j2.get("status") not in (200, None):
+        raise HTTPException(status_code=502, detail=j2.get("msg", "FinMind chain error"))
+    raw2 = j2.get("data") or []
+    from collections import defaultdict
+    tree2: dict = defaultdict(lambda: defaultdict(list))
+    seen2: set = set()
+    nm = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
+    for row in raw2:
+        sid = str(row.get("stock_id", ""))
+        ind = str(row.get("industry", ""))
+        sub = str(row.get("sub_industry", ""))
+        key = (sid, ind, sub)
+        if key in seen2:
+            continue
+        seen2.add(key)
+        cap = _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
+        tree2[ind][sub].append({"id": sid, "name": nm.get(sid, ""), "cap": round(cap, 0) if cap else None})
+    icounts = {i: sum(len(v) for v in s.values()) for i, s in tree2.items()}
+    ilist   = sorted(tree2.keys(), key=lambda x: -icounts[x])
+    chain = {"total": len(raw2), "industries": {i: dict(s) for i, s in tree2.items()},
+             "industry_list": ilist, "industry_counts": icounts}
+    _cset("industry_chain", chain)
+    return chain
+
+
 @app.get("/api/treemap")
 def api_treemap(date: str = ""):
     """Return Plotly treemap data. date=YYYY-MM-DD for historical, empty for live snapshot."""
@@ -1772,7 +1857,6 @@ def api_treemap(date: str = ""):
     trade_date = ""
 
     if is_hist:
-        # Historical: fetch TaiwanStockPrice for the requested date
         try:
             r = requests.get(FINMIND_BASE, params={
                 "dataset": "TaiwanStockPrice",
@@ -1793,7 +1877,6 @@ def api_treemap(date: str = ""):
         except Exception:
             pass
     else:
-        # Live: real-time tick snapshot (single call, ~2800 stocks, change_rate included)
         SNAPSHOT_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
         try:
             r = requests.get(SNAPSHOT_URL, params={"token": token}, timeout=15)
@@ -1806,101 +1889,61 @@ def api_treemap(date: str = ""):
                     pct   = float(row.get("change_rate", 0) or 0)
                     price_map[sid] = {"close": close, "pct": pct}
         except Exception:
-            pass  # render treemap without color if snapshot unavailable
+            pass
 
-    # ── Industry chain (reuse cache or fetch inline) ──────────────────────
-    chain = _cget("industry_chain", ttl_h=24)
-    if chain is None:
-        try:
-            r2 = requests.get(FINMIND_BASE, params={
-                "dataset": "TaiwanStockIndustryChain", "token": token,
-            }, timeout=30)
-            j2 = r2.json()
-            if r2.status_code != 200 or j2.get("status") not in (200, None):
-                raise HTTPException(status_code=502, detail=j2.get("msg", "FinMind chain error"))
-            raw2 = j2.get("data") or []
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-        from collections import defaultdict
-        tree2: dict = defaultdict(lambda: defaultdict(list))
-        seen2: set = set()
-        nm = {s["stock_id"]: s.get("stock_name", "") for s in _STOCKS}
-        for row in raw2:
-            sid = str(row.get("stock_id", ""))
-            ind = str(row.get("industry", ""))
-            sub = str(row.get("sub_industry", ""))
-            key = (sid, ind, sub)
-            if key in seen2:
-                continue
-            seen2.add(key)
-            cap = _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
-            tree2[ind][sub].append({"id": sid, "name": nm.get(sid, ""), "cap": round(cap, 0) if cap else None})
-        icounts = {i: sum(len(v) for v in s.values()) for i, s in tree2.items()}
-        ilist   = sorted(tree2.keys(), key=lambda x: -icounts[x])
-        chain = {
-            "total": len(raw2), "industries": {i: dict(s) for i, s in tree2.items()},
-            "industry_list": ilist, "industry_counts": icounts,
-        }
-        _cset("industry_chain", chain)
-
-    # ── Build Plotly treemap arrays ───────────────────────────────────────
-    ids: list = []; labels: list = []; parents: list = []
-    values: list = []; colors: list = []; texts: list = []
-
-    ids.append("root"); labels.append("台灣股市"); parents.append("")
-    values.append(0);   colors.append(0);          texts.append(f"資料日期：{trade_date}")
-
-    industries = chain["industries"]
-
-    for ind in chain["industry_list"]:
-        subs = industries.get(ind, {})
-        ind_id = f"I|{ind}"
-        ind_cap = 0.0; ind_wpct = 0.0
-
-        for sub, stocks in subs.items():
-            sub_id = f"S|{ind}|{sub}"
-            sub_cap = 0.0; sub_wpct = 0.0
-
-            for s in stocks:
-                sid  = s["id"]
-                cap  = float(s.get("cap") or 0)
-                p    = price_map.get(sid, {})
-                pct  = p.get("pct", 0)
-                cls  = p.get("close", 0)
-                sign = "+" if pct > 0 else ""
-                stk_id = f"K|{sid}|{ind}|{sub}"
-                ids.append(stk_id)
-                labels.append(f"{sid}" + (f"<br>{s['name']}" if s.get("name") else ""))
-                parents.append(sub_id)
-                values.append(max(cap, 0.1))
-                colors.append(pct)
-                texts.append(f"{sid} {s.get('name','')}<br>收盤:{cls}<br>{sign}{pct:.2f}%<br>市值:{_fmt_cap_py(cap)}")
-                sub_cap += cap
-                sub_wpct += pct * cap
-
-            sub_avg = sub_wpct / sub_cap if sub_cap > 0 else 0
-            ids.append(sub_id); labels.append(sub); parents.append(ind_id)
-            values.append(0)  # branchvalues='remainder': inner nodes get 0, Plotly auto-sums children
-            colors.append(round(sub_avg, 2))
-            texts.append(f"{sub}<br>市值:{_fmt_cap_py(sub_cap)}<br>漲跌:{sub_avg:+.2f}%")
-            ind_cap  += sub_cap
-            ind_wpct += sub_avg * sub_cap
-
-        ind_avg = ind_wpct / ind_cap if ind_cap > 0 else 0
-        ids.append(ind_id); labels.append(ind); parents.append("root")
-        values.append(0)  # branchvalues='remainder'
-        colors.append(round(ind_avg, 2))
-        texts.append(f"{ind}<br>市值:{_fmt_cap_py(ind_cap)}<br>漲跌:{ind_avg:+.2f}%")
-
-    result = {
-        "ids": ids, "labels": labels, "parents": parents,
-        "values": values, "colors": colors, "texts": texts,
-        "trade_date": trade_date, "is_hist": is_hist,
-    }
+    chain = _get_or_build_chain(token)
+    result = _build_treemap_arrays(price_map, chain, trade_date, is_hist)
     _cset(ckey, result)
     return result
+
+
+@app.get("/api/treemap/preload")
+def api_treemap_preload(start: str = "", end: str = ""):
+    """Bulk-fetch TaiwanStockPrice for a date range and cache one treemap per date.
+    Returns list of cached dates so the frontend can animate without extra API calls."""
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not end:
+        end = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if not start:
+        start = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+
+    try:
+        r = requests.get(FINMIND_BASE, params={
+            "dataset": "TaiwanStockPrice",
+            "start_date": start, "end_date": end, "token": token,
+        }, timeout=60)
+        j = r.json()
+        if j.get("status") not in (200, None):
+            raise HTTPException(status_code=502, detail=j.get("msg", "FinMind error"))
+        rows = j.get("data") or []
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not rows:
+        return {"dates": [], "cached": 0}
+
+    from collections import defaultdict
+    price_by_date: dict = defaultdict(dict)
+    for row in rows:
+        d   = str(row.get("date", ""))
+        sid = str(row.get("stock_id", ""))
+        close  = float(row.get("close",  0) or 0)
+        spread = float(row.get("spread", 0) or 0)
+        prev   = close - spread
+        pct    = round(spread / prev * 100, 2) if prev != 0 and close > 0 else 0
+        price_by_date[d][sid] = {"close": close, "pct": pct}
+
+    chain = _get_or_build_chain(token)
+    cached_dates = []
+    for d, pm in sorted(price_by_date.items()):
+        ckey = f"treemap:{d}"
+        if _cget(ckey, ttl_h=999) is None:
+            _cset(ckey, _build_treemap_arrays(pm, chain, d, is_hist=True))
+        cached_dates.append(d)
+
+    return {"dates": cached_dates, "cached": len(cached_dates)}
 
 
 @app.post("/api/reload_stocks")
@@ -2904,6 +2947,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           <div style="display:flex;gap:4px;margin-left:8px">
             <button class="sort-btn active" id="chain-view-list" onclick="chainSetView('list')">📋 清單</button>
             <button class="sort-btn" id="chain-view-map"  onclick="chainSetView('map')">📊 板塊圖</button>
+            <button class="sort-btn" id="chain-view-anim" onclick="chainSetView('anim')">🎬 動態</button>
           </div>
           <span id="chain-status" style="font-size:11px;color:var(--mut);margin-left:auto"></span>
           <div id="chain-ac" style="display:none;position:absolute;top:34px;left:0;z-index:200;background:var(--sur2);border:1px solid var(--bor);border-radius:6px;min-width:160px;max-height:180px;overflow-y:auto;box-shadow:0 4px 16px #0006"></div>
@@ -2916,6 +2960,38 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           <div id="chain-sub-panel" style="flex:1;overflow-y:auto;padding:8px 10px">
             <div style="color:var(--mut);font-size:12px;padding:20px;text-align:center">← 選擇左側產業</div>
           </div>
+        </div>
+        <!-- Animation view -->
+        <div id="chain-anim-wrap" style="display:none;flex-direction:column;flex:1;min-height:0;border:1px solid var(--bor);border-radius:8px;overflow:hidden">
+          <!-- Loader bar -->
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur2);flex-wrap:wrap">
+            <label style="font-size:11px;color:var(--mut)">起日</label>
+            <input type="date" id="anim-start" style="background:var(--sur);color:var(--txt);border:1px solid var(--bor);border-radius:4px;padding:2px 6px;font-size:11px">
+            <label style="font-size:11px;color:var(--mut)">迄日</label>
+            <input type="date" id="anim-end"   style="background:var(--sur);color:var(--txt);border:1px solid var(--bor);border-radius:4px;padding:2px 6px;font-size:11px">
+            <button class="sort-btn" id="anim-load-btn" onclick="treemapAnimLoad()">載入</button>
+            <span id="anim-progress" style="font-size:11px;color:var(--mut)"></span>
+          </div>
+          <!-- Playback bar (shown after load) -->
+          <div id="anim-playback" style="display:none;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur2)">
+            <button id="anim-play-btn" class="sort-btn active" onclick="treemapAnimToggle()" style="min-width:32px">▶</button>
+            <button class="sort-btn" onclick="treemapAnimRewind()" title="回到第一幀">⏮</button>
+            <label style="font-size:11px;color:var(--mut)">速度</label>
+            <select id="anim-speed" onchange="treemapAnimSetSpeed(+this.value)"
+              style="background:var(--sur);color:var(--txt);border:1px solid var(--bor);border-radius:4px;padding:2px 4px;font-size:11px">
+              <option value="2000">0.5×</option>
+              <option value="1000" selected>1×</option>
+              <option value="500">2×</option>
+              <option value="250">4×</option>
+            </select>
+            <input type="range" id="anim-timeline" min="0" value="0"
+              style="flex:1;accent-color:var(--acc)"
+              oninput="treemapAnimScrub(+this.value)">
+            <span id="anim-date-label" style="font-size:12px;color:var(--txt);min-width:90px;text-align:right"></span>
+          </div>
+          <!-- Treemap canvas for animation -->
+          <div id="chain-treemap-anim" style="width:100%;flex:1;min-height:0"></div>
+          <div id="chain-anim-msg" style="position:absolute;inset:0;pointer-events:none;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--mut)"></div>
         </div>
         <!-- Treemap — MAP view -->
         <div id="chain-treemap-wrap" style="display:none;flex-direction:column;flex:1;min-height:0;border:1px solid var(--bor);border-radius:8px;overflow:hidden;position:relative">
@@ -4961,13 +5037,24 @@ let _treemapLoaded = false;
 
 let _treemapDate = ''; // '' = live, 'YYYY-MM-DD' = historical
 
+// ── Animation state ───────────────────────────────────────────────────────
+let _animFrames  = [];   // [{date, colors, texts, trade_date}]
+let _animStruct  = null; // shared {ids, labels, parents, values} from first frame
+let _animIdx     = 0;
+let _animPlaying = false;
+let _animTimer   = null;
+let _animSpeed   = 1000; // ms per frame
+
 function chainSetView(v) {
   _chainView = v;
   document.getElementById('chain-view-list').classList.toggle('active', v === 'list');
-  document.getElementById('chain-view-map').classList.toggle('active', v === 'map');
-  document.getElementById('chain-browser').style.display      = v === 'list' ? 'flex'  : 'none';
-  document.getElementById('chain-treemap-wrap').style.display = v === 'map'  ? 'flex'  : 'none';
-  if (v === 'map' && !_treemapLoaded) chainLoadTreemap();
+  document.getElementById('chain-view-map').classList.toggle('active',  v === 'map');
+  document.getElementById('chain-view-anim').classList.toggle('active', v === 'anim');
+  document.getElementById('chain-browser').style.display      = v === 'list' ? 'flex' : 'none';
+  document.getElementById('chain-treemap-wrap').style.display = v === 'map'  ? 'flex' : 'none';
+  document.getElementById('chain-anim-wrap').style.display    = v === 'anim' ? 'flex' : 'none';
+  if (v === 'map'  && !_treemapLoaded) chainLoadTreemap();
+  if (v === 'anim' && !_animFrames.length) _animInitDefaults();
 }
 
 function treemapNav(delta) {
@@ -5034,6 +5121,135 @@ async function chainLoadTreemap() {
     msg.textContent = '板塊圖載入失敗：' + e.message;
   }
 }
+
+// ── Animation functions ───────────────────────────────────────────────────
+
+function _animInitDefaults() {
+  // Default range: yesterday back 42 calendar days (~30 trading days)
+  const today = new Date();
+  const end = new Date(today); end.setDate(end.getDate() - 1);
+  const start = new Date(today); start.setDate(start.getDate() - 43);
+  document.getElementById('anim-end').value   = end.toISOString().slice(0, 10);
+  document.getElementById('anim-start').value = start.toISOString().slice(0, 10);
+}
+
+async function treemapAnimLoad() {
+  const start = document.getElementById('anim-start').value;
+  const end   = document.getElementById('anim-end').value;
+  if (!start || !end) { alert('請選擇起始和結束日期'); return; }
+  const btn  = document.getElementById('anim-load-btn');
+  const prog = document.getElementById('anim-progress');
+  btn.disabled = true;
+  prog.textContent = '預載中（單次 API 呼叫取整段資料）…';
+  // Stop any running animation
+  if (_animPlaying) treemapAnimToggle();
+  _animFrames = []; _animStruct = null;
+
+  try {
+    // Step 1: preload — one bulk API call, server caches per-date treemaps
+    const r1 = await fetch(`/api/treemap/preload?start=${start}&end=${end}`);
+    if (!r1.ok) { const t = await r1.text(); throw new Error(t); }
+    const preload = await r1.json();
+    const dates = preload.dates || [];
+    if (!dates.length) { prog.textContent = '該區間無交易資料'; return; }
+
+    // Step 2: fetch each cached treemap frame (fast — served from memory)
+    prog.textContent = `取得 ${dates.length} 天資料…`;
+    for (let i = 0; i < dates.length; i++) {
+      const d = dates[i];
+      const r2 = await fetch(`/api/treemap?date=${d}`);
+      const frame = await r2.json();
+      if (frame.no_data) continue;
+      if (!_animStruct) {
+        // Store static structure from first frame (same for all dates)
+        _animStruct = { ids: frame.ids, labels: frame.labels,
+                        parents: frame.parents, values: frame.values };
+      }
+      _animFrames.push({ date: d, colors: frame.colors,
+                         texts: frame.texts, trade_date: frame.trade_date });
+      prog.textContent = `載入 ${i + 1} / ${dates.length}…`;
+    }
+    if (!_animFrames.length) { prog.textContent = '無可用資料'; return; }
+
+    prog.textContent = `已載入 ${_animFrames.length} 天`;
+    const tl = document.getElementById('anim-timeline');
+    tl.max = _animFrames.length - 1; tl.value = 0;
+    document.getElementById('anim-playback').style.display = 'flex';
+    _animIdx = 0;
+    treemapAnimShowFrame(0);
+  } catch(e) {
+    prog.textContent = '載入失敗：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function treemapAnimShowFrame(idx) {
+  if (!_animFrames.length || !_animStruct) return;
+  idx = Math.max(0, Math.min(idx, _animFrames.length - 1));
+  _animIdx = idx;
+  const f = _animFrames[idx];
+  const el = document.getElementById('chain-treemap-anim');
+  const colorscale = [
+    [0.00,'#7f0000'],[0.20,'#c62828'],[0.35,'#ef5350'],
+    [0.45,'#ef9a9a'],[0.50,'#37474f'],
+    [0.55,'#a5d6a7'],[0.65,'#43a047'],[0.80,'#1b5e20'],[1.00,'#003300'],
+  ];
+  Plotly.react(el, [{
+    type: 'treemap', branchvalues: 'remainder',
+    ids: _animStruct.ids, labels: _animStruct.labels,
+    parents: _animStruct.parents, values: _animStruct.values,
+    text: f.texts, hovertemplate: '%{text}<extra></extra>', textinfo: 'label',
+    marker: { colors: f.colors, colorscale, cmin: -5, cmax: 5, showscale: false },
+    pathbar: { visible: false }, tiling: { pad: 2 },
+  }], {
+    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+    margin: { t: 0, r: 0, b: 0, l: 0 },
+    font: { color: '#e6edf3', size: 11 },
+  }, { responsive: true, displayModeBar: false });
+  document.getElementById('anim-date-label').textContent = f.trade_date || f.date;
+  document.getElementById('anim-timeline').value = idx;
+}
+
+function treemapAnimToggle() {
+  if (_animPlaying) {
+    clearInterval(_animTimer); _animTimer = null;
+    _animPlaying = false;
+    document.getElementById('anim-play-btn').textContent = '▶';
+  } else {
+    if (!_animFrames.length) return;
+    _animPlaying = true;
+    document.getElementById('anim-play-btn').textContent = '⏸';
+    _animTimer = setInterval(() => {
+      const next = (_animIdx + 1) % _animFrames.length;
+      treemapAnimShowFrame(next);
+    }, _animSpeed);
+  }
+}
+
+function treemapAnimRewind() {
+  if (_animPlaying) { clearInterval(_animTimer); _animPlaying = false;
+    document.getElementById('anim-play-btn').textContent = '▶'; }
+  treemapAnimShowFrame(0);
+}
+
+function treemapAnimScrub(idx) {
+  if (_animPlaying) { clearInterval(_animTimer); _animPlaying = false;
+    document.getElementById('anim-play-btn').textContent = '▶'; }
+  treemapAnimShowFrame(idx);
+}
+
+function treemapAnimSetSpeed(ms) {
+  _animSpeed = ms;
+  if (_animPlaying) {
+    clearInterval(_animTimer);
+    _animTimer = setInterval(() => {
+      treemapAnimShowFrame((_animIdx + 1) % _animFrames.length);
+    }, _animSpeed);
+  }
+}
+
+// ── Static treemap ────────────────────────────────────────────────────────
 
 function chainRenderTreemap(data) {
   const el = document.getElementById('chain-treemap');
