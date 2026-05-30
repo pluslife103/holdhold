@@ -1883,6 +1883,10 @@ def api_treemap():
         colors.append(round(ind_avg, 2))
         texts.append(f"{ind}<br>市值:{_fmt_cap_py(ind_cap)}<br>漲跌:{ind_avg:+.2f}%")
 
+    # branchvalues='total' requires root value >= sum of children
+    root_cap = sum(v for v, p in zip(values, parents) if p == "root")
+    values[0] = root_cap
+
     result = {
         "ids": ids, "labels": labels, "parents": parents,
         "values": values, "colors": colors, "texts": texts,
