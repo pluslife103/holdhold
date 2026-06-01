@@ -777,6 +777,7 @@ def _startup_tasks():
     _init_tier_grading()   # 立即從市值預分層，讓 tier 按鈕可用
     _prefetch_industry_chain()  # 預熱 cache，避免 grading 耗盡 quota 後使用者遇到 rate limit
     _run_grading()         # 背景逐支抓詳細資料（更新 grade / sparkline）
+    threading.Thread(target=_auto_scan_loop, daemon=True).start()  # 每日 06:00 TW 自動掃描
 
 
 @asynccontextmanager
@@ -1388,6 +1389,56 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
 
     with _OV_SCAN_LOCK:
         _OV_SCAN["running"] = False
+
+
+def _auto_scan_loop():
+    """每日台灣時間 06:00 自動掃描所有分層，從最大市值開始。"""
+    TW_OFFSET = timedelta(hours=8)
+    while True:
+        now_tw = datetime.utcnow() + TW_OFFSET
+        target_tw = now_tw.replace(hour=6, minute=0, second=0, microsecond=0)
+        if now_tw >= target_tw:
+            target_tw += timedelta(days=1)
+        wait_sec = (target_tw - now_tw).total_seconds()
+        print(f"[AutoScan] 下次掃描 {target_tw.strftime('%Y-%m-%d 06:00')} TW，等待 {wait_sec/3600:.1f}h")
+        time.sleep(wait_sec)
+
+        # 等 grading 就緒（最多等 10 分鐘）
+        for _ in range(120):
+            with _CLOCK:
+                ready = len(_GRADING)
+            if ready > 0:
+                break
+            time.sleep(5)
+
+        with _CLOCK:
+            stock_ids = sorted(
+                [sid for sid, g in _GRADING.items() if g.get("tier", "")],
+                key=lambda sid: TIER_ORDER.get(_GRADING.get(sid, {}).get("tier", ""), 999)
+            )
+
+        token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+        if not token:
+            print("[AutoScan] 無 FINMIND_TOKEN，跳過")
+            continue
+        if not stock_ids:
+            print("[AutoScan] 無已分層股票，跳過")
+            continue
+
+        with _OV_SCAN_LOCK:
+            if _OV_SCAN["running"]:
+                print("[AutoScan] 掃描中，跳過")
+                continue
+            _OV_SCAN.update({
+                "running": True, "done": 0, "total": len(stock_ids),
+                "error": "", "days": 15, "skip": 0, "last_err": "",
+                "started": datetime.utcnow().strftime("%H:%M") + " UTC",
+                "tier": "", "results": {},
+            })
+
+        print(f"[AutoScan] 開始自動掃描 {len(stock_ids)} 支股票（依市值大→小）")
+        threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, 15, False),
+                         daemon=True).start()
 
 
 @app.post("/api/overview_scan/start")
