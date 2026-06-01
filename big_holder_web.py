@@ -43,11 +43,14 @@ GRADE_WORKERS  = 2      # concurrent API requests — keep low to avoid OOM on R
 # ── 規模分層 & 波動等級 ────────────────────────────────────────────────────
 # 市值單位：億 NTD
 TIERS = [
-    ("mega",  10_000, "超大型", "🏢"),   # > 1 兆
-    ("large",  1_000, "大型",   "🏗"),   # 1000億–1兆
-    ("mid",      100, "中型",   "🏬"),   # 100億–1000億
-    ("small",     20, "小型",   "🏪"),   # 20億–100億
-    ("micro",      0, "微型",   "🏠"),   # < 20億
+    ("tril",  10_000, "兆",    "🌐"),   # ≥ 1 兆
+    ("b5k",    5_000, "五千億", "🏙"),   # 5000–10000億
+    ("b3k",    3_000, "三千億", "🏛"),   # 3000–5000億
+    ("b2k",    2_000, "二千億", "🏰"),   # 2000–3000億
+    ("b1k",    1_000, "千億",   "🏢"),   # 1000–2000億
+    ("b500",     500, "五百億", "🏬"),   # 500–1000億
+    ("b200",     200, "二百億", "🏗"),   # 200–500億
+    ("b100",     100, "百億",   "🏪"),   # 100–200億
 ]
 TIER_ORDER = {t[0]: i for i, t in enumerate(TIERS)}
 
@@ -303,7 +306,7 @@ def _tier_of(cap_億: float) -> str:
     for name, min_cap, *_ in TIERS:
         if cap_億 >= min_cap:
             return name
-    return "micro"
+    return ""  # 百億以下不分類
 
 
 def _assign_grades_inplace(rows: list[dict]) -> None:
@@ -2854,11 +2857,14 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
         <!-- 規模篩選 -->
         <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;align-items:center">
           <button class="gf-btn active" id="ovt-all"   onclick="ovSetTier('')">全部</button>
-          <button class="gf-btn" id="ovt-mega"  onclick="ovSetTier('mega')" >🏢 超大型<small id="ovt-cnt-mega"  style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">≥1兆</span></button>
-          <button class="gf-btn" id="ovt-large" onclick="ovSetTier('large')">🏗 大型<small   id="ovt-cnt-large" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">1000–10000億</span></button>
-          <button class="gf-btn" id="ovt-mid"   onclick="ovSetTier('mid')"  >🏬 中型<small   id="ovt-cnt-mid"   style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">100–1000億</span></button>
-          <button class="gf-btn" id="ovt-small" onclick="ovSetTier('small')">🏪 小型<small   id="ovt-cnt-small" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">20–100億</span></button>
-          <button class="gf-btn" id="ovt-micro" onclick="ovSetTier('micro')">🏠 微型<small   id="ovt-cnt-micro" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">&lt;20億</span></button>
+          <button class="gf-btn" id="ovt-tril" onclick="ovSetTier('tril')">🌐 兆<small id="ovt-cnt-tril" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">≥1兆</span></button>
+          <button class="gf-btn" id="ovt-b5k"  onclick="ovSetTier('b5k')" >🏙 五千億<small id="ovt-cnt-b5k"  style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">5000億–1兆</span></button>
+          <button class="gf-btn" id="ovt-b3k"  onclick="ovSetTier('b3k')" >🏛 三千億<small id="ovt-cnt-b3k"  style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">3000–5000億</span></button>
+          <button class="gf-btn" id="ovt-b2k"  onclick="ovSetTier('b2k')" >🏰 二千億<small id="ovt-cnt-b2k"  style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">2000–3000億</span></button>
+          <button class="gf-btn" id="ovt-b1k"  onclick="ovSetTier('b1k')" >🏢 千億<small   id="ovt-cnt-b1k"  style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">1000–2000億</span></button>
+          <button class="gf-btn" id="ovt-b500" onclick="ovSetTier('b500')">🏬 五百億<small id="ovt-cnt-b500" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">500–1000億</span></button>
+          <button class="gf-btn" id="ovt-b200" onclick="ovSetTier('b200')">🏗 二百億<small  id="ovt-cnt-b200" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">200–500億</span></button>
+          <button class="gf-btn" id="ovt-b100" onclick="ovSetTier('b100')">🏪 百億<small   id="ovt-cnt-b100" style="opacity:.6;margin-left:3px"></small><span style="font-size:9px;opacity:.5;margin-left:4px;font-weight:400">100–200億</span></button>
         </div>
         <!-- 產業類別篩選（規模選定後動態出現） -->
         <div id="ov-industry-row" style="display:none;gap:4px;flex-wrap:wrap;margin-top:6px;align-items:center">
@@ -3955,11 +3961,14 @@ async function _ovPollTick() {
 function ovSort() { if (_ovData) renderOverviewGrid(); }
 
 const OV_TIERS = [
-  { key: 'mega',  label: '超大型', icon: '🏢', range: '> 1兆'   },
-  { key: 'large', label: '大型',   icon: '🏗',  range: '> 1000億' },
-  { key: 'mid',   label: '中型',   icon: '🏬', range: '> 100億'  },
-  { key: 'small', label: '小型',   icon: '🏪', range: '> 20億'   },
-  { key: 'micro', label: '微型',   icon: '🏠', range: '< 20億'   },
+  { key: 'tril', label: '兆',    icon: '🌐', range: '≥ 1兆'       },
+  { key: 'b5k',  label: '五千億', icon: '🏙', range: '5000億–1兆'  },
+  { key: 'b3k',  label: '三千億', icon: '🏛', range: '3000–5000億' },
+  { key: 'b2k',  label: '二千億', icon: '🏰', range: '2000–3000億' },
+  { key: 'b1k',  label: '千億',   icon: '🏢', range: '1000–2000億' },
+  { key: 'b500', label: '五百億', icon: '🏬', range: '500–1000億'  },
+  { key: 'b200', label: '二百億', icon: '🏗',  range: '200–500億'   },
+  { key: 'b100', label: '百億',   icon: '🏪', range: '100–200億'   },
 ];
 
 function _ovCard(item) {
