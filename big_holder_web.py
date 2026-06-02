@@ -1392,15 +1392,15 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
 
 
 def _auto_scan_loop():
-    """每日台灣時間 06:00 自動掃描所有分層，從最大市值開始。"""
+    """每日台灣時間 01:00 自動掃描所有分層，從最大市值開始。"""
     TW_OFFSET = timedelta(hours=8)
     while True:
         now_tw = datetime.utcnow() + TW_OFFSET
-        target_tw = now_tw.replace(hour=6, minute=0, second=0, microsecond=0)
+        target_tw = now_tw.replace(hour=1, minute=0, second=0, microsecond=0)
         if now_tw >= target_tw:
             target_tw += timedelta(days=1)
         wait_sec = (target_tw - now_tw).total_seconds()
-        print(f"[AutoScan] 下次掃描 {target_tw.strftime('%Y-%m-%d 06:00')} TW，等待 {wait_sec/3600:.1f}h")
+        print(f"[AutoScan] 下次掃描 {target_tw.strftime('%Y-%m-%d 01:00')} TW，等待 {wait_sec/3600:.1f}h")
         time.sleep(wait_sec)
 
         # 等 grading 就緒（最多等 10 分鐘）
