@@ -774,6 +774,7 @@ def _prefetch_industry_chain() -> None:
 def _startup_tasks():
     """Run sequentially in a background thread: load stocks then start grading."""
     _load_stocks()
+    _load_ov_snapshot()    # 恢復上次掃描結果
     _init_tier_grading()   # 立即從市值預分層，讓 tier 按鈕可用
     _prefetch_industry_chain()  # 預熱 cache，避免 grading 耗盡 quota 後使用者遇到 rate limit
     _run_grading()         # 背景逐支抓詳細資料（更新 grade / sparkline）
@@ -1198,6 +1199,46 @@ _OV_SCAN: dict = {
     "industry": "", "skip": 0, "last_err": "",
 }
 _OV_SCAN_LOCK = threading.Lock()
+_OV_SNAPSHOT_PATH = Path(__file__).parent / "ov_scan_snapshot.json"
+
+
+def _save_ov_snapshot():
+    with _OV_SCAN_LOCK:
+        data = {
+            "saved_at": datetime.utcnow().isoformat(),
+            "days": _OV_SCAN["days"],
+            "tier": _OV_SCAN.get("tier", ""),
+            "results": _OV_SCAN["results"],
+        }
+    try:
+        _OV_SNAPSHOT_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(f"[Snapshot] 已儲存 {len(data['results'])} 支股票 → {_OV_SNAPSHOT_PATH.name}")
+    except Exception as exc:
+        print(f"[Snapshot] 儲存失敗: {exc}")
+
+
+def _load_ov_snapshot():
+    if not _OV_SNAPSHOT_PATH.exists():
+        return
+    try:
+        data = json.loads(_OV_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        results = data.get("results", {})
+        days = int(data.get("days", 15))
+        if not results:
+            return
+        with _OV_SCAN_LOCK:
+            _OV_SCAN["results"] = results
+            _OV_SCAN["days"]    = days
+            _OV_SCAN["tier"]    = data.get("tier", "")
+            _OV_SCAN["running"] = False
+            _OV_SCAN["done"]    = len(results)
+            _OV_SCAN["total"]   = len(results)
+            _OV_SCAN["started"] = data.get("saved_at", "")[:10]
+        for stock_id, item in results.items():
+            _cset(f"ov_item|{stock_id}|{days}", item)
+        print(f"[Snapshot] 已載入 {len(results)} 支股票（儲存於 {data.get('saved_at','?')[:19]}）")
+    except Exception as exc:
+        print(f"[Snapshot] 載入失敗: {exc}")
 
 
 def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
@@ -1437,8 +1478,11 @@ def _auto_scan_loop():
             })
 
         print(f"[AutoScan] 開始自動掃描 {len(stock_ids)} 支股票（依市值大→小）")
-        threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, 15, False),
-                         daemon=True).start()
+        t = threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, 15, False),
+                             daemon=True)
+        t.start()
+        t.join()  # 等掃描完成
+        _save_ov_snapshot()
 
 
 @app.post("/api/overview_scan/start")
