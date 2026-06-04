@@ -2797,8 +2797,9 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 .drawer-content{display:flex;flex-direction:column;flex:1;overflow:hidden}
 
 /* ─── BOTTOM NAV (mobile only, hidden on desktop) ─── */
-.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;height:var(--botnav-h);background:var(--sur);border-top:1px solid var(--bor);z-index:100;align-items:stretch}
-.bnav-btn{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;padding:6px;transition:.15s;position:relative}
+.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;height:var(--botnav-h);background:var(--sur);border-top:1px solid var(--bor);z-index:100;align-items:stretch;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.bottom-nav::-webkit-scrollbar{display:none}
+.bnav-btn{flex:0 0 64px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;background:none;border:none;color:var(--mut);cursor:pointer;font-size:10px;padding:6px;transition:.15s;position:relative}
 .bnav-btn svg{flex-shrink:0}
 .bnav-btn.active{color:var(--acc)}
 .bnav-btn.active svg{stroke:var(--acc)}
