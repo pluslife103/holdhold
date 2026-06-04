@@ -3384,7 +3384,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
         </div>
         <!-- Chart (fixed height) + company list (scrollable) -->
         <div id="flow-chart" style="flex:0 0 280px;border:1px solid var(--bor);border-radius:8px"></div>
-        <div id="flow-list" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:6px"></div>
+        <div id="flow-list" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:3px"></div>
       </div>
     </div>
 
@@ -6060,23 +6060,28 @@ function _flowRenderList(data) {
     const pts = (sub_series[sub] || {});
     const lastDate = Object.keys(pts).sort().pop();
     const totalCap = lastDate ? pts[lastDate] : 0;
-    const rows = companies.slice(0, 30).map(c =>
-      `<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 10px;font-size:11px;border-bottom:1px solid var(--bor)40">
+    const withCap = companies.filter(c => c.cap > 0);
+    const noCap   = companies.filter(c => !(c.cap > 0));
+    const showList = withCap.slice(0, 30);
+    const rows = showList.map(c =>
+      `<div style="display:flex;justify-content:space-between;align-items:center;padding:1px 8px;font-size:11px;border-bottom:1px solid var(--bor)30">
         <span style="color:var(--txt)">${c.id} <span style="color:var(--mut)">${c.name}</span></span>
         <span style="color:var(--mut);white-space:nowrap">${_flowFmtCap(c.cap)}</span>
       </div>`
     ).join('');
-    const more = companies.length > 30
-      ? `<div style="font-size:10px;color:var(--mut);padding:2px 10px">…共 ${companies.length} 家</div>` : '';
-    return `<details style="border:1px solid ${col}55;border-radius:7px;overflow:hidden;flex-shrink:0" open>
-      <summary style="padding:6px 10px;cursor:pointer;background:${col}15;display:flex;justify-content:space-between;align-items:center;list-style:none">
-        <span style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--txt)">
-          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${col}"></span>
+    const moreWith = withCap.length > 30
+      ? `<div style="font-size:10px;color:var(--mut);padding:1px 8px">…共 ${withCap.length} 家</div>` : '';
+    const noCapLine = noCap.length
+      ? `<div style="font-size:10px;color:var(--mut);padding:1px 8px;border-top:1px solid var(--bor)30">無資料：${noCap.map(c=>c.id).join('、')}</div>` : '';
+    return `<details style="border:1px solid ${col}55;border-radius:6px;overflow:hidden;flex-shrink:0" open>
+      <summary style="padding:4px 8px;cursor:pointer;background:${col}15;display:flex;justify-content:space-between;align-items:center;list-style:none">
+        <span style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--txt)">
+          <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${col}"></span>
           ${sub}
         </span>
         <span style="font-size:11px;color:var(--mut)">${_flowFmtCap(totalCap)} · ${companies.length}家</span>
       </summary>
-      ${rows}${more}
+      ${rows}${moreWith}${noCapLine}
     </details>`;
   }).join('');
 }
