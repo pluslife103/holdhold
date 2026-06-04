@@ -3255,7 +3255,10 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             <button class="sort-btn" id="icap-d120" onclick="icapSetDays(120)">4M</button>
             <button class="sort-btn" id="icap-d250" onclick="icapSetDays(250)">1Y</button>
           </div>
-          <button class="sort-btn active" id="icap-fetch-btn" onclick="icapFetch()" style="margin-left:auto">載入</button>
+          <div style="display:flex;gap:3px;margin-left:auto">
+            <button class="sort-btn" id="icap-norm-btn" onclick="icapToggleNorm()" title="標準化：以期初=100比較相對漲跌">標準化</button>
+            <button class="sort-btn active" id="icap-fetch-btn" onclick="icapFetch()">載入</button>
+          </div>
           <span id="icap-status" style="font-size:11px;color:var(--mut)"></span>
         </div>
         <!-- Industry toggles -->
@@ -5575,10 +5578,12 @@ function chainRenderTreemap(data) {
 }
 
 // ── 產業市值走勢 ─────────────────────────────────────────────────────────
-let _icapDays = 60;
-let _icapSel  = new Set();   // selected industry names
-let _icapInds = [];          // all available industries from chain
+let _icapDays  = 60;
+let _icapNorm  = false;      // normalized view (base=100 at first date)
+let _icapSel   = new Set();  // selected industry names
+let _icapInds  = [];         // all available industries from chain
 let _icapInited = false;
+let _icapLastData = null;    // cached last API response for re-render
 
 const ICAP_COLORS = [
   '#58a6ff','#3fb950','#f97316','#c084fc','#e879f9',
@@ -5591,6 +5596,13 @@ function icapSetDays(d) {
   [30,60,120,250].forEach(n => {
     document.getElementById(`icap-d${n}`).classList.toggle('active', n === d);
   });
+}
+
+function icapToggleNorm() {
+  _icapNorm = !_icapNorm;
+  const btn = document.getElementById('icap-norm-btn');
+  btn.classList.toggle('active', _icapNorm);
+  if (_icapLastData) _icapRenderChart(_icapLastData);
 }
 
 async function icapInit() {
@@ -5619,6 +5631,7 @@ async function icapInit() {
     if (snap.industries && snap.industries.length) {
       _icapSel = new Set(snap.industries);
       _icapRenderButtons();
+      _icapLastData = snap;
       _icapRenderChart(snap);
       const saved = snap.saved_at ? snap.saved_at.slice(0,16).replace('T',' ') + ' UTC' : '';
       icapStatus(saved ? `快照：${saved}` : '');
@@ -5651,6 +5664,7 @@ async function icapFetch() {
     const inds = Array.from(_icapSel).join(',');
     const r = await fetch(`/api/industry_cap_history?industries=${encodeURIComponent(inds)}&days=${_icapDays}`);
     const d = await r.json();
+    _icapLastData = d;
     _icapRenderChart(d);
     icapStatus('');
   } catch(e) {
@@ -5680,31 +5694,69 @@ function _icapRenderChart(data) {
   for (const ind of _icapSel) {
     const pts = series[ind];
     if (!pts) { ci++; continue; }
-    const xs = [], ys = [];
+    // collect raw series
+    const xs = [], rawY = [];
     for (const d of dates) {
-      if (pts[d] !== undefined) { xs.push(d); ys.push(pts[d]); }
+      if (pts[d] !== undefined) { xs.push(d); rawY.push(pts[d]); }
     }
+    if (!xs.length) { ci++; continue; }
+
+    let ys, hoverTpl;
+    if (_icapNorm) {
+      // find first non-zero base value
+      const base = rawY.find(v => v > 0) || 1;
+      ys = rawY.map(v => v > 0 ? (v / base) * 100 : null);
+      hoverTpl = `<b>${ind}</b><br>%{x}<br>相對值: %{y:.1f}<extra></extra>`;
+    } else {
+      ys = rawY;
+      hoverTpl = `<b>${ind}</b><br>%{x}<br>市值: %{customdata}<extra></extra>`;
+    }
+
     traces.push({
       x: xs, y: ys, name: ind, type: 'scatter', mode: 'lines',
       line: { color: ICAP_COLORS[ci % ICAP_COLORS.length], width: 2 },
-      hovertemplate: `<b>${ind}</b><br>%{x}<br>市值: %{customdata}<extra></extra>`,
-      customdata: ys.map(_icapFmtCap),
+      hovertemplate: hoverTpl,
+      customdata: _icapNorm ? undefined : rawY.map(_icapFmtCap),
     });
     ci++;
   }
 
-  const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
-    || !document.documentElement.getAttribute('data-theme');
   const bg  = getComputedStyle(document.documentElement).getPropertyValue('--sur').trim()  || '#0d1117';
   const bg2 = getComputedStyle(document.documentElement).getPropertyValue('--sur2').trim() || '#161b22';
   const txt = getComputedStyle(document.documentElement).getPropertyValue('--txt').trim()  || '#e6edf3';
   const bor = getComputedStyle(document.documentElement).getPropertyValue('--bor').trim()  || '#30363d';
 
-  const allY = traces.flatMap(t => t.y).filter(v => v > 0);
-  const yMax = allY.length ? Math.max(...allY) : 1;
-  // nice tick step
-  const mag = Math.pow(10, Math.floor(Math.log10(yMax)));
-  const step = yMax / mag > 5 ? mag : mag / 2;
+  let yAxisCfg;
+  if (_icapNorm) {
+    // Reference line at 100
+    const allNorm = traces.flatMap(t => t.y).filter(v => v != null);
+    const yMin = allNorm.length ? Math.min(...allNorm) : 80;
+    const yMax = allNorm.length ? Math.max(...allNorm) : 120;
+    const pad  = (yMax - yMin) * 0.05 || 5;
+    yAxisCfg = {
+      gridcolor: bor, linecolor: bor,
+      tickformat: '.1f', ticksuffix: '',
+      title: { text: '基期=100', font: { size: 10, color: txt } },
+      range: [yMin - pad, yMax + pad],
+      // zero-line at 100 via shape (added in layout.shapes)
+    };
+  } else {
+    const allY = traces.flatMap(t => t.y).filter(v => v > 0);
+    const yMax = allY.length ? Math.max(...allY) : 1;
+    const mag  = Math.pow(10, Math.floor(Math.log10(yMax)));
+    const step = yMax / mag > 5 ? mag : mag / 2;
+    yAxisCfg = {
+      gridcolor: bor, linecolor: bor,
+      tickformat: '.0f', dtick: step, ticksuffix: '億',
+      hoverformat: '.0f',
+    };
+  }
+
+  const shapes = _icapNorm ? [{
+    type: 'line', xref: 'paper', yref: 'y',
+    x0: 0, x1: 1, y0: 100, y1: 100,
+    line: { color: '#8b949e', width: 1, dash: 'dot' },
+  }] : [];
 
   Plotly.react('icap-chart', traces, {
     paper_bgcolor: bg, plot_bgcolor: bg,
@@ -5712,6 +5764,7 @@ function _icapRenderChart(data) {
     margin: { l: 72, r: 16, t: 20, b: 40 },
     legend: { orientation: 'h', x: 0, y: 1.06, font: { size: 11 } },
     hovermode: 'x unified',
+    shapes,
     xaxis: {
       type: 'date', gridcolor: bor, linecolor: bor,
       rangeselector: {
@@ -5725,12 +5778,7 @@ function _icapRenderChart(data) {
         ],
       },
     },
-    yaxis: {
-      gridcolor: bor, linecolor: bor,
-      tickformat: '.0f', dtick: step,
-      ticksuffix: '億',
-      hoverformat: '.0f',
-    },
+    yaxis: yAxisCfg,
   }, { responsive: true, displayModeBar: false });
 }
 </script>
