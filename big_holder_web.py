@@ -1984,6 +1984,91 @@ def api_industry_cap_history(
     return result
 
 
+@app.get("/api/chain_flow")
+def api_chain_flow(
+    industry: str = Query(""),
+    days: int = Query(60),
+):
+    """Sub-category market cap history for a single industry (supply chain view)."""
+    chain = _cget("industry_chain", ttl_h=24)
+    if not chain:
+        raise HTTPException(404, "產業鏈資料未就緒，請稍後再試")
+    industry = industry.strip()
+    sub_map = chain["industries"].get(industry)
+    if not sub_map:
+        raise HTTPException(404, f"找不到產業: {industry}")
+
+    from datetime import date as dt_date, timedelta as td
+    end_d   = dt_date.today()
+    start_d = end_d - td(days=round(days * 1.4))
+    start   = start_d.isoformat()
+    end     = end_d.isoformat()
+
+    sub_stocks: dict = {}
+    all_sids: set = set()
+    for sub_name, items in sub_map.items():
+        stocks: dict = {}
+        for s in items:
+            sid = s["id"]
+            cap = s.get("cap") or _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
+            if cap and float(cap) > 0:
+                stocks[sid] = float(cap)
+                all_sids.add(sid)
+        if stocks:
+            sub_stocks[sub_name] = stocks
+
+    def _fetch_one(sid):
+        try: return sid, _fetch_price_range(sid, start, end)
+        except Exception: return sid, {}
+
+    price_by_sid: dict = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for sid, pm in ex.map(_fetch_one, list(all_sids)):
+            price_by_sid[sid] = pm
+
+    sub_series: dict = {}
+    for sub_name, stocks in sub_stocks.items():
+        date_total: dict = {}
+        for sid, cap_cur in stocks.items():
+            pm = price_by_sid.get(sid, {})
+            closes = {d: v["close"] for d, v in pm.items() if v.get("close", 0) > 0}
+            if not closes:
+                continue
+            price_now = closes[max(closes)]
+            if price_now <= 0:
+                continue
+            for d, price_d in closes.items():
+                if d < start or d > end:
+                    continue
+                date_total[d] = date_total.get(d, 0.0) + cap_cur * (price_d / price_now)
+        if date_total:
+            sub_series[sub_name] = dict(sorted(date_total.items()))
+
+    all_dates = sorted({d for dc in sub_series.values() for d in dc})
+
+    sub_companies: dict = {}
+    for sub_name, items in sub_map.items():
+        companies = []
+        for s in items:
+            cap = s.get("cap") or _STOCK_MCAP.get(s["id"])
+            companies.append({"id": s["id"], "name": s.get("name", ""), "cap": cap})
+        sub_companies[sub_name] = sorted(companies, key=lambda x: -(x["cap"] or 0))
+
+    # Sort subs by total current cap descending
+    subs_sorted = sorted(
+        sub_series.keys(),
+        key=lambda s: -(sum(sub_stocks.get(s, {}).values())),
+    )
+
+    return {
+        "industry": industry,
+        "sub_series": sub_series,
+        "sub_companies": sub_companies,
+        "dates": all_dates,
+        "subs": subs_sorted,
+    }
+
+
 def _fmt_cap_py(cap: float | None) -> str:
     if not cap or cap <= 0:
         return "—"
@@ -2835,6 +2920,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
       <div class="tab" onclick="switchTab('kline')">📈 K線分析</div>
       <div class="tab" onclick="switchTab('chain')">🏭 產業鏈</div>
+      <div class="tab" onclick="switchTab('flow')">🔗 傳導鏈</div>
       <div class="tab" onclick="switchTab('indcap')">📊 產業市值</div>
     </div>
 
@@ -3279,6 +3365,28 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
+    <!-- ── 傳導鏈 pane ── -->
+    <div class="pane" id="pane-flow">
+      <div style="padding:10px 14px;display:flex;flex-direction:column;gap:8px;height:100%;overflow:hidden">
+        <!-- Controls -->
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0">
+          <select id="flow-ind-sel" onchange="flowFetch()" style="font-size:12px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 8px;border-radius:5px;max-width:160px">
+            <option value="">選擇產業…</option>
+          </select>
+          <div style="display:flex;gap:3px">
+            <button class="sort-btn" id="flow-d30"  onclick="flowSetDays(30)">1M</button>
+            <button class="sort-btn active" id="flow-d60" onclick="flowSetDays(60)">2M</button>
+            <button class="sort-btn" id="flow-d120" onclick="flowSetDays(120)">4M</button>
+          </div>
+          <button class="sort-btn active" id="flow-norm-btn" onclick="flowToggleNorm()" title="標準化：以期初=100比較相對漲跌">標準化</button>
+          <span id="flow-status" style="font-size:11px;color:var(--mut)"></span>
+        </div>
+        <!-- Chart (fixed height) + company list (scrollable) -->
+        <div id="flow-chart" style="flex:0 0 280px;border:1px solid var(--bor);border-radius:8px"></div>
+        <div id="flow-list" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:6px"></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -3336,6 +3444,14 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <path d="M5 8v3M5 11h14M19 11V8M12 8v3"/><rect x="9" y="14" width="6" height="5" rx="1"/>
     </svg>
     <span>產業鏈</span>
+  </button>
+  <button class="bnav-btn" id="bnav-flow" onclick="switchTab('flow')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M4 12h4M12 6v4M12 14v4M16 12h4"/><circle cx="12" cy="12" r="2"/>
+      <circle cx="4" cy="12" r="2"/><circle cx="20" cy="12" r="2"/>
+      <circle cx="12" cy="4" r="2"/><circle cx="12" cy="20" r="2"/>
+    </svg>
+    <span>傳導鏈</span>
   </button>
   <button class="bnav-btn" id="bnav-indcap" onclick="switchTab('indcap')">
     <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
@@ -3793,7 +3909,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview','kline','chain','indcap'];
+  const tabNames = ['single','compare','grade','broker','overview','kline','chain','flow','indcap'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -3827,6 +3943,7 @@ function switchTab(name) {
     _ovStartPoll();  // auto-load snapshot or resume in-progress scan
   }
   if (name === 'chain') chainLoad();
+  if (name === 'flow') flowInit();
   if (name === 'indcap') icapInit();
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
@@ -5788,6 +5905,179 @@ function _icapRenderChart(data) {
     },
     yaxis: yAxisCfg,
   }, { responsive: true, displayModeBar: false });
+}
+
+// ── 傳導鏈 ─────────────────────────────────────────────────────────────────
+let _flowDays   = 60;
+let _flowNorm   = true;
+let _flowData   = null;
+let _flowInited = false;
+
+const FLOW_COLORS = [
+  '#f97316','#58a6ff','#3fb950','#c084fc','#fb7185',
+  '#34d399','#facc15','#38bdf8','#a78bfa','#e879f9',
+  '#f43f5e','#22d3ee','#84cc16','#fbbf24','#60a5fa',
+];
+
+function _flowFmtCap(v) {
+  if (!v || v <= 0) return '-';
+  if (v >= 1e4) return (v/1e4).toFixed(1) + '兆';
+  if (v >= 1e3) return (v/1e3).toFixed(1) + '千億';
+  return Math.round(v) + '億';
+}
+
+async function flowInit() {
+  if (_flowInited) return;
+  _flowInited = true;
+  const sel = document.getElementById('flow-ind-sel');
+  try {
+    const r = await fetch('/api/industry_chain');
+    if (!r.ok) return;
+    const d = await r.json();
+    (d.industry_list || []).forEach(ind => {
+      const opt = document.createElement('option');
+      opt.value = ind; opt.textContent = ind;
+      sel.appendChild(opt);
+    });
+  } catch(e) { /* silently ignore */ }
+}
+
+function flowSetDays(d) {
+  _flowDays = d;
+  [30, 60, 120].forEach(x => {
+    const btn = document.getElementById('flow-d' + x);
+    if (btn) btn.classList.toggle('active', x === d);
+  });
+  if (_flowData) flowFetch();
+}
+
+function flowToggleNorm() {
+  _flowNorm = !_flowNorm;
+  document.getElementById('flow-norm-btn').classList.toggle('active', _flowNorm);
+  if (_flowData) _flowRenderChart(_flowData);
+}
+
+async function flowFetch() {
+  const ind = document.getElementById('flow-ind-sel').value;
+  if (!ind) { document.getElementById('flow-status').textContent = '請先選擇產業'; return; }
+  const status = document.getElementById('flow-status');
+  status.textContent = '載入中…';
+  try {
+    const r = await fetch(`/api/chain_flow?industry=${encodeURIComponent(ind)}&days=${_flowDays}`);
+    if (!r.ok) {
+      const t = await r.text();
+      status.textContent = '失敗: ' + (JSON.parse(t)?.detail || r.status);
+      return;
+    }
+    _flowData = await r.json();
+    const nd = _flowData.dates ? _flowData.dates.length : 0;
+    const ns = _flowData.subs ? _flowData.subs.length : 0;
+    status.textContent = `${ns} 個子類 · ${nd} 個交易日`;
+    _flowRenderChart(_flowData);
+    _flowRenderList(_flowData);
+  } catch(e) {
+    status.textContent = '錯誤: ' + e.message;
+  }
+}
+
+function _flowRenderChart(data) {
+  const { sub_series, dates, subs } = data;
+  if (!subs || !subs.length) return;
+  const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+  const bg = isDark ? '#0d1117' : '#ffffff';
+  const txt = isDark ? '#e6edf3' : '#1f2328';
+  const bor = isDark ? '#30363d' : '#d0d7de';
+
+  const traces = [];
+  subs.forEach((sub, ci) => {
+    const pts = sub_series[sub] || {};
+    const xs = [], rawY = [];
+    (dates || []).forEach(d => { if (pts[d] !== undefined) { xs.push(d); rawY.push(pts[d]); } });
+    if (!xs.length) return;
+    let ys, hoverTpl;
+    if (_flowNorm) {
+      const base = rawY.find(v => v > 0) || 1;
+      ys = rawY.map(v => v > 0 ? (v / base) * 100 : null);
+      hoverTpl = `<b>${sub}</b><br>%{x}<br>相對值: %{y:.1f}<extra></extra>`;
+    } else {
+      ys = rawY;
+      hoverTpl = `<b>${sub}</b><br>%{x}<br>市值: %{customdata}<extra></extra>`;
+    }
+    traces.push({
+      x: xs, y: ys, name: sub, type: 'scatter', mode: 'lines',
+      line: { color: FLOW_COLORS[ci % FLOW_COLORS.length], width: 2 },
+      hovertemplate: hoverTpl,
+      customdata: _flowNorm ? undefined : rawY.map(_flowFmtCap),
+    });
+  });
+
+  let yAxisCfg;
+  if (_flowNorm) {
+    const allY = traces.flatMap(t => t.y).filter(v => v != null);
+    const yMin = allY.length ? Math.min(...allY) : 80;
+    const yMax = allY.length ? Math.max(...allY) : 120;
+    const pad  = (yMax - yMin) * 0.05 || 5;
+    yAxisCfg = {
+      gridcolor: bor, linecolor: bor,
+      tickformat: '.1f',
+      title: { text: '基期=100', font: { size: 10, color: txt } },
+      range: [yMin - pad, yMax + pad],
+    };
+  } else {
+    yAxisCfg = { gridcolor: bor, linecolor: bor, ticksuffix: '億', hoverformat: '.0f' };
+  }
+
+  const shapes = _flowNorm ? [{
+    type: 'line', xref: 'paper', yref: 'y',
+    x0: 0, x1: 1, y0: 100, y1: 100,
+    line: { color: '#8b949e', width: 1, dash: 'dot' },
+  }] : [];
+
+  Plotly.react('flow-chart', traces, {
+    paper_bgcolor: bg, plot_bgcolor: bg,
+    font: { color: txt, size: 11 },
+    margin: { l: 56, r: 16, t: 10, b: 36 },
+    xaxis: { gridcolor: bor, linecolor: bor, showgrid: true },
+    yaxis: yAxisCfg,
+    legend: { font: { size: 10 }, bgcolor: 'rgba(0,0,0,0)', bordercolor: bor, borderwidth: 1 },
+    hovermode: 'x unified',
+    shapes,
+  }, { responsive: true, displayModeBar: false });
+}
+
+function _flowRenderList(data) {
+  const { sub_companies, subs, sub_series } = data;
+  const listEl = document.getElementById('flow-list');
+  if (!subs || !subs.length) {
+    listEl.innerHTML = '<div style="color:var(--mut);font-size:12px">無子類資料</div>';
+    return;
+  }
+  listEl.innerHTML = subs.map((sub, ci) => {
+    const companies = (sub_companies[sub] || []);
+    const col = FLOW_COLORS[ci % FLOW_COLORS.length];
+    // sub-cap total
+    const pts = (sub_series[sub] || {});
+    const lastDate = Object.keys(pts).sort().pop();
+    const totalCap = lastDate ? pts[lastDate] : 0;
+    const rows = companies.slice(0, 30).map(c =>
+      `<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 10px;font-size:11px;border-bottom:1px solid var(--bor)40">
+        <span style="color:var(--txt)">${c.id} <span style="color:var(--mut)">${c.name}</span></span>
+        <span style="color:var(--mut);white-space:nowrap">${_flowFmtCap(c.cap)}</span>
+      </div>`
+    ).join('');
+    const more = companies.length > 30
+      ? `<div style="font-size:10px;color:var(--mut);padding:2px 10px">…共 ${companies.length} 家</div>` : '';
+    return `<details style="border:1px solid ${col}55;border-radius:7px;overflow:hidden;flex-shrink:0" open>
+      <summary style="padding:6px 10px;cursor:pointer;background:${col}15;display:flex;justify-content:space-between;align-items:center;list-style:none">
+        <span style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--txt)">
+          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${col}"></span>
+          ${sub}
+        </span>
+        <span style="font-size:11px;color:var(--mut)">${_flowFmtCap(totalCap)} · ${companies.length}家</span>
+      </summary>
+      ${rows}${more}
+    </details>`;
+  }).join('');
 }
 </script>
 </body>
