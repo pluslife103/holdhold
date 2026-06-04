@@ -1845,6 +1845,78 @@ def api_industry_chain():
     return result
 
 
+@app.get("/api/industry_cap_history")
+def api_industry_cap_history(
+    industries: str = Query(""),
+    days: int = Query(60),
+):
+    """Historical total market cap per industry for multi-line comparison chart."""
+    chain = _cget("industry_chain", ttl_h=24)
+    if not chain:
+        raise HTTPException(404, "產業鏈資料未就緒，請稍後再試")
+
+    ind_names = [n.strip() for n in industries.split(",") if n.strip()]
+    if not ind_names:
+        ind_names = chain["industry_list"][:8]
+
+    from datetime import date as dt_date, timedelta as td
+    end_d   = dt_date.today()
+    start_d = end_d - td(days=round(days * 1.4))
+    start   = start_d.isoformat()
+    end     = end_d.isoformat()
+
+    all_industries = chain["industries"]
+
+    # Build per-industry stock→cap mapping
+    ind_stocks: dict = {}  # {ind: {sid: cap_億}}
+    all_sids: set = set()
+    for ind in ind_names:
+        subs = all_industries.get(ind, {})
+        stocks: dict = {}
+        for sub_items in subs.values():
+            for s in sub_items:
+                sid = s["id"]
+                cap = s.get("cap") or _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
+                if cap and float(cap) > 0:
+                    stocks[sid] = float(cap)
+                    all_sids.add(sid)
+        ind_stocks[ind] = stocks
+
+    # Fetch all needed price ranges in parallel
+    def _fetch_one(sid):
+        try:
+            return sid, _fetch_price_range(sid, start, end)
+        except Exception:
+            return sid, {}
+
+    price_by_sid: dict = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for sid, pm in ex.map(_fetch_one, list(all_sids)):
+            price_by_sid[sid] = pm
+
+    # Compute historical industry market cap totals
+    series: dict = {}
+    for ind in ind_names:
+        date_total: dict = {}
+        for sid, cap_cur in ind_stocks[ind].items():
+            pm = price_by_sid.get(sid, {})
+            closes = {d: v["close"] for d, v in pm.items() if v.get("close", 0) > 0}
+            if not closes:
+                continue
+            price_now = closes[max(closes)]
+            if price_now <= 0:
+                continue
+            for d, price_d in closes.items():
+                if d < start or d > end:
+                    continue
+                date_total[d] = date_total.get(d, 0.0) + cap_cur * (price_d / price_now)
+        if date_total:
+            series[ind] = dict(sorted(date_total.items()))
+
+    all_dates = sorted({d for dc in series.values() for d in dc})
+    return {"series": series, "dates": all_dates, "industries": list(series.keys())}
+
+
 def _fmt_cap_py(cap: float | None) -> str:
     if not cap or cap <= 0:
         return "—"
@@ -2696,6 +2768,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
       <div class="tab" onclick="switchTab('kline')">📈 K線分析</div>
       <div class="tab" onclick="switchTab('chain')">🏭 產業鏈</div>
+      <div class="tab" onclick="switchTab('indcap')">📊 產業市值</div>
     </div>
 
     <!-- 個股 pane -->
@@ -3112,6 +3185,30 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
+    <!-- ── 產業市值 ── -->
+    <div class="pane" id="pane-indcap">
+      <div style="padding:10px 14px;display:flex;flex-direction:column;gap:8px;height:100%;overflow:hidden">
+        <!-- Controls -->
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0">
+          <span style="font-size:12px;color:var(--mut)">區間</span>
+          <div style="display:flex;gap:3px">
+            <button class="sort-btn" id="icap-d30"  onclick="icapSetDays(30)">1M</button>
+            <button class="sort-btn active" id="icap-d60" onclick="icapSetDays(60)">2M</button>
+            <button class="sort-btn" id="icap-d120" onclick="icapSetDays(120)">4M</button>
+            <button class="sort-btn" id="icap-d250" onclick="icapSetDays(250)">1Y</button>
+          </div>
+          <button class="sort-btn active" id="icap-fetch-btn" onclick="icapFetch()" style="margin-left:auto">載入</button>
+          <span id="icap-status" style="font-size:11px;color:var(--mut)"></span>
+        </div>
+        <!-- Industry toggles -->
+        <div id="icap-ind-btns" style="display:flex;gap:5px;flex-wrap:wrap;flex-shrink:0;padding:4px 0">
+          <span style="font-size:12px;color:var(--mut);align-self:center">載入產業中…</span>
+        </div>
+        <!-- Chart -->
+        <div id="icap-chart" style="flex:1;min-height:0;border:1px solid var(--bor);border-radius:8px"></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -3169,6 +3266,12 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <path d="M5 8v3M5 11h14M19 11V8M12 8v3"/><rect x="9" y="14" width="6" height="5" rx="1"/>
     </svg>
     <span>產業鏈</span>
+  </button>
+  <button class="bnav-btn" id="bnav-indcap" onclick="switchTab('indcap')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 4-6"/>
+    </svg>
+    <span>產業</span>
   </button>
 </nav>
 
@@ -3620,7 +3723,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview','kline','chain'];
+  const tabNames = ['single','compare','grade','broker','overview','kline','chain','indcap'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -3655,6 +3758,7 @@ function switchTab(name) {
     // no auto-scan: user picks tier first
   }
   if (name === 'chain') chainLoad();
+  if (name === 'indcap') icapInit();
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
 
@@ -5410,6 +5514,149 @@ function chainRenderTreemap(data) {
       chainGoStock(sid);
     }
   });
+}
+
+// ── 產業市值走勢 ─────────────────────────────────────────────────────────
+let _icapDays = 60;
+let _icapSel  = new Set();   // selected industry names
+let _icapInds = [];          // all available industries from chain
+let _icapInited = false;
+
+const ICAP_COLORS = [
+  '#58a6ff','#3fb950','#f97316','#c084fc','#e879f9',
+  '#34d399','#facc15','#fb7185','#38bdf8','#a78bfa',
+  '#f472b6','#4ade80','#fb923c','#818cf8','#2dd4bf',
+];
+
+function icapSetDays(d) {
+  _icapDays = d;
+  [30,60,120,250].forEach(n => {
+    document.getElementById(`icap-d${n}`).classList.toggle('active', n === d);
+  });
+}
+
+async function icapInit() {
+  if (_icapInited) return;
+  _icapInited = true;
+  try {
+    const r = await fetch('/api/industry_chain');
+    const d = await r.json();
+    _icapInds = d.industry_list || [];
+    // default: select top 6 by stock count
+    _icapSel = new Set(_icapInds.slice(0, 6));
+    _icapRenderButtons();
+  } catch(e) {
+    document.getElementById('icap-ind-btns').innerHTML =
+      '<span style="color:var(--mut);font-size:12px">載入失敗，請重試</span>';
+  }
+}
+
+function _icapRenderButtons() {
+  const wrap = document.getElementById('icap-ind-btns');
+  wrap.innerHTML = _icapInds.map((ind, i) => {
+    const on = _icapSel.has(ind);
+    const col = ICAP_COLORS[i % ICAP_COLORS.length];
+    return `<button class="sort-btn${on?' active':''}"
+      style="${on?`border-color:${col};color:${col}`:''}; font-size:11px; padding:3px 9px"
+      onclick="icapToggle(${JSON.stringify(ind)},${i})">${ind}</button>`;
+  }).join('');
+}
+
+function icapToggle(ind, idx) {
+  if (_icapSel.has(ind)) { _icapSel.delete(ind); } else { _icapSel.add(ind); }
+  _icapRenderButtons();
+}
+
+async function icapFetch() {
+  if (!_icapSel.size) { icapStatus('請先選擇至少一個產業'); return; }
+  const btn = document.getElementById('icap-fetch-btn');
+  btn.disabled = true;
+  icapStatus('載入中…');
+  try {
+    const inds = Array.from(_icapSel).join(',');
+    const r = await fetch(`/api/industry_cap_history?industries=${encodeURIComponent(inds)}&days=${_icapDays}`);
+    const d = await r.json();
+    _icapRenderChart(d);
+    icapStatus('');
+  } catch(e) {
+    icapStatus('載入失敗');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function icapStatus(msg) {
+  document.getElementById('icap-status').textContent = msg;
+}
+
+function _icapFmtCap(v) {
+  if (v >= 1e4)  return (v/1e4).toFixed(1) + '兆';
+  if (v >= 1e3)  return (v/1e3).toFixed(1) + '千億';
+  if (v >= 100)  return (v/100).toFixed(1) + '百億';
+  return v.toFixed(0) + '億';
+}
+
+function _icapRenderChart(data) {
+  const { series, dates } = data;
+  if (!dates || !dates.length) { icapStatus('無資料'); return; }
+
+  const traces = [];
+  let ci = 0;
+  for (const ind of _icapSel) {
+    const pts = series[ind];
+    if (!pts) { ci++; continue; }
+    const xs = [], ys = [];
+    for (const d of dates) {
+      if (pts[d] !== undefined) { xs.push(d); ys.push(pts[d]); }
+    }
+    traces.push({
+      x: xs, y: ys, name: ind, type: 'scatter', mode: 'lines',
+      line: { color: ICAP_COLORS[ci % ICAP_COLORS.length], width: 2 },
+      hovertemplate: `<b>${ind}</b><br>%{x}<br>市值: %{customdata}<extra></extra>`,
+      customdata: ys.map(_icapFmtCap),
+    });
+    ci++;
+  }
+
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    || !document.documentElement.getAttribute('data-theme');
+  const bg  = getComputedStyle(document.documentElement).getPropertyValue('--sur').trim()  || '#0d1117';
+  const bg2 = getComputedStyle(document.documentElement).getPropertyValue('--sur2').trim() || '#161b22';
+  const txt = getComputedStyle(document.documentElement).getPropertyValue('--txt').trim()  || '#e6edf3';
+  const bor = getComputedStyle(document.documentElement).getPropertyValue('--bor').trim()  || '#30363d';
+
+  const allY = traces.flatMap(t => t.y).filter(v => v > 0);
+  const yMax = allY.length ? Math.max(...allY) : 1;
+  // nice tick step
+  const mag = Math.pow(10, Math.floor(Math.log10(yMax)));
+  const step = yMax / mag > 5 ? mag : mag / 2;
+
+  Plotly.react('icap-chart', traces, {
+    paper_bgcolor: bg, plot_bgcolor: bg,
+    font: { color: txt, size: 11 },
+    margin: { l: 72, r: 16, t: 20, b: 40 },
+    legend: { orientation: 'h', x: 0, y: 1.06, font: { size: 11 } },
+    hovermode: 'x unified',
+    xaxis: {
+      type: 'date', gridcolor: bor, linecolor: bor,
+      rangeselector: {
+        bgcolor: bg2, bordercolor: bor, activecolor: '#58a6ff',
+        font: { size: 11, color: txt },
+        buttons: [
+          { count:1, label:'1M', step:'month', stepmode:'backward' },
+          { count:3, label:'3M', step:'month', stepmode:'backward' },
+          { count:6, label:'6M', step:'month', stepmode:'backward' },
+          { step:'all', label:'全部' },
+        ],
+      },
+    },
+    yaxis: {
+      gridcolor: bor, linecolor: bor,
+      tickformat: '.0f', dtick: step,
+      ticksuffix: '億',
+      hoverformat: '.0f',
+    },
+  }, { responsive: true, displayModeBar: false });
 }
 </script>
 </body>
