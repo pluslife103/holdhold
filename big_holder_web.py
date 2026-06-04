@@ -774,7 +774,8 @@ def _prefetch_industry_chain() -> None:
 def _startup_tasks():
     """Run sequentially in a background thread: load stocks then start grading."""
     _load_stocks()
-    _load_ov_snapshot()    # 恢復上次掃描結果
+    _load_ov_snapshot()       # 恢復大戶總覽掃描結果
+    _load_indcap_snapshot()   # 恢復產業市值走勢快照
     _init_tier_grading()   # 立即從市值預分層，讓 tier 按鈕可用
     _prefetch_industry_chain()  # 預熱 cache，避免 grading 耗盡 quota 後使用者遇到 rate limit
     _run_grading()         # 背景逐支抓詳細資料（更新 grade / sparkline）
@@ -1484,6 +1485,18 @@ def _auto_scan_loop():
         t.join()  # 等掃描完成
         _save_ov_snapshot()
 
+        # 產業市值走勢掃描
+        chain = _cget("industry_chain", ttl_h=24)
+        if chain:
+            all_inds = chain.get("industry_list", [])
+            print(f"[IndCap] 開始掃描 {len(all_inds)} 個產業市值走勢")
+            try:
+                result = _compute_industry_cap_history(all_inds, days=60)
+                if result:
+                    _save_indcap_snapshot(result)
+            except Exception as exc:
+                print(f"[IndCap] 掃描失敗: {exc}")
+
 
 @app.post("/api/overview_scan/start")
 def api_ov_scan_start(
@@ -1845,35 +1858,28 @@ def api_industry_chain():
     return result
 
 
-@app.get("/api/industry_cap_history")
-def api_industry_cap_history(
-    industries: str = Query(""),
-    days: int = Query(60),
-):
-    """Historical total market cap per industry for multi-line comparison chart."""
+_INDCAP_SNAPSHOT_PATH = Path(__file__).parent / "indcap_snapshot.json"
+_INDCAP_SNAPSHOT: dict = {}   # 最新一次掃描結果（記憶體快取）
+_INDCAP_LOCK = threading.Lock()
+
+
+def _compute_industry_cap_history(ind_names: list, days: int) -> dict:
+    """Core logic: compute historical market cap series for given industries."""
+    from datetime import date as dt_date, timedelta as td
     chain = _cget("industry_chain", ttl_h=24)
     if not chain:
-        raise HTTPException(404, "產業鏈資料未就緒，請稍後再試")
-
-    ind_names = [n.strip() for n in industries.split(",") if n.strip()]
-    if not ind_names:
-        ind_names = chain["industry_list"][:8]
-
-    from datetime import date as dt_date, timedelta as td
+        return {}
     end_d   = dt_date.today()
     start_d = end_d - td(days=round(days * 1.4))
     start   = start_d.isoformat()
     end     = end_d.isoformat()
 
     all_industries = chain["industries"]
-
-    # Build per-industry stock→cap mapping
-    ind_stocks: dict = {}  # {ind: {sid: cap_億}}
+    ind_stocks: dict = {}
     all_sids: set = set()
     for ind in ind_names:
-        subs = all_industries.get(ind, {})
         stocks: dict = {}
-        for sub_items in subs.values():
+        for sub_items in all_industries.get(ind, {}).values():
             for s in sub_items:
                 sid = s["id"]
                 cap = s.get("cap") or _STOCK_MCAP.get(sid) or (_GRADING.get(sid) or {}).get("market_cap_億")
@@ -1882,7 +1888,6 @@ def api_industry_cap_history(
                     all_sids.add(sid)
         ind_stocks[ind] = stocks
 
-    # Fetch all needed price ranges in parallel
     def _fetch_one(sid):
         try:
             return sid, _fetch_price_range(sid, start, end)
@@ -1894,7 +1899,6 @@ def api_industry_cap_history(
         for sid, pm in ex.map(_fetch_one, list(all_sids)):
             price_by_sid[sid] = pm
 
-    # Compute historical industry market cap totals
     series: dict = {}
     for ind in ind_names:
         date_total: dict = {}
@@ -1915,6 +1919,60 @@ def api_industry_cap_history(
 
     all_dates = sorted({d for dc in series.values() for d in dc})
     return {"series": series, "dates": all_dates, "industries": list(series.keys())}
+
+
+def _save_indcap_snapshot(data: dict):
+    payload = dict(data)
+    payload["saved_at"] = datetime.utcnow().isoformat()
+    try:
+        _INDCAP_SNAPSHOT_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        with _INDCAP_LOCK:
+            _INDCAP_SNAPSHOT.clear()
+            _INDCAP_SNAPSHOT.update(payload)
+        print(f"[IndCap] snapshot saved: {len(data.get('industries', []))} 產業 → {_INDCAP_SNAPSHOT_PATH.name}")
+    except Exception as exc:
+        print(f"[IndCap] snapshot save error: {exc}")
+
+
+def _load_indcap_snapshot():
+    if not _INDCAP_SNAPSHOT_PATH.exists():
+        return
+    try:
+        data = json.loads(_INDCAP_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        with _INDCAP_LOCK:
+            _INDCAP_SNAPSHOT.clear()
+            _INDCAP_SNAPSHOT.update(data)
+        print(f"[IndCap] snapshot loaded: {len(data.get('industries', []))} 產業（{data.get('saved_at','?')[:10]}）")
+    except Exception as exc:
+        print(f"[IndCap] snapshot load error: {exc}")
+
+
+@app.get("/api/industry_cap_snapshot")
+def api_industry_cap_snapshot():
+    """Return the last saved industry cap snapshot (fast, no recompute)."""
+    with _INDCAP_LOCK:
+        snap = dict(_INDCAP_SNAPSHOT)
+    if not snap:
+        raise HTTPException(404, "尚無快照，請等待每日自動掃描或手動載入")
+    return snap
+
+
+@app.get("/api/industry_cap_history")
+def api_industry_cap_history(
+    industries: str = Query(""),
+    days: int = Query(60),
+):
+    """Historical total market cap per industry for multi-line comparison chart."""
+    chain = _cget("industry_chain", ttl_h=24)
+    if not chain:
+        raise HTTPException(404, "產業鏈資料未就緒，請稍後再試")
+    ind_names = [n.strip() for n in industries.split(",") if n.strip()]
+    if not ind_names:
+        ind_names = chain["industry_list"]
+    result = _compute_industry_cap_history(ind_names, days)
+    if not result:
+        raise HTTPException(404, "產業鏈資料未就緒，請稍後再試")
+    return result
 
 
 def _fmt_cap_py(cap: float | None) -> str:
@@ -5538,16 +5596,33 @@ function icapSetDays(d) {
 async function icapInit() {
   if (_icapInited) return;
   _icapInited = true;
-  try {
-    const r = await fetch('/api/industry_chain');
-    const d = await r.json();
+
+  // Load industry list and snapshot in parallel
+  const [chainRes, snapRes] = await Promise.allSettled([
+    fetch('/api/industry_chain'),
+    fetch('/api/industry_cap_snapshot'),
+  ]);
+
+  if (chainRes.status === 'fulfilled' && chainRes.value.ok) {
+    const d = await chainRes.value.json();
     _icapInds = d.industry_list || [];
-    // default: select top 6 by stock count
-    _icapSel = new Set(_icapInds.slice(0, 6));
+    _icapSel  = new Set(_icapInds.slice(0, 6));
     _icapRenderButtons();
-  } catch(e) {
+  } else {
     document.getElementById('icap-ind-btns').innerHTML =
       '<span style="color:var(--mut);font-size:12px">載入失敗，請重試</span>';
+  }
+
+  // Show snapshot immediately if available
+  if (snapRes.status === 'fulfilled' && snapRes.value.ok) {
+    const snap = await snapRes.value.json();
+    if (snap.industries && snap.industries.length) {
+      _icapSel = new Set(snap.industries);
+      _icapRenderButtons();
+      _icapRenderChart(snap);
+      const saved = snap.saved_at ? snap.saved_at.slice(0,16).replace('T',' ') + ' UTC' : '';
+      icapStatus(saved ? `快照：${saved}` : '');
+    }
   }
 }
 
