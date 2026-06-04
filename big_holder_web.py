@@ -1433,9 +1433,69 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
         _OV_SCAN["running"] = False
 
 
+def _run_auto_scan_once(label: str = "AutoScan"):
+    """執行一次完整的大戶掃描 + 產業市值掃描並儲存快照。在背景 thread 呼叫。"""
+    # 等 grading 就緒（最多等 15 分鐘）
+    for _ in range(180):
+        with _CLOCK:
+            ready = len(_GRADING)
+        if ready > 0:
+            break
+        time.sleep(5)
+
+    with _CLOCK:
+        stock_ids = sorted(
+            [sid for sid, g in _GRADING.items() if g.get("tier", "")],
+            key=lambda sid: TIER_ORDER.get(_GRADING.get(sid, {}).get("tier", ""), 999)
+        )
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        print(f"[{label}] 無 FINMIND_TOKEN，跳過")
+        return
+    if not stock_ids:
+        print(f"[{label}] 無已分層股票，跳過")
+        return
+
+    with _OV_SCAN_LOCK:
+        if _OV_SCAN["running"]:
+            print(f"[{label}] 掃描中，跳過")
+            return
+        _OV_SCAN.update({
+            "running": True, "done": 0, "total": len(stock_ids),
+            "error": "", "days": 15, "skip": 0, "last_err": "",
+            "started": datetime.utcnow().strftime("%H:%M") + " UTC",
+            "tier": "", "results": {},
+        })
+
+    print(f"[{label}] 開始掃描 {len(stock_ids)} 支股票（依市值大→小）")
+    t = threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, 15, False), daemon=True)
+    t.start()
+    t.join()
+    _save_ov_snapshot()
+
+    # 產業市值走勢掃描
+    chain = _cget("industry_chain", ttl_h=24)
+    if chain:
+        all_inds = chain.get("industry_list", [])
+        print(f"[{label}/IndCap] 開始掃描 {len(all_inds)} 個產業市值走勢")
+        try:
+            result = _compute_industry_cap_history(all_inds, days=60)
+            if result:
+                _save_indcap_snapshot(result)
+        except Exception as exc:
+            print(f"[{label}/IndCap] 掃描失敗: {exc}")
+
+
 def _auto_scan_loop():
-    """每日台灣時間 01:00 自動掃描所有分層，從最大市值開始。"""
+    """每日台灣時間 01:00 自動掃描；若無快照（如 redeploy 後）則啟動後立即補跑一次。"""
     TW_OFFSET = timedelta(hours=8)
+
+    # redeploy 後快照消失，立即補跑一次（在背景不阻塞其他啟動任務）
+    if not _OV_SNAPSHOT_PATH.exists():
+        print("[AutoScan] 無快照，啟動後立即補跑掃描...")
+        _run_auto_scan_once("StartupScan")
+
     while True:
         now_tw = datetime.utcnow() + TW_OFFSET
         target_tw = now_tw.replace(hour=1, minute=0, second=0, microsecond=0)
@@ -1444,58 +1504,7 @@ def _auto_scan_loop():
         wait_sec = (target_tw - now_tw).total_seconds()
         print(f"[AutoScan] 下次掃描 {target_tw.strftime('%Y-%m-%d 01:00')} TW，等待 {wait_sec/3600:.1f}h")
         time.sleep(wait_sec)
-
-        # 等 grading 就緒（最多等 10 分鐘）
-        for _ in range(120):
-            with _CLOCK:
-                ready = len(_GRADING)
-            if ready > 0:
-                break
-            time.sleep(5)
-
-        with _CLOCK:
-            stock_ids = sorted(
-                [sid for sid, g in _GRADING.items() if g.get("tier", "")],
-                key=lambda sid: TIER_ORDER.get(_GRADING.get(sid, {}).get("tier", ""), 999)
-            )
-
-        token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
-        if not token:
-            print("[AutoScan] 無 FINMIND_TOKEN，跳過")
-            continue
-        if not stock_ids:
-            print("[AutoScan] 無已分層股票，跳過")
-            continue
-
-        with _OV_SCAN_LOCK:
-            if _OV_SCAN["running"]:
-                print("[AutoScan] 掃描中，跳過")
-                continue
-            _OV_SCAN.update({
-                "running": True, "done": 0, "total": len(stock_ids),
-                "error": "", "days": 15, "skip": 0, "last_err": "",
-                "started": datetime.utcnow().strftime("%H:%M") + " UTC",
-                "tier": "", "results": {},
-            })
-
-        print(f"[AutoScan] 開始自動掃描 {len(stock_ids)} 支股票（依市值大→小）")
-        t = threading.Thread(target=_ov_scan_worker, args=(token, stock_ids, 15, False),
-                             daemon=True)
-        t.start()
-        t.join()  # 等掃描完成
-        _save_ov_snapshot()
-
-        # 產業市值走勢掃描
-        chain = _cget("industry_chain", ttl_h=24)
-        if chain:
-            all_inds = chain.get("industry_list", [])
-            print(f"[IndCap] 開始掃描 {len(all_inds)} 個產業市值走勢")
-            try:
-                result = _compute_industry_cap_history(all_inds, days=60)
-                if result:
-                    _save_indcap_snapshot(result)
-            except Exception as exc:
-                print(f"[IndCap] 掃描失敗: {exc}")
+        _run_auto_scan_once("AutoScan")
 
 
 @app.post("/api/overview_scan/start")
@@ -3815,8 +3824,7 @@ function switchTab(name) {
   }
   if (name === 'overview' && allStocks.length) {
     _ovLoadTierCounts();
-    if (_ovData !== null) _ovStartPoll();  // resume polling if scan is still running
-    // no auto-scan: user picks tier first
+    _ovStartPoll();  // auto-load snapshot or resume in-progress scan
   }
   if (name === 'chain') chainLoad();
   if (name === 'indcap') icapInit();
@@ -5645,8 +5653,8 @@ function _icapRenderButtons() {
     const on = _icapSel.has(ind);
     const col = ICAP_COLORS[i % ICAP_COLORS.length];
     return `<button class="sort-btn${on?' active':''}"
-      style="${on?`border-color:${col};color:${col}`:''}; font-size:11px; padding:3px 9px"
-      onclick="icapToggle(${JSON.stringify(ind)},${i})">${ind}</button>`;
+      style="${on?`border-color:${col};background:${col}22;color:var(--txt)`:''}; font-size:11px; padding:3px 9px"
+      data-ind="${ind}" data-idx="${i}" onclick="icapToggle(this.dataset.ind,+this.dataset.idx)">${ind}</button>`;
   }).join('');
 }
 
