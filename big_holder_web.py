@@ -1,7 +1,7 @@
 """
 big_holder_web.py
 =================
-千張大戶分析網站
+千張大戶分析網站 — 含大戶總覽、分級排行、分點籌碼、產業市值走勢
 
 啟動：  python big_holder_web.py
 瀏覽：  http://localhost:8001
