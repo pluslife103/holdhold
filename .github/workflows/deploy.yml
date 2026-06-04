@@ -12,11 +12,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
 
-      - name: Deploy to Railway
-        # 在 Railway dashboard 取得 RAILWAY_TOKEN 後設定在 GitHub Secrets
-        uses: bervProject/railway-deploy@main
-        with:
-          railway_token: ${{ secrets.RAILWAY_TOKEN }}
-          service: etf-aag87uqu
+      - name: Redeploy from GitHub source
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway redeploy --service etf-aag87uqu --from-source --yes
