@@ -1196,7 +1196,7 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
 # ── 大戶總覽後台掃描 ──────────────────────────────────────────────────────
 _OV_SCAN: dict = {
     "running": False, "done": 0, "total": 0,
-    "results": {}, "error": "", "days": 15, "started": "", "tier": "",
+    "results": {}, "error": "", "days": 20, "started": "", "tier": "",
     "industry": "", "skip": 0, "last_err": "",
 }
 _OV_SCAN_LOCK = threading.Lock()
@@ -1226,7 +1226,7 @@ def _load_ov_snapshot():
     try:
         data = json.loads(_OV_SNAPSHOT_PATH.read_text(encoding="utf-8"))
         results = data.get("results", {})
-        days = int(data.get("days", 15))
+        days = int(data.get("days", 20))
         if not results:
             return
         with _OV_SCAN_LOCK:
@@ -1465,7 +1465,7 @@ def _run_auto_scan_once(label: str = "AutoScan"):
             return
         _OV_SCAN.update({
             "running": True, "done": 0, "total": len(stock_ids),
-            "error": "", "days": 15, "skip": 0, "last_err": "",
+            "error": "", "days": 20, "skip": 0, "last_err": "",
             "started": datetime.utcnow().strftime("%H:%M") + " UTC",
             "tier": "", "results": {},
         })
@@ -1511,7 +1511,7 @@ def _auto_scan_loop():
 
 @app.post("/api/overview_scan/start")
 def api_ov_scan_start(
-    days: int = Query(15), force: bool = Query(False),
+    days: int = Query(20), force: bool = Query(False),
     tier: str = Query(""), industry: str = Query(""),
 ):
     import os
@@ -3164,8 +3164,8 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           <span id="ov-stock-count" style="font-size:10px;color:var(--mut)"></span>
           <select id="ov-days" class="search" style="width:130px" onchange="ovReload()">
             <option value="10">近10交易日</option>
-            <option value="15" selected>近15交易日</option>
-            <option value="20">近20交易日</option>
+            <option value="15">近15交易日</option>
+            <option value="20" selected>近20交易日</option>
             <option value="30">近30交易日</option>
           </select>
           <select id="ov-sort" class="search" style="width:120px" onchange="ovSort()">
@@ -4374,7 +4374,7 @@ function _ovCard(item) {
   const cap      = item.market_cap_億 >= 10000
     ? `${(item.market_cap_億/10000).toFixed(1)}兆`
     : item.market_cap_億 > 0 ? `${Math.round(item.market_cap_億)}億` : '';
-  const spark    = _ovSpark(item.timeline, 188);
+  const spark    = _ovSpark((item.timeline || []).slice(-20), 188);
   return `<div class="ov-card" onclick="jumpToTimeline('${item.stock_id}')">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">
       <div>
