@@ -1226,7 +1226,7 @@ def _load_ov_snapshot():
     try:
         data = json.loads(_OV_SNAPSHOT_PATH.read_text(encoding="utf-8"))
         results = data.get("results", {})
-        days = int(data.get("days", 20))
+        days = _OV_SCAN["days"]  # 用目前預設，不被舊快照覆蓋
         if not results:
             return
         with _OV_SCAN_LOCK:
@@ -1526,7 +1526,7 @@ def api_ov_scan_start(
         if _OV_SCAN["running"]:
             return {"status": "already_running", "done": _OV_SCAN["done"],
                     "total": _OV_SCAN["total"]}
-        if (force or _OV_SCAN["days"] != days or _OV_SCAN["tier"] != tier
+        if (force or _OV_SCAN["tier"] != tier
                 or _OV_SCAN.get("industry", "") != industry):
             _OV_SCAN["results"] = {}
         _OV_SCAN["tier"] = tier
