@@ -1200,7 +1200,9 @@ _OV_SCAN: dict = {
     "industry": "", "skip": 0, "last_err": "",
 }
 _OV_SCAN_LOCK = threading.Lock()
-_OV_SNAPSHOT_PATH = Path(__file__).parent / "ov_scan_snapshot.json"
+_DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent))
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+_OV_SNAPSHOT_PATH = _DATA_DIR / "ov_scan_snapshot.json"
 
 
 def _save_ov_snapshot():
@@ -1867,7 +1869,7 @@ def api_industry_chain():
     return result
 
 
-_INDCAP_SNAPSHOT_PATH = Path(__file__).parent / "indcap_snapshot.json"
+_INDCAP_SNAPSHOT_PATH = _DATA_DIR / "indcap_snapshot.json"
 _INDCAP_SNAPSHOT: dict = {}   # 最新一次掃描結果（記憶體快取）
 _INDCAP_LOCK = threading.Lock()
 
