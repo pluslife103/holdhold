@@ -4035,7 +4035,12 @@ function renderTimeline(tl, stock) {
         <span style="color:${netColor};font-weight:700">淨 ${total_net>0?'+':''}${total_net}</span>
       </div>
     </div>
-    <div style="font-size:10px;color:#8b949e;margin-bottom:6px">每格 = 800萬 NTD｜紅漲綠跌（台股慣例）</div>
+    <div style="font-size:10px;color:#8b949e;margin-bottom:6px;line-height:1.7">
+      <span style="color:#c9d1d9;font-weight:600">主力判斷：</span>單一分點當日買進<em>或</em>賣出金額 &gt; 800萬 NTD 即視為主力。
+      <span style="color:#c9d1d9;font-weight:600;margin-left:8px">柱高單位：</span>該分點金額 ÷ 800萬（無條件捨去），例如買 1,600萬 = 2格、買 4,000萬 = 5格。
+      <span style="color:#c9d1d9;font-weight:600;margin-left:8px">散戶：</span>單日買賣 ≤ 800萬 的分點，柱高單位為<em>張數</em>。
+      <span style="margin-left:8px">紅漲綠跌（台股慣例）</span>
+    </div>
     <div id="tl-chart" style="width:100%;height:620px"></div>`;
 
   const dates       = tl.map(d => d.date);
