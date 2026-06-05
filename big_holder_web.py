@@ -5291,8 +5291,13 @@ async function singleLoadChain(stockId, stockName) {
     return;
   }
 
-  el.innerHTML = `<div style="border:1px solid var(--bor);border-radius:8px;padding:10px 12px;margin-top:2px">
-    <div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--txt)">🏭 所屬產業鏈</div>
+  el.innerHTML = `<details style="border:1px solid var(--bor);border-radius:8px;margin-top:2px;overflow:hidden">
+    <summary style="padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--txt);list-style:none;user-select:none;background:var(--sur2)">
+      <svg id="chain-toggle-icon" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="transition:.2s;flex-shrink:0"><path d="M9 18l6-6-6-6"/></svg>
+      🏭 所屬產業鏈
+      <span style="font-size:10px;color:var(--mut);font-weight:400;margin-left:2px">${found.map(f=>f.ind+(f.ind!==f.sub?' › '+f.sub:'')).join('、')}</span>
+    </summary>
+    <div style="padding:10px 12px">
     ${found.map(f => `
       <div style="margin-bottom:10px">
         <div style="font-size:10px;color:var(--mut);margin-bottom:5px;padding-bottom:3px;border-bottom:1px solid var(--bor)">
@@ -5303,7 +5308,18 @@ async function singleLoadChain(stockId, stockName) {
           ${f.peers.map(s => _chipLabel(s, stockId)).join('')}
         </div>
       </div>`).join('')}
-  </div>`;
+    </div>
+  </details>
+  <script>
+  (function(){
+    const d = document.querySelector('#single-chain details');
+    if (!d) return;
+    const icon = d.querySelector('#chain-toggle-icon');
+    d.addEventListener('toggle', () => {
+      icon.style.transform = d.open ? 'rotate(90deg)' : '';
+    });
+  })();
+  </script>`;
 }
 
 // ── 產業鏈 ─────────────────────────────────────────────────────────────
