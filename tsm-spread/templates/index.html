@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>台積電 &amp; EWT 折溢價追蹤器</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #05070f;
+      --surface: #0e1425;
+      --surface2: #151d35;
+      --border: #1e2d50;
+      --text: #e2e8f0;
+      --muted: #7a8ba8;
+      --accent: #3b82f6;
+      --green: #22c55e;
+      --red: #ef4444;
+      --gold: #f59e0b;
+      --purple: #a78bfa;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 18px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon {
+      width: 42px; height: 42px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+    h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; }
+    .subtitle { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    #timestamp { font-size: 0.8rem; color: var(--muted); }
+    .btn-refresh {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 8px; padding: 7px 16px; font-size: 0.82rem;
+      cursor: pointer; font-weight: 600; transition: opacity .15s;
+    }
+    .btn-refresh:hover { opacity: .85; }
+    .btn-refresh:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* ── TAB NAV ─────────────────────────────────────── */
+    .tab-nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 28px;
+      display: flex;
+      gap: 0;
+    }
+    .tab-btn {
+      background: none; border: none; color: var(--muted);
+      font-size: 0.88rem; font-weight: 600; cursor: pointer;
+      padding: 13px 22px; position: relative;
+      transition: color .15s;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    main { max-width: 1160px; margin: 0 auto; padding: 28px 20px 60px; }
+
+    /* ── TAB PANELS ──────────────────────────────────── */
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── SECTION DIVIDER ─────────────────────── */
+    .section-header {
+      display: flex; align-items: center; gap: 14px;
+      margin: 36px 0 22px;
+    }
+    .section-header:first-child { margin-top: 0; }
+    .section-badge {
+      font-size: 0.72rem; font-weight: 700; letter-spacing: .08em;
+      padding: 4px 12px; border-radius: 6px; text-transform: uppercase;
+    }
+    .badge-tsm { background: rgba(59,130,246,.2); color: #60a5fa; }
+    .badge-ewt { background: rgba(167,139,250,.2); color: #c4b5fd; }
+    .badge-pos { background: rgba(34,197,94,.2); color: #4ade80; }
+    .section-line { flex: 1; height: 1px; background: var(--border); }
+    .section-title { font-size: 1.05rem; font-weight: 700; }
+
+    /* ── HERO CARD ───────────────────────────── */
+    .hero {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px 32px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      flex-wrap: wrap;
+    }
+    .hero-label { font-size: 0.82rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+    .hero-value {
+      font-size: 3.2rem; font-weight: 800;
+      letter-spacing: -0.03em; line-height: 1;
+    }
+    .hero-value.positive { color: var(--green); }
+    .hero-value.negative { color: var(--red); }
+    .hero-value.neutral  { color: var(--muted); }
+    .hero-badge {
+      display: inline-block; padding: 4px 12px;
+      border-radius: 999px; font-size: 0.78rem; font-weight: 700; margin-top: 8px;
+    }
+    .badge-premium  { background: rgba(34,197,94,.15);  color: var(--green); }
+    .badge-discount { background: rgba(239,68,68,.15);  color: var(--red); }
+    .badge-neutral  { background: rgba(122,139,168,.15); color: var(--muted); }
+    .hero-formula { font-size: 0.82rem; color: var(--muted); line-height: 1.7; }
+    .hero-formula span { color: var(--text); font-weight: 600; }
+
+    /* ── STAT CARDS ──────────────────────────── */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px; margin-bottom: 24px;
+    }
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; padding: 20px 22px;
+    }
+    .card-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
+    .card-value { font-size: 1.65rem; font-weight: 700; letter-spacing: -0.02em; }
+    .card-sub { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+    .card-tag {
+      display: inline-block; font-size: 0.7rem; font-weight: 600;
+      padding: 2px 8px; border-radius: 5px; margin-left: 6px; vertical-align: middle;
+    }
+    .tag-us   { background: rgba(59,130,246,.18);  color: #60a5fa; }
+    .tag-tw   { background: rgba(245,158,11,.18);  color: #fbbf24; }
+    .tag-fx   { background: rgba(139,92,246,.18);  color: #a78bfa; }
+    .tag-imp  { background: rgba(34,197,94,.12);   color: #4ade80; }
+    .tag-nav  { background: rgba(167,139,250,.18); color: #c4b5fd; }
+    .tag-etf  { background: rgba(236,72,153,.18);  color: #f472b6; }
+
+    /* ── CHART SECTION ───────────────────────── */
+    .chart-section {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 24px; margin-bottom: 20px;
+    }
+    .chart-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
+    .chart-title { font-size: 1rem; font-weight: 700; }
+    .chart-desc { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .chart-tabs { display: flex; gap: 6px; }
+    .chart-tab {
+      background: var(--bg); border: 1px solid var(--border);
+      color: var(--muted); border-radius: 7px; padding: 5px 13px;
+      font-size: 0.78rem; cursor: pointer; font-weight: 600; transition: all .15s;
+    }
+    .chart-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    canvas { max-height: 300px; }
+
+    .zero-legend {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 0.75rem; color: var(--muted); margin-top: 12px;
+    }
+    .zero-legend .dot { width: 10px; height: 2px; background: var(--muted); display: inline-block; }
+
+    .disclaimer {
+      font-size: 0.75rem; color: var(--muted);
+      text-align: center; margin-top: 32px; line-height: 1.8;
+    }
+
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    @media (max-width: 600px) {
+      .hero-value { font-size: 2.4rem; }
+      h1 { font-size: 1rem; }
+      .tab-btn { padding: 12px 14px; font-size: 0.82rem; }
+    }
+
+    /* ── POSITIONS TABLE ─────────────────────── */
+    .pos-table-wrap {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; overflow: hidden; overflow-x: auto; margin-bottom: 20px;
+    }
+    .pos-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; min-width: 620px; }
+    .pos-table thead th {
+      background: #0a1020; padding: 9px 13px; text-align: right;
+      color: var(--muted); font-weight: 500;
+      border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    .pos-table thead th:first-child,
+    .pos-table thead th:nth-child(2) { text-align: left; }
+    .pos-table tbody td {
+      padding: 9px 13px; border-bottom: 1px solid rgba(30,45,80,.6);
+      text-align: right; white-space: nowrap;
+    }
+    .pos-table tbody tr:last-child td { border-bottom: none; }
+    .pos-table tbody tr:hover { background: rgba(255,255,255,.03); }
+    .pos-table tbody td:first-child { text-align: left; font-weight: 600; font-family: monospace; letter-spacing: .02em; }
+    .pos-table tbody td:nth-child(2) { text-align: left; color: var(--muted); font-size: .8rem; }
+    .pos-pnl-up   { color: var(--green); font-weight: 600; }
+    .pos-pnl-down { color: var(--red);   font-weight: 600; }
+    .pos-dir-long  { color: var(--green); font-weight: 700; }
+    .pos-dir-short { color: var(--red);   font-weight: 700; }
+    .pos-stale-bar {
+      font-size: .75rem; color: var(--muted); text-align: center;
+      padding: 10px; margin-bottom: 8px;
+    }
+    .pos-sub-title {
+      font-size: .8rem; color: var(--muted); font-weight: 600;
+      text-transform: uppercase; letter-spacing: .06em;
+      padding: 14px 18px 0;
+    }
+    .pos-table thead th.sortable { cursor: pointer; user-select: none; }
+    .pos-table thead th.sortable:hover { color: var(--text); }
+    .pos-sort-asc::after  { content: ' ↑'; color: var(--accent); }
+    .pos-sort-desc::after { content: ' ↓'; color: var(--accent); }
+    .pos-code-name { display: block; font-size: .72rem; color: var(--muted); font-weight: 400; font-family: inherit; margin-top: 1px; }
+
+    .expand-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 18px; height: 18px; border-radius: 4px; margin-right: 5px;
+      color: var(--muted); cursor: pointer; font-size: .8rem; font-weight: 700;
+      transition: transform .2s, color .15s; user-select: none;
+    }
+    .expand-btn:hover { color: var(--accent); }
+    .expand-btn.open  { transform: rotate(90deg); color: var(--accent); }
+    .lots-row > td { padding: 0 !important; background: #060b18; border-bottom: 2px solid var(--border) !important; }
+    .lots-table { width: 100%; border-collapse: collapse; font-size: .79rem; }
+    .lots-table thead th {
+      background: #040810; padding: 7px 13px;
+      color: var(--muted); font-weight: 500; text-align: right;
+      border-bottom: 1px solid rgba(30,45,80,.6); white-space: nowrap;
+    }
+    .lots-table thead th:first-child { text-align: left; }
+    .lots-table tbody td {
+      padding: 7px 13px; border-bottom: 1px solid rgba(30,45,80,.3);
+      text-align: right; white-space: nowrap;
+    }
+    .lots-table tbody tr:last-child td { border-bottom: none; }
+    .lots-table tbody td:first-child { text-align: left; color: var(--muted); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">📊</div>
+    <div>
+      <h1>台積電 &amp; EWT 折溢價追蹤器</h1>
+      <div class="subtitle">TSM ADR · EWT ETF · 2330.TW · 0050.TW · 即時價差監控</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <a href="/bom" style="background:rgba(99,102,241,.15);color:#a5b4fc;border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:7px 14px;font-size:.82rem;font-weight:600;text-decoration:none;transition:background .15s" onmouseover="this.style.background='rgba(99,102,241,.28)'" onmouseout="this.style.background='rgba(99,102,241,.15)'">⬡ 經濟拆解</a>
+    <span id="timestamp">— 載入中 —</span>
+    <button class="btn-refresh" id="refreshBtn" onclick="onRefresh()">重新整理</button>
+  </div>
+</header>
+
+<nav class="tab-nav">
+  <button class="tab-btn active" id="tab-btn-positions" onclick="switchTab('positions')">💼 持倉</button>
+  <button class="tab-btn" id="tab-btn-spread" onclick="switchTab('spread')">📈 折溢價</button>
+</nav>
+
+<main>
+
+  <!-- ════════════════ TAB: 折溢價 ════════════════ -->
+  <div class="tab-panel" id="panel-spread">
+
+    <!-- ════════ TSM SECTION ════════ -->
+    <div class="section-header">
+      <span class="section-badge badge-tsm">TSM ↔ 2330</span>
+      <span class="section-title">美股 TSM ADR vs 台灣 2330 台積電</span>
+      <span class="section-line"></span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="hero-label">TSM ADR 折溢價（即時）</div>
+        <div class="hero-value neutral" id="tsmHeroValue">—</div>
+        <div id="tsmHeroBadge" class="hero-badge badge-neutral">載入中…</div>
+      </div>
+      <div class="hero-formula" id="tsmFormula">
+        計算公式：<br/>
+        <span>換算台股價</span> = TSM(USD) × 匯率 ÷ 5 <br/>
+        <span>折溢價%</span> = (換算台股價 − 2330) ÷ 2330 × 100
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">TSM 美股 <span class="card-tag tag-us">NYSE</span></div>
+        <div class="card-value" id="cardTSM">—</div>
+        <div class="card-sub">美元 USD</div>
+      </div>
+      <div class="card">
+        <div class="card-label">2330 台積電 <span class="card-tag tag-tw">TWSE</span></div>
+        <div class="card-value" id="card2330">—</div>
+        <div class="card-sub">新台幣 TWD</div>
+      </div>
+      <div class="card">
+        <div class="card-label">USD/TWD 匯率 <span class="card-tag tag-fx">FX</span></div>
+        <div class="card-value" id="cardFX">—</div>
+        <div class="card-sub">1 美元 = ? 台幣</div>
+      </div>
+      <div class="card">
+        <div class="card-label">TSM 換算台股價 <span class="card-tag tag-imp">IMPLIED</span></div>
+        <div class="card-value" id="cardImplied">—</div>
+        <div class="card-sub">TWD（TSM × 匯率 ÷ 5）</div>
+      </div>
+    </div>
+
+    <div class="chart-section">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">TSM 折溢價歷史走勢（近 90 日）</div>
+          <div class="chart-desc">正值 = TSM 溢價；負值 = TSM 折價</div>
+        </div>
+      </div>
+      <canvas id="tsmPremiumChart"></canvas>
+      <div class="zero-legend"><span class="dot"></span> 零基準線（折溢價 = 0%）</div>
+    </div>
+
+    <div class="chart-section">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">TSM 價格對比：2330 vs 換算台股價（近 90 日）</div>
+          <div class="chart-desc">兩線靠攏代表套利空間收窄</div>
+        </div>
+        <div class="chart-tabs">
+          <button class="chart-tab active" id="tabTWD" onclick="switchTsmChart('twd')">TWD</button>
+          <button class="chart-tab" id="tabUSD" onclick="switchTsmChart('usd')">USD</button>
+        </div>
+      </div>
+      <canvas id="tsmPriceChart"></canvas>
+    </div>
+
+    <!-- ════════ EWT SECTION ════════ -->
+    <div class="section-header">
+      <span class="section-badge badge-ewt">EWT ↔ 0050</span>
+      <span class="section-title">美股 EWT ETF vs 台灣 0050 元大台灣 50</span>
+      <span class="section-line"></span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <div class="hero-label">EWT ETF 折溢價（對 NAV）</div>
+        <div class="hero-value neutral" id="ewtHeroValue">—</div>
+        <div id="ewtHeroBadge" class="hero-badge badge-neutral">載入中…</div>
+      </div>
+      <div class="hero-formula" id="ewtFormula">
+        計算公式：<br/>
+        <span>折溢價%</span> = (EWT 市價 − NAV) ÷ NAV × 100<br/>
+        <span>NAV</span> = iShares 官方每日公佈之基金淨值
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">EWT 市價 <span class="card-tag tag-us">NYSE</span></div>
+        <div class="card-value" id="cardEWT">—</div>
+        <div class="card-sub">美元 USD</div>
+      </div>
+      <div class="card">
+        <div class="card-label">EWT NAV <span class="card-tag tag-nav">NAV</span></div>
+        <div class="card-value" id="cardNAV">—</div>
+        <div class="card-sub">美元 USD（iShares 官方淨值）</div>
+      </div>
+      <div class="card">
+        <div class="card-label">0050 元大台灣 50 <span class="card-tag tag-tw">TWSE</span></div>
+        <div class="card-value" id="card0050">—</div>
+        <div class="card-sub">新台幣 TWD</div>
+      </div>
+      <div class="card">
+        <div class="card-label">0050 換算美股價 <span class="card-tag tag-etf">USD</span></div>
+        <div class="card-value" id="card0050usd">—</div>
+        <div class="card-sub">USD（0050 ÷ 匯率）</div>
+      </div>
+    </div>
+
+    <div class="chart-section">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">EWT ETF 相對 0050 累積報酬差（近 90 日）</div>
+          <div class="chart-desc">正值 = EWT 相對 0050(USD) 累積超額報酬；以首日歸一化至 100</div>
+        </div>
+      </div>
+      <canvas id="ewtSpreadChart"></canvas>
+      <div class="zero-legend"><span class="dot"></span> 零基準線（兩者報酬相同）</div>
+    </div>
+
+    <div class="chart-section">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">EWT vs 0050(USD) 指數化報酬對比（近 90 日）</div>
+          <div class="chart-desc">首日 = 100，觀察兩者報酬走勢差異</div>
+        </div>
+      </div>
+      <canvas id="ewtIndexChart"></canvas>
+    </div>
+
+    <div class="disclaimer">
+      資料來源：Yahoo Finance（市場收盤後更新，含約 15 分鐘延遲）。本網站僅供資訊參考，不構成任何投資建議。<br/>
+      TSM ADR 換算比例：1 ADR = 5 普通股（2330.TW）。EWT NAV 為 iShares 官方公佈數值。<br/>
+      EWT 追蹤 MSCI Taiwan 25/50 指數；0050 追蹤台灣 50 指數，成分略有不同。
+    </div>
+
+  </div><!-- /panel-spread -->
+
+  <!-- ════════════════ TAB: 持倉 ════════════════ -->
+  <div class="tab-panel active" id="panel-positions">
+
+    <div class="section-header" style="margin-top:0">
+      <span class="section-badge badge-pos">持倉</span>
+      <span class="section-title">現股 &amp; 期貨持倉快照</span>
+      <span class="section-line"></span>
+    </div>
+
+    <div id="pos-stale-bar" class="pos-stale-bar">資料截至：載入中…</div>
+
+    <div class="cards" id="pos-cards">
+      <div class="card">
+        <div class="card-label">現股持倉</div>
+        <div class="card-value" id="p-count">—</div>
+        <div class="card-sub" id="p-count-sub">— 檔</div>
+      </div>
+      <div class="card">
+        <div class="card-label">現股投入成本</div>
+        <div class="card-value" id="p-cost">—</div>
+        <div class="card-sub">新台幣</div>
+      </div>
+      <div class="card">
+        <div class="card-label">現股市值</div>
+        <div class="card-value" id="p-value">—</div>
+        <div class="card-sub">新台幣</div>
+      </div>
+      <div class="card">
+        <div class="card-label">現股未實現損益</div>
+        <div class="card-value" id="p-pnl">—</div>
+        <div class="card-sub" id="p-pnl-pct">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">期貨未實現損益</div>
+        <div class="card-value" id="p-fut-pnl">—</div>
+        <div class="card-sub" id="p-fut-count">— 口</div>
+      </div>
+    </div>
+
+    <div class="pos-table-wrap">
+      <div class="pos-sub-title">現股持倉</div>
+      <table class="pos-table">
+        <thead><tr>
+          <th class="sortable pos-sort-asc" id="th-code" onclick="sortPositions('code')" style="text-align:left">代號</th>
+          <th>價格</th>
+          <th>變更$</th>
+          <th>變更%</th>
+          <th>當日益損$</th>
+          <th>市值</th>
+          <th>單位成本</th>
+          <th>成本</th>
+          <th>益損$</th>
+          <th>益損%</th>
+          <th>持倉佔比</th>
+        </tr></thead>
+        <tbody id="pos-stock-tbody"></tbody>
+      </table>
+    </div>
+
+    <div class="pos-table-wrap">
+      <div class="pos-sub-title">期貨未平倉</div>
+      <table class="pos-table">
+        <thead><tr>
+          <th>合約代號</th><th>名稱</th><th>多/空</th>
+          <th>口數</th><th>進場均價</th><th>現價</th><th>損益</th>
+        </tr></thead>
+        <tbody id="pos-fut-tbody"></tbody>
+      </table>
+    </div>
+
+  </div><!-- /panel-positions -->
+
+</main>
+
+<script>
+  let tsmHistData = null;
+  let ewtHistData = null;
+  let tsmPremiumChart = null;
+  let tsmPriceChart   = null;
+  let ewtSpreadChart  = null;
+  let ewtIndexChart   = null;
+  let tsmPriceMode = 'twd';
+  let positionsLoaded = false;
+  document.getElementById('refreshBtn').textContent = '更新持倉';
+
+  // ── TAB SWITCHING ─────────────────────────────────────────────────
+  function switchTab(name) {
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('panel-' + name).classList.add('active');
+    document.getElementById('tab-btn-' + name).classList.add('active');
+
+    if (name === 'positions' && !positionsLoaded) {
+      fetchPositions();
+    }
+    // Update refresh button behaviour label
+    document.getElementById('refreshBtn').textContent = name === 'spread' ? '重新整理' : '更新持倉';
+  }
+
+  function onRefresh() {
+    const isSpread = document.getElementById('panel-spread').classList.contains('active');
+    if (isSpread) {
+      refreshAll();
+    } else {
+      positionsLoaded = false;
+      fetchPositions();
+    }
+  }
+
+  const CD = {
+    responsive: true,
+    maintainAspectRatio: true,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { labels: { color: '#7a8ba8', font: { size: 12 } } },
+      tooltip: {
+        backgroundColor: '#0e1425', borderColor: '#1e2d50', borderWidth: 1,
+        titleColor: '#e2e8f0', bodyColor: '#a0aec0',
+      }
+    },
+    scales: {
+      x: { ticks: { color: '#7a8ba8', maxTicksLimit: 8, font: { size: 11 } }, grid: { color: '#1e2d50' } },
+      y: { ticks: { color: '#7a8ba8', font: { size: 11 } }, grid: { color: '#1e2d50' } }
+    }
+  };
+
+  // ── TSM ──────────────────────────────────────────────────────────
+
+  async function fetchTsmCurrent() {
+    const res  = await fetch('/api/current');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    const pct  = data.premium_pct;
+    const sign = pct >= 0 ? '+' : '';
+
+    const heroEl  = document.getElementById('tsmHeroValue');
+    const badgeEl = document.getElementById('tsmHeroBadge');
+    heroEl.textContent  = sign + pct.toFixed(3) + '%';
+    heroEl.className    = 'hero-value ' + colorClass(pct, 0.1);
+
+    if (pct > 0.1) {
+      badgeEl.textContent = '▲ TSM 溢價交易'; badgeEl.className = 'hero-badge badge-premium';
+    } else if (pct < -0.1) {
+      badgeEl.textContent = '▼ TSM 折價交易'; badgeEl.className = 'hero-badge badge-discount';
+    } else {
+      badgeEl.textContent = '≈ 接近平價';     badgeEl.className = 'hero-badge badge-neutral';
+    }
+
+    document.getElementById('cardTSM').textContent     = '$' + data.tsm_price.toFixed(2);
+    document.getElementById('card2330').textContent    = data.twse_price.toFixed(0);
+    document.getElementById('cardFX').textContent      = data.usdtwd.toFixed(3);
+    document.getElementById('cardImplied').textContent = data.implied_twse.toFixed(1);
+    document.getElementById('timestamp').textContent   = '更新：' + data.timestamp;
+
+    document.getElementById('tsmFormula').innerHTML =
+      `計算公式：<br/>
+      <span>換算台股價</span> = $${data.tsm_price.toFixed(2)} × ${data.usdtwd.toFixed(3)} ÷ 5 = <span>${data.implied_twse.toFixed(1)}</span> TWD<br/>
+      <span>折溢價%</span> = (${data.implied_twse.toFixed(1)} − ${data.twse_price.toFixed(0)}) ÷ ${data.twse_price.toFixed(0)} × 100
+      = <span style="color:${pct>=0?'#22c55e':'#ef4444'}">${sign}${pct.toFixed(3)}%</span>`;
+  }
+
+  async function fetchTsmHistory() {
+    const res  = await fetch('/api/history');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    tsmHistData = data;
+    buildTsmPremiumChart(data);
+    buildTsmPriceChart(data, tsmPriceMode);
+  }
+
+  function buildTsmPremiumChart(data) {
+    const ctx = document.getElementById('tsmPremiumChart').getContext('2d');
+    if (tsmPremiumChart) tsmPremiumChart.destroy();
+    const colors = data.premium_pct.map(v => v >= 0 ? 'rgba(34,197,94,0.8)' : 'rgba(239,68,68,0.8)');
+    tsmPremiumChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: data.dates,
+        datasets: [{ label: '折溢價 (%)', data: data.premium_pct,
+          backgroundColor: colors, borderWidth: 0, borderRadius: 3 }]
+      },
+      options: {
+        ...CD,
+        plugins: { ...CD.plugins, legend: { display: false },
+          tooltip: { ...CD.plugins.tooltip, callbacks: { label: c => ` ${c.raw >= 0?'+':''}${c.raw.toFixed(3)}%` } } },
+        scales: { ...CD.scales, y: { ...CD.scales.y, ticks: { ...CD.scales.y.ticks, callback: v => v.toFixed(1)+'%' } } }
+      }
+    });
+  }
+
+  function buildTsmPriceChart(data, mode) {
+    const ctx = document.getElementById('tsmPriceChart').getContext('2d');
+    if (tsmPriceChart) tsmPriceChart.destroy();
+    let ds1, ds2, l1, l2, fmt;
+    if (mode === 'twd') {
+      ds1 = data.twse; ds2 = data.implied_twse;
+      l1 = '2330.TW 實際價 (TWD)'; l2 = 'TSM 換算台股價 (TWD)';
+      fmt = v => v.toFixed(0);
+    } else {
+      ds1 = data.twse.map((v,i) => v / data.usdtwd[i]);
+      ds2 = data.tsm.map(v => v / 5);
+      l1 = '2330.TW ÷ 匯率 (USD)'; l2 = 'TSM ÷ 5 (USD)';
+      fmt = v => '$' + v.toFixed(2);
+    }
+    tsmPriceChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels: data.dates, datasets: [
+        { label: l1, data: ds1, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.08)',
+          borderWidth: 2, pointRadius: 0, tension: 0.2 },
+        { label: l2, data: ds2, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)',
+          borderWidth: 2, pointRadius: 0, tension: 0.2 }
+      ]},
+      options: { ...CD, scales: { ...CD.scales, y: { ...CD.scales.y, ticks: { ...CD.scales.y.ticks, callback: fmt } } } }
+    });
+  }
+
+  function switchTsmChart(mode) {
+    tsmPriceMode = mode;
+    document.getElementById('tabTWD').className = 'chart-tab' + (mode==='twd'?' active':'');
+    document.getElementById('tabUSD').className = 'chart-tab' + (mode==='usd'?' active':'');
+    if (tsmHistData) buildTsmPriceChart(tsmHistData, mode);
+  }
+
+  // ── EWT ──────────────────────────────────────────────────────────
+
+  async function fetchEwtCurrent() {
+    const res  = await fetch('/api/ewt/current');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    const pct  = data.premium_pct;
+    const sign = pct >= 0 ? '+' : '';
+
+    const heroEl  = document.getElementById('ewtHeroValue');
+    const badgeEl = document.getElementById('ewtHeroBadge');
+    heroEl.textContent = sign + pct.toFixed(3) + '%';
+    heroEl.className   = 'hero-value ' + colorClass(pct, 0.1);
+
+    if (pct > 0.5) {
+      badgeEl.textContent = '▲ EWT 溢價交易'; badgeEl.className = 'hero-badge badge-premium';
+    } else if (pct < -0.5) {
+      badgeEl.textContent = '▼ EWT 折價交易'; badgeEl.className = 'hero-badge badge-discount';
+    } else {
+      badgeEl.textContent = '≈ 接近平價';     badgeEl.className = 'hero-badge badge-neutral';
+    }
+
+    document.getElementById('cardEWT').textContent    = '$' + data.ewt_price.toFixed(2);
+    document.getElementById('cardNAV').textContent    = '$' + data.nav.toFixed(2);
+    document.getElementById('card0050').textContent   = data.zero50_price.toFixed(1);
+    document.getElementById('card0050usd').textContent= '$' + data.zero50_usd.toFixed(3);
+
+    document.getElementById('ewtFormula').innerHTML =
+      `計算公式：<br/>
+      <span>折溢價%</span> = ($${data.ewt_price.toFixed(2)} − $${data.nav.toFixed(2)}) ÷ $${data.nav.toFixed(2)} × 100
+      = <span style="color:${pct>=0?'#22c55e':'#ef4444'}">${sign}${pct.toFixed(3)}%</span><br/>
+      <span>NAV</span> = $${data.nav.toFixed(2)}（iShares 官方淨值）`;
+  }
+
+  async function fetchEwtHistory() {
+    const res  = await fetch('/api/ewt/history');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    ewtHistData = data;
+    buildEwtSpreadChart(data);
+    buildEwtIndexChart(data);
+  }
+
+  function buildEwtSpreadChart(data) {
+    const ctx = document.getElementById('ewtSpreadChart').getContext('2d');
+    if (ewtSpreadChart) ewtSpreadChart.destroy();
+    const colors = data.spread.map(v => v >= 0 ? 'rgba(167,139,250,0.75)' : 'rgba(239,68,68,0.75)');
+    ewtSpreadChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: data.dates,
+        datasets: [{ label: 'EWT 相對 0050(USD) 超額報酬 (pt)', data: data.spread,
+          backgroundColor: colors, borderWidth: 0, borderRadius: 3 }]
+      },
+      options: {
+        ...CD,
+        plugins: { ...CD.plugins, legend: { display: false },
+          tooltip: { ...CD.plugins.tooltip, callbacks: {
+            label: c => ` ${c.raw >= 0?'+':''}${c.raw.toFixed(2)} pt`
+          }}
+        },
+        scales: { ...CD.scales, y: { ...CD.scales.y,
+          ticks: { ...CD.scales.y.ticks, callback: v => (v>=0?'+':'')+v.toFixed(1)+' pt' }
+        }}
+      }
+    });
+  }
+
+  function buildEwtIndexChart(data) {
+    const ctx = document.getElementById('ewtIndexChart').getContext('2d');
+    if (ewtIndexChart) ewtIndexChart.destroy();
+    ewtIndexChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels: data.dates, datasets: [
+        { label: 'EWT (首日=100)', data: data.ewt_idx,
+          borderColor: '#a78bfa', backgroundColor: 'rgba(167,139,250,0.08)',
+          borderWidth: 2, pointRadius: 0, tension: 0.2 },
+        { label: '0050 換算 USD (首日=100)', data: data.zero50_idx,
+          borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.08)',
+          borderWidth: 2, pointRadius: 0, tension: 0.2 }
+      ]},
+      options: {
+        ...CD,
+        scales: { ...CD.scales, y: { ...CD.scales.y,
+          ticks: { ...CD.scales.y.ticks, callback: v => v.toFixed(1) }
+        }}
+      }
+    });
+  }
+
+  // ── helpers ───────────────────────────────────────────────────────
+
+  function colorClass(pct, threshold) {
+    return pct > threshold ? 'positive' : pct < -threshold ? 'negative' : 'neutral';
+  }
+
+  async function refreshAll() {
+    const btn = document.getElementById('refreshBtn');
+    btn.disabled = true; btn.textContent = '更新中…';
+    try {
+      await Promise.all([
+        fetchTsmCurrent(), fetchTsmHistory(),
+        fetchEwtCurrent(), fetchEwtHistory()
+      ]);
+    } catch(e) { console.error(e); }
+    finally { btn.disabled = false; btn.textContent = '重新整理'; }
+  }
+
+  // ── Positions ─────────────────────────────────────────────────────
+  const fmtN     = n => n == null ? '—' : Math.round(n).toLocaleString('zh-TW');
+  const fmtP     = n => n == null ? '—' : (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%';
+  const fmtPrice = n => n == null ? '—' : Number(n).toLocaleString('zh-TW', {minimumFractionDigits: 0, maximumFractionDigits: 2});
+  const pnlCls   = n => n > 0 ? 'pos-pnl-up' : n < 0 ? 'pos-pnl-down' : '';
+
+  let posStocks = [];
+  let posSort = { key: 'code', dir: 1 };
+
+  function sortPositions(key) {
+    if (posSort.key === key) posSort.dir *= -1;
+    else { posSort.key = key; posSort.dir = 1; }
+    document.querySelectorAll('.pos-table thead th.sortable').forEach(th => {
+      th.classList.remove('pos-sort-asc', 'pos-sort-desc');
+    });
+    const th = document.getElementById('th-' + key);
+    if (th) th.classList.add(posSort.dir === 1 ? 'pos-sort-asc' : 'pos-sort-desc');
+    renderStocksTable();
+  }
+
+  function renderStocksTable() {
+    const totalMV = posStocks.reduce((s, p) => s + (p.market_value || 0), 0);
+    const sorted = [...posStocks].sort((a, b) => {
+      const va = a[posSort.key] ?? '';
+      const vb = b[posSort.key] ?? '';
+      return (va < vb ? -1 : va > vb ? 1 : 0) * posSort.dir;
+    });
+    document.getElementById('pos-stock-tbody').innerHTML = sorted.map((p, idx) => {
+      const pc = pnlCls(p.pnl);
+      const weight = totalMV > 0 ? (p.market_value / totalMV * 100).toFixed(2) + '%' : '—';
+      const lots = p.lots || [];
+      const hasLots = lots.length > 0;
+
+      const mainRow = `<tr id="pos-row-${idx}">
+        <td style="text-align:left">
+          ${hasLots
+            ? `<span class="expand-btn" onclick="toggleLots(${idx})">›</span>`
+            : `<span style="display:inline-block;width:23px"></span>`}
+          <span style="font-weight:600;font-family:monospace;letter-spacing:.02em">${p.code}</span>
+          <span class="pos-code-name">${p.name || ''}</span>
+        </td>
+        <td>${fmtPrice(p.last_price)}</td>
+        <td style="color:var(--muted)">—</td>
+        <td style="color:var(--muted)">—</td>
+        <td style="color:var(--muted)">—</td>
+        <td>${fmtN(p.market_value)}</td>
+        <td>${fmtPrice(p.avg_cost)}</td>
+        <td>${fmtN(p.cost)}</td>
+        <td class="${pc}">${(p.pnl >= 0 ? '+' : '') + fmtN(p.pnl)}</td>
+        <td class="${pc}">${fmtP(p.pnl_pct)}</td>
+        <td style="color:var(--muted)">${weight}</td>
+      </tr>`;
+
+      if (!hasLots) return mainRow;
+
+      const lotsRows = lots.map(l => {
+        const lc = pnlCls(l.pnl);
+        return `<tr>
+          <td>${l.date || '—'}</td>
+          <td>${l.quantity}</td>
+          <td>${fmtN(l.market_value)}</td>
+          <td>${fmtPrice(l.buy_price)}</td>
+          <td>${fmtN(l.cost)}</td>
+          <td class="${lc}">${(l.pnl >= 0 ? '+' : '') + fmtN(l.pnl)}</td>
+          <td class="${lc}">${fmtP(l.pnl_pct)}</td>
+          <td>${fmtN(l.cost)}</td>
+          <td>${fmtPrice(l.buy_price)}</td>
+          <td class="${lc}">${(l.pnl >= 0 ? '+' : '') + fmtN(l.pnl)}</td>
+          <td class="${lc}">${fmtP(l.pnl_pct)}</td>
+        </tr>`;
+      }).join('');
+
+      const detailRow = `<tr id="pos-lots-${idx}" class="lots-row" style="display:none">
+        <td colspan="11">
+          <table class="lots-table">
+            <thead><tr>
+              <th>開倉日期</th><th>數量</th><th>市值</th>
+              <th>單位成本</th><th>成本</th><th>益損$</th><th>益損%</th>
+              <th>調整後成本</th><th>調整後單位成本</th><th>調整後益損$</th><th>調整後益損%</th>
+            </tr></thead>
+            <tbody>${lotsRows}</tbody>
+          </table>
+        </td>
+      </tr>`;
+
+      return mainRow + detailRow;
+    }).join('') || '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">無現股資料</td></tr>';
+  }
+
+  function toggleLots(idx) {
+    const lotsRow = document.getElementById('pos-lots-' + idx);
+    const btn = document.querySelector('#pos-row-' + idx + ' .expand-btn');
+    if (!lotsRow) return;
+    const isOpen = lotsRow.style.display !== 'none';
+    lotsRow.style.display = isOpen ? 'none' : 'table-row';
+    if (btn) btn.classList.toggle('open', !isOpen);
+  }
+
+  function toggleFutLots(idx) {
+    const lotsRow = document.getElementById('fut-lots-' + idx);
+    const btn = document.querySelector('#fut-row-' + idx + ' .expand-btn');
+    if (!lotsRow) return;
+    const isOpen = lotsRow.style.display !== 'none';
+    lotsRow.style.display = isOpen ? 'none' : 'table-row';
+    if (btn) btn.classList.toggle('open', !isOpen);
+  }
+
+  async function fetchPositions() {
+    const btn = document.getElementById('refreshBtn');
+    btn.disabled = true; btn.textContent = '更新中…';
+    try {
+      const d = await fetch('/api/positions').then(r => r.json());
+      if (d.error) { console.warn('positions:', d.error); return; }
+      const s = d.summary;
+
+      positionsLoaded = true;
+      document.getElementById('pos-stale-bar').textContent = '資料截至：' + (d.exported_at || '—') + '（靜態快照，非即時）';
+      document.getElementById('p-count').textContent     = fmtN(s.stock_count);
+      document.getElementById('p-count-sub').textContent = s.stock_count + ' 檔';
+      document.getElementById('p-cost').textContent      = fmtN(s.stock_cost);
+      document.getElementById('p-value').textContent     = fmtN(s.stock_value);
+
+      const pEl = document.getElementById('p-pnl');
+      pEl.textContent = (s.stock_pnl >= 0 ? '+' : '') + fmtN(s.stock_pnl);
+      pEl.className = 'card-value ' + pnlCls(s.stock_pnl);
+      document.getElementById('p-pnl-pct').textContent = fmtP(s.stock_pnl_pct);
+
+      const fEl = document.getElementById('p-fut-pnl');
+      fEl.textContent = (s.futures_pnl >= 0 ? '+' : '') + fmtN(s.futures_pnl);
+      fEl.className = 'card-value ' + pnlCls(s.futures_pnl);
+      document.getElementById('p-fut-count').textContent = s.futures_count + ' 口';
+
+      posStocks = (d.stocks || []).filter(p => p.type === 'stock' || p.type === 'us');
+      renderStocksTable();
+
+      const futs = d.futures || [];
+      document.getElementById('pos-fut-tbody').innerHTML = futs.map((f, idx) => {
+        const pc = pnlCls(f.pnl);
+        const dc = f.direction === '多' ? 'pos-dir-long' : 'pos-dir-short';
+        const lots = f.lots || [];
+        const hasLots = lots.length > 0;
+
+        const mainRow = `<tr id="fut-row-${idx}">
+          <td style="text-align:left">
+            ${hasLots
+              ? `<span class="expand-btn" onclick="toggleFutLots(${idx})">›</span>`
+              : `<span style="display:inline-block;width:23px"></span>`}
+            ${f.code}
+          </td>
+          <td style="text-align:left">${f.name || ''}</td>
+          <td class="${dc}">${f.direction}</td>
+          <td>${f.quantity} 口</td>
+          <td>${fmtPrice(f.avg_cost)}</td>
+          <td>${fmtPrice(f.last_price)}</td>
+          <td class="${pc}">${(f.pnl >= 0 ? '+' : '') + fmtN(f.pnl)}</td>
+        </tr>`;
+
+        if (!hasLots) return mainRow;
+
+        const lotsRows = lots.map(l => {
+          const lc = pnlCls(l.pnl);
+          const ldc = l.direction === '多' ? 'pos-dir-long' : 'pos-dir-short';
+          return `<tr>
+            <td>${l.date || '—'}</td>
+            <td>${l.quantity} 口</td>
+            <td class="${ldc}">${l.direction}</td>
+            <td>${fmtPrice(l.entry_price)}</td>
+            <td>${fmtPrice(l.last_price)}</td>
+            <td class="${lc}">${(l.pnl >= 0 ? '+' : '') + fmtN(l.pnl)}</td>
+          </tr>`;
+        }).join('');
+
+        const detailRow = `<tr id="fut-lots-${idx}" class="lots-row" style="display:none">
+          <td colspan="7">
+            <table class="lots-table">
+              <thead><tr>
+                <th>開倉時間</th><th>口數</th><th>方向</th>
+                <th>進場價</th><th>現價</th><th>損益</th>
+              </tr></thead>
+              <tbody>${lotsRows}</tbody>
+            </table>
+          </td>
+        </tr>`;
+
+        return mainRow + detailRow;
+      }).join('') || '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px">無期貨資料</td></tr>';
+
+    } catch(e) { console.warn('fetchPositions error:', e); }
+    finally { btn.disabled = false; btn.textContent = '更新持倉'; }
+  }
+
+  fetchPositions();
+  refreshAll();
+  setInterval(refreshAll, 60000);
+</script>
+
+</body>
+</html>
