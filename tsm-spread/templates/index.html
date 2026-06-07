@@ -369,10 +369,92 @@
     .ai-no-data .icon { font-size: 40px; margin-bottom: 12px; }
     .ai-no-data h3 { font-size: 1rem; color: var(--text); margin-bottom: 8px; }
     .ai-no-data p  { font-size: .84rem; line-height: 1.7; }
+
+    .ai-custom-row {
+      display: flex; gap: 10px; margin-bottom: 20px; align-items: center;
+    }
+    .ai-custom-input {
+      flex: 1; background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); border-radius: 10px; padding: 11px 16px;
+      font-size: .9rem; outline: none; transition: border-color .2s;
+    }
+    .ai-custom-input:focus { border-color: var(--accent); }
+    .ai-custom-input::placeholder { color: var(--muted); font-size: .85rem; }
+    .ai-custom-btn {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 10px; padding: 11px 20px; font-size: .9rem;
+      font-weight: 600; cursor: pointer; transition: opacity .15s; white-space: nowrap;
+    }
+    .ai-custom-btn:hover { opacity: .85; }
+    .ai-custom-btn:disabled { opacity: .5; cursor: wait; }
     .ai-no-data code {
       background: var(--surface2); border: 1px solid var(--border);
       border-radius: 5px; padding: 1px 6px; font-size: .82rem; color: #6ee7b7;
     }
+
+    /* ── HISTORY TAB ────────────────────────────────────────── */
+    .history-wrap { max-width: 860px; margin: 0 auto; padding: 28px 0 80px; }
+    .history-top-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 24px; flex-wrap: wrap; gap: 12px;
+    }
+    .history-title { font-size: 1.1rem; font-weight: 700; color: var(--text); }
+    .history-clear-all {
+      background: rgba(239,68,68,.12); color: #f87171;
+      border: 1px solid rgba(239,68,68,.25); border-radius: 8px;
+      padding: 7px 16px; font-size: .82rem; font-weight: 600;
+      cursor: pointer; transition: background .15s;
+    }
+    .history-clear-all:hover { background: rgba(239,68,68,.22); }
+    .history-empty {
+      text-align: center; padding: 70px 20px;
+      color: var(--muted); font-size: .9rem; line-height: 1.9;
+    }
+    .history-empty .icon { font-size: 40px; margin-bottom: 12px; }
+    .history-stock-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; overflow: hidden; margin-bottom: 18px;
+    }
+    .history-stock-header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 20px; background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+    }
+    .history-ticker {
+      font-size: .95rem; font-weight: 700; font-family: monospace;
+      letter-spacing: .04em; color: var(--accent);
+    }
+    .history-sname { font-size: .9rem; color: var(--muted); flex: 1; }
+    .history-qa-count {
+      font-size: .75rem; color: var(--muted);
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 5px; padding: 2px 8px;
+    }
+    .history-del-btn {
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 7px;
+      padding: 5px 12px; font-size: .78rem; cursor: pointer; transition: all .15s;
+    }
+    .history-del-btn:hover { color: #f87171; border-color: rgba(239,68,68,.4); }
+    .history-qa-item { border-bottom: 1px solid rgba(30,45,80,.5); }
+    .history-qa-item:last-child { border-bottom: none; }
+    .history-qa-q {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 20px; cursor: pointer;
+      font-size: .88rem; font-weight: 500; color: var(--text);
+      transition: background .15s; user-select: none;
+    }
+    .history-qa-q:hover { background: rgba(255,255,255,.03); }
+    .history-qa-q .h-icon { font-size: .75rem; color: #34d399; flex-shrink: 0; }
+    .history-qa-q .h-expand { margin-left: auto; font-size: .75rem; color: var(--muted); transition: transform .2s; flex-shrink: 0; }
+    .history-qa-q.open .h-expand { transform: rotate(180deg); }
+    .history-qa-time { font-size: .72rem; color: var(--muted); flex-shrink: 0; }
+    .history-qa-a {
+      display: none; padding: 16px 22px 18px;
+      font-size: .88rem; line-height: 1.85; color: #c8d5e8;
+      background: rgba(0,0,0,.15); border-top: 1px solid var(--border);
+    }
+    .history-qa-a.open { display: block; }
   </style>
 </head>
 <body>
@@ -397,6 +479,7 @@
   <button class="tab-btn active" id="tab-btn-positions" onclick="switchTab('positions')">💼 持倉</button>
   <button class="tab-btn" id="tab-btn-spread" onclick="switchTab('spread')">📈 折溢價</button>
   <button class="tab-btn" id="tab-btn-ai" onclick="switchTab('ai')">🤖 AI 分析</button>
+  <button class="tab-btn" id="tab-btn-history" onclick="switchTab('history')">📋 紀錄</button>
 </nav>
 
 <main>
@@ -637,6 +720,13 @@
 
       <div class="q-grid" id="ai-q-grid"></div>
 
+      <div class="ai-custom-row">
+        <input class="ai-custom-input" id="ai-custom-input" type="text"
+               placeholder="輸入自訂問題，直接詢問財報狗 AI…"
+               onkeydown="if(event.key==='Enter') sendCustomQuestion()">
+        <button class="ai-custom-btn" id="ai-custom-btn" onclick="sendCustomQuestion()">送出</button>
+      </div>
+
       <div class="ai-answer-box" id="ai-answer-box">
         <div class="ai-answer-q" id="ai-answer-q" style="display:none">
           <span class="badge">AI</span>
@@ -651,6 +741,17 @@
         </div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- ════════════════ TAB: 問答紀錄 ════════════════ -->
+  <div class="tab-panel" id="panel-history">
+    <div class="history-wrap">
+      <div class="history-top-bar">
+        <span class="history-title">📋 AI 問答紀錄</span>
+        <button class="history-clear-all" onclick="clearAllHistory()">清除全部</button>
+      </div>
+      <div id="history-list"></div>
     </div>
   </div>
 
@@ -680,9 +781,13 @@
     if (name === 'ai' && !aiLoaded) {
       loadAiData();
     }
+    if (name === 'history') {
+      renderHistoryTab();
+    }
     document.getElementById('refreshBtn').textContent =
-      name === 'spread' ? '重新整理' :
-      name === 'ai'     ? 'AI 重新載入' : '更新持倉';
+      name === 'spread'  ? '重新整理' :
+      name === 'ai'      ? 'AI 重新載入' :
+      name === 'history' ? '重新整理' : '更新持倉';
   }
 
   function onRefresh() {
@@ -693,6 +798,8 @@
       aiQA = {};
       aiLoaded = false;
       loadAiData();
+    } else if (active === 'panel-history') {
+      renderHistoryTab();
     } else {
       positionsLoaded = false;
       fetchPositions();
@@ -1141,6 +1248,16 @@
       aiCurrentTicker = ticker;
       document.getElementById('ai-stock-name').textContent = '—';
     }
+    // 從 localStorage 恢復此股票的快取答案
+    const h = loadAiHistory();
+    if (h[ticker] && h[ticker].answers) {
+      Object.entries(h[ticker].answers).forEach(([q, obj]) => {
+        if (!aiQA[q]) aiQA[q] = obj.answer;
+      });
+      if (h[ticker].stock_name && document.getElementById('ai-stock-name').textContent === '—') {
+        document.getElementById('ai-stock-name').textContent = `${ticker} ${h[ticker].stock_name}`;
+      }
+    }
     renderQChips();
     document.getElementById('ai-answer-body').innerHTML = '<span class="empty-hint">← 點左側問題查看 AI 分析</span>';
     document.getElementById('ai-answer-q').style.display = 'none';
@@ -1195,6 +1312,12 @@
           document.getElementById('ai-stock-name').textContent =
             `${ticker} ${data.stock_name}`;
         }
+        // 存入 localStorage
+        const hist = loadAiHistory();
+        if (!hist[ticker]) hist[ticker] = { stock_name: data.stock_name || ticker, answers: {} };
+        hist[ticker].stock_name = data.stock_name || hist[ticker].stock_name || ticker;
+        hist[ticker].answers[question] = { answer: data.answer, saved_at: new Date().toLocaleString('zh-TW') };
+        saveAiHistory(hist);
         renderAnswerHtml(data.answer);
         document.getElementById('ai-footer').style.display = 'block';
         // 更新 chip 顯示已回答
@@ -1209,17 +1332,143 @@
     }
   }
 
-  function renderAnswerHtml(answer) {
+  function renderAnswerHtmlStr(answer) {
     const escaped = answer
       .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const html = escaped
+    return escaped
       .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
       .replace(/^#{1,3} (.+)$/gm, '<br><span style="font-size:1.05em;font-weight:700;color:#e2e8f0">$1</span><br>')
       .replace(/^- (.+)$/gm, '<br>• $1')
       .replace(/\n/g, '<br>')
       .replace(/(\+[\d,.]+%)/g, '<span style="color:var(--green);font-weight:600">$1</span>')
       .replace(/(-[\d,.]+%)/g,  '<span style="color:var(--red);font-weight:600">$1</span>');
-    document.getElementById('ai-answer-body').innerHTML = html;
+  }
+
+  function renderAnswerHtml(answer) {
+    document.getElementById('ai-answer-body').innerHTML = renderAnswerHtmlStr(answer);
+  }
+
+  // ── 自訂問題 ──────────────────────────────────────────────────────
+  async function sendCustomQuestion() {
+    const inputEl = document.getElementById('ai-custom-input');
+    const btnEl   = document.getElementById('ai-custom-btn');
+    const question = inputEl.value.trim();
+    if (!question) return;
+
+    document.querySelectorAll('.q-chip').forEach(c => c.classList.remove('active'));
+    document.getElementById('ai-answer-q-text').textContent = question;
+    document.getElementById('ai-answer-q').style.display = 'flex';
+    document.getElementById('ai-answer-box').classList.add('has-answer');
+    document.getElementById('ai-answer-body').innerHTML = '<span class="loading">AI 分析中，請稍候（約 15–30 秒）…</span>';
+    document.getElementById('ai-footer').style.display = 'none';
+
+    inputEl.disabled = true;
+    btnEl.disabled   = true;
+    btnEl.textContent = '等待中…';
+
+    const ticker = document.getElementById('ai-stock-input').value.trim() || '2330';
+    try {
+      const resp = await fetch(
+        `/api/ai-proxy?ticker=${encodeURIComponent(ticker)}&question=${encodeURIComponent(question)}`
+      );
+      const data = await resp.json();
+      if (data.error) {
+        document.getElementById('ai-answer-body').innerHTML =
+          `<span style="color:var(--red)">錯誤：${data.error}</span>`;
+      } else {
+        if (data.stock_name) {
+          document.getElementById('ai-stock-name').textContent = `${ticker} ${data.stock_name}`;
+        }
+        const hist = loadAiHistory();
+        if (!hist[ticker]) hist[ticker] = { stock_name: data.stock_name || ticker, answers: {} };
+        hist[ticker].stock_name = data.stock_name || hist[ticker].stock_name || ticker;
+        hist[ticker].answers[question] = { answer: data.answer, saved_at: new Date().toLocaleString('zh-TW') };
+        saveAiHistory(hist);
+        renderAnswerHtml(data.answer);
+        document.getElementById('ai-footer').style.display = 'block';
+        inputEl.value = '';
+      }
+    } catch (e) {
+      document.getElementById('ai-answer-body').innerHTML =
+        `<span style="color:var(--red)">網路錯誤：${e.message}</span>`;
+    } finally {
+      inputEl.disabled = false;
+      btnEl.disabled   = false;
+      btnEl.textContent = '送出';
+      inputEl.focus();
+    }
+  }
+
+  // ── 問答紀錄 (localStorage) ────────────────────────────────────────
+  function loadAiHistory() {
+    try { return JSON.parse(localStorage.getItem('ai_qa_history') || '{}'); }
+    catch { return {}; }
+  }
+  function saveAiHistory(h) {
+    localStorage.setItem('ai_qa_history', JSON.stringify(h));
+  }
+
+  function clearAllHistory() {
+    if (!confirm('確定清除全部問答紀錄？')) return;
+    localStorage.removeItem('ai_qa_history');
+    aiQA = {};
+    renderQChips();
+    renderHistoryTab();
+  }
+
+  function clearTickerHistory(ticker) {
+    const h = loadAiHistory();
+    delete h[ticker];
+    saveAiHistory(h);
+    if (ticker === aiCurrentTicker) { aiQA = {}; renderQChips(); }
+    renderHistoryTab();
+  }
+
+  function toggleHistoryQA(qEl) {
+    const id = qEl.dataset.target;
+    const aEl = document.getElementById(id);
+    if (!aEl) return;
+    const isOpen = aEl.classList.contains('open');
+    aEl.classList.toggle('open', !isOpen);
+    qEl.classList.toggle('open', !isOpen);
+  }
+
+  function renderHistoryTab() {
+    const h = loadAiHistory();
+    const list = document.getElementById('history-list');
+    const tickers = Object.keys(h);
+    if (tickers.length === 0) {
+      list.innerHTML = '<div class="history-empty"><div class="icon">📭</div><p>尚無問答紀錄<br>點 AI 分析 Tab 詢問問題後<br>答案將自動儲存至此</p></div>';
+      return;
+    }
+    list.innerHTML = tickers.map(ticker => {
+      const entry   = h[ticker];
+      const answers = entry.answers || {};
+      const qList   = Object.entries(answers);
+      const qItems  = qList.map(([q, obj], i) => {
+        const id = `hqa-${ticker}-${i}`.replace(/[^a-zA-Z0-9-_]/g, '_');
+        return `
+        <div class="history-qa-item">
+          <div class="history-qa-q" data-target="${id}" onclick="toggleHistoryQA(this)">
+            <span class="h-icon">✓</span>
+            ${q}
+            <span class="history-qa-time">${obj.saved_at || ''}</span>
+            <span class="h-expand">▾</span>
+          </div>
+          <div class="history-qa-a" id="${id}">${renderAnswerHtmlStr(obj.answer)}</div>
+        </div>`;
+      }).join('');
+      return `
+      <div class="history-stock-card">
+        <div class="history-stock-header">
+          <span class="history-ticker">${ticker}</span>
+          <span class="history-sname">${entry.stock_name || ''}</span>
+          <span class="history-qa-count">${qList.length} 題</span>
+          <button class="history-del-btn" onclick="clearTickerHistory('${ticker}')">清除</button>
+        </div>
+        <div>${qItems}</div>
+      </div>`;
+    }).join('');
   }
 </script>
 
