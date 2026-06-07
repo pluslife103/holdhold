@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 股票分析 — {{ data.stock_info.name if data.stock_info else '財報狗' }}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #05070f;
+      --surface:  #0e1425;
+      --surface2: #151d35;
+      --border:   #1e2d50;
+      --text:     #e2e8f0;
+      --muted:    #7a8ba8;
+      --accent:   #3b82f6;
+      --green:    #22c55e;
+      --red:      #ef4444;
+      --gold:     #f59e0b;
+      --purple:   #a78bfa;
+      --teal:     #6ee7b7;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 18px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon {
+      width: 42px; height: 42px;
+      background: linear-gradient(135deg, #10b981, #3b82f6);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+    .logo h1 { font-size: 1.2rem; font-weight: 700; }
+    .logo .subtitle { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    .nav-link {
+      border-radius: 8px; padding: 7px 14px;
+      font-size: .82rem; font-weight: 600;
+      text-decoration: none; transition: background .15s;
+    }
+    .nav-link.home {
+      background: rgba(59,130,246,.15); color: #93c5fd;
+      border: 1px solid rgba(59,130,246,.3);
+    }
+    .nav-link.home:hover { background: rgba(59,130,246,.28); }
+
+    /* ── Stock Info Bar ── */
+    .stock-bar {
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 28px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .stock-badge {
+      background: var(--accent);
+      color: #fff;
+      font-size: 12px; font-weight: 700;
+      padding: 3px 10px; border-radius: 20px;
+      letter-spacing: 1px;
+    }
+    .stock-name { font-size: 18px; font-weight: 700; }
+    .stock-price { font-size: 20px; font-weight: 700; color: var(--green); }
+    .crawl-time { margin-left: auto; font-size: 12px; color: var(--muted); }
+    .qa-count {
+      font-size: 12px; color: var(--teal);
+      background: rgba(16,185,129,.1);
+      border: 1px solid rgba(16,185,129,.25);
+      border-radius: 20px; padding: 3px 10px;
+    }
+
+    /* ── Main ── */
+    main { max-width: 860px; margin: 32px auto; padding: 0 16px 80px; }
+
+    /* ── Q&A Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      margin-bottom: 16px;
+      overflow: hidden;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .card:hover { border-color: rgba(59,130,246,.5); }
+    .card.open  { border-color: rgba(59,130,246,.6); box-shadow: 0 0 0 1px rgba(59,130,246,.15); }
+
+    .card-q {
+      display: flex; align-items: flex-start; gap: 12px;
+      padding: 16px 20px;
+      cursor: pointer; user-select: none;
+      background: var(--surface2);
+    }
+    .q-icon {
+      width: 26px; height: 26px; flex-shrink: 0; margin-top: 1px;
+      background: linear-gradient(135deg, #10b981, #3b82f6);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 800; color: #fff;
+    }
+    .q-text { flex: 1; font-size: 15px; font-weight: 600; line-height: 1.5; }
+    .chevron {
+      font-size: 16px; color: var(--muted);
+      transition: transform .25s; flex-shrink: 0; margin-top: 3px;
+    }
+    .card.open .chevron { transform: rotate(180deg); color: var(--accent); }
+
+    .card-a {
+      display: none;
+      padding: 20px 20px 20px 58px;
+      font-size: 14.5px; line-height: 1.9;
+      color: #c8d5e8;
+      border-top: 1px solid var(--border);
+    }
+    .card.open .card-a { display: block; }
+
+    /* inline highlights */
+    .card-a .hi-g { color: var(--green); font-weight: 600; }
+    .card-a .hi-r { color: var(--red);   font-weight: 600; }
+    .card-a .hi-b { color: var(--accent); font-weight: 600; }
+
+    .ai-tag {
+      display: inline-flex; align-items: center; gap: 5px;
+      margin-top: 16px;
+      font-size: 11px; color: var(--muted);
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      border-radius: 6px; padding: 3px 10px;
+    }
+    .ai-tag::before { content: "🤖"; font-size: 10px; }
+
+    /* ── Empty state ── */
+    .empty {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--muted);
+    }
+    .empty .icon { font-size: 48px; margin-bottom: 16px; }
+    .empty h2 { font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+    .empty p { font-size: 14px; line-height: 1.7; }
+    .empty code {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px; padding: 2px 7px;
+      font-size: 13px; color: var(--teal);
+    }
+
+    /* ── Source note ── */
+    .source-note {
+      text-align: center;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 40px;
+      padding-top: 24px;
+      border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🤖</div>
+    <div>
+      <h1>AI 股票分析</h1>
+      <div class="subtitle">財報狗 AI 對話 · 自動爬蟲擷取</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <a href="/" class="nav-link home">← 折溢價追蹤</a>
+  </div>
+</header>
+
+{% if data and data.stock_info %}
+<div class="stock-bar">
+  <span class="stock-badge">{{ data.stock_info.id }}</span>
+  <span class="stock-name">{{ data.stock_info.name }}</span>
+  {% if data.stock_info.price %}
+  <span class="stock-price">{{ data.stock_info.price }}</span>
+  {% endif %}
+  <span class="qa-count">{{ data.qa_pairs | length }} 則分析</span>
+  <span class="crawl-time">更新：{{ data.crawl_time[:16] if data.crawl_time else '—' }}</span>
+</div>
+{% endif %}
+
+<main>
+{% if data and data.qa_pairs %}
+
+  {% for qa in data.qa_pairs %}
+  <div class="card" id="card-{{ loop.index }}">
+    <div class="card-q" onclick="toggle({{ loop.index }})">
+      <div class="q-icon">Q</div>
+      <div class="q-text">{{ qa.question }}</div>
+      <div class="chevron">▾</div>
+    </div>
+    <div class="card-a">
+      {{ qa.answer | replace('\n', '<br>') | safe }}
+      <div class="ai-tag">AI 生成內容，僅供參考，不構成投資建議</div>
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="source-note">
+    資料來源：財報狗 statementdog.com &nbsp;·&nbsp;
+    以 Playwright 自動擷取 AI 對話內容 &nbsp;·&nbsp;
+    非財報狗官方服務
+  </div>
+
+{% else %}
+  <div class="empty">
+    <div class="icon">🤖</div>
+    <h2>尚無 AI 分析資料</h2>
+    <p>
+      請先在本機執行爬蟲抓取財報狗 AI 對話：<br><br>
+      <code>python statementdog_ai_scraper.py</code><br><br>
+      完成後將 <code>tsm-spread/ai_data.json</code> commit 並部署即可顯示。
+    </p>
+  </div>
+{% endif %}
+</main>
+
+<script>
+  function toggle(i) {
+    document.getElementById('card-' + i).classList.toggle('open');
+  }
+  // 預設展開第一張
+  const first = document.getElementById('card-1');
+  if (first) first.classList.add('open');
+</script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
@@ -174,6 +174,33 @@ def positions_data():
             return jsonify(json.load(f))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── AI Analysis ───────────────────────────────────────────────────────────────
+
+_AI_DATA_FILE = os.path.join(os.path.dirname(__file__), "ai_data.json")
+
+@app.route("/ai")
+def ai_analysis():
+    data = {}
+    if os.path.exists(_AI_DATA_FILE):
+        with open(_AI_DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    return render_template("ai.html", data=data)
+
+
+@app.route("/api/ai-data")
+def ai_data_api():
+    stock_id = request.args.get("stock_id", "2330").strip()
+    if not os.path.exists(_AI_DATA_FILE):
+        return jsonify({"error": "no data", "qa_pairs": []})
+    with open(_AI_DATA_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    # filter by stock_id if the file is for a different stock
+    info = data.get("stock_info", {})
+    if info.get("id", stock_id) != stock_id:
+        return jsonify({"error": "stock mismatch", "qa_pairs": []})
+    return jsonify(data)
 
 
 if __name__ == "__main__":

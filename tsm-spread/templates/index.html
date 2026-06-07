@@ -252,6 +252,124 @@
     }
     .lots-table tbody tr:last-child td { border-bottom: none; }
     .lots-table tbody td:first-child { text-align: left; color: var(--muted); }
+
+    /* ── AI TAB ─────────────────────────────────────────────── */
+    .ai-wrap { max-width: 780px; margin: 0 auto; padding: 28px 0 80px; }
+
+    .ai-stock-row {
+      display: flex; gap: 10px; align-items: center;
+      margin-bottom: 28px; flex-wrap: wrap;
+    }
+    .ai-stock-input {
+      background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); border-radius: 10px;
+      padding: 10px 16px; font-size: 1rem; width: 130px;
+      outline: none; transition: border-color .2s;
+    }
+    .ai-stock-input:focus { border-color: var(--accent); }
+    .ai-load-btn {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 10px; padding: 10px 20px; font-size: .9rem;
+      font-weight: 600; cursor: pointer; transition: opacity .15s;
+    }
+    .ai-load-btn:hover { opacity: .85; }
+    .ai-stock-label {
+      font-size: .9rem; color: var(--muted);
+    }
+    .ai-stock-name {
+      font-size: .9rem; color: var(--text); font-weight: 600;
+      margin-left: 4px;
+    }
+
+    .q-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 10px; margin-bottom: 28px;
+    }
+    .q-chip {
+      background: var(--surface); border: 1px solid var(--border);
+      color: var(--text); border-radius: 10px;
+      padding: 12px 16px; font-size: .88rem; font-weight: 500;
+      cursor: pointer; transition: all .18s; text-align: left;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .q-chip:hover { border-color: var(--accent); background: rgba(59,130,246,.08); }
+    .q-chip.active {
+      border-color: var(--accent); background: rgba(59,130,246,.15);
+      color: #93c5fd;
+    }
+    .q-chip .q-icon { font-size: .75rem; opacity: .6; }
+
+    .ai-answer-box {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; overflow: hidden;
+      transition: border-color .2s;
+    }
+    .ai-answer-box.has-answer { border-color: rgba(59,130,246,.4); }
+    .ai-answer-q {
+      background: var(--surface2);
+      padding: 14px 20px;
+      font-size: .9rem; font-weight: 600; color: #93c5fd;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px;
+    }
+    .ai-answer-q .badge {
+      background: rgba(59,130,246,.2); color: var(--accent);
+      border-radius: 6px; padding: 2px 8px; font-size: .75rem;
+      font-weight: 700; flex-shrink: 0;
+    }
+    .ai-answer-body {
+      padding: 22px 22px 18px;
+      font-size: .92rem; line-height: 1.9; color: #c8d5e8;
+      min-height: 80px;
+    }
+    .ai-answer-body .loading {
+      color: var(--muted); display: flex; align-items: center; gap: 8px;
+    }
+    .ai-answer-body .loading::before {
+      content: ''; display: inline-block;
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .ai-answer-body .empty-hint {
+      color: var(--muted); font-size: .88rem;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .ai-footer {
+      padding: 10px 22px 14px;
+      font-size: .76rem; color: var(--muted);
+      border-top: 1px solid var(--border);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .ai-footer a { color: var(--muted); text-decoration: none; }
+    .ai-footer a:hover { color: var(--accent); }
+
+    .ai-crawl-time {
+      font-size: .78rem; color: var(--muted);
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 14px; margin-bottom: 20px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .ai-crawl-time .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green); flex-shrink: 0;
+    }
+    .ai-crawl-time .dot.stale { background: var(--gold); }
+    .ai-crawl-time .dot.none  { background: var(--muted); }
+
+    .ai-no-data {
+      text-align: center; padding: 60px 20px;
+      color: var(--muted);
+    }
+    .ai-no-data .icon { font-size: 40px; margin-bottom: 12px; }
+    .ai-no-data h3 { font-size: 1rem; color: var(--text); margin-bottom: 8px; }
+    .ai-no-data p  { font-size: .84rem; line-height: 1.7; }
+    .ai-no-data code {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 5px; padding: 1px 6px; font-size: .82rem; color: #6ee7b7;
+    }
   </style>
 </head>
 <body>
@@ -266,6 +384,7 @@
   </div>
   <div class="header-right">
     <a href="/bom" style="background:rgba(99,102,241,.15);color:#a5b4fc;border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:7px 14px;font-size:.82rem;font-weight:600;text-decoration:none;transition:background .15s" onmouseover="this.style.background='rgba(99,102,241,.28)'" onmouseout="this.style.background='rgba(99,102,241,.15)'">⬡ 經濟拆解</a>
+    <a href="/ai" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);border-radius:8px;padding:7px 14px;font-size:.82rem;font-weight:600;text-decoration:none;transition:background .15s" onmouseover="this.style.background='rgba(16,185,129,.25)'" onmouseout="this.style.background='rgba(16,185,129,.12)'">🤖 AI 分析</a>
     <span id="timestamp">— 載入中 —</span>
     <button class="btn-refresh" id="refreshBtn" onclick="onRefresh()">重新整理</button>
   </div>
@@ -274,6 +393,7 @@
 <nav class="tab-nav">
   <button class="tab-btn active" id="tab-btn-positions" onclick="switchTab('positions')">💼 持倉</button>
   <button class="tab-btn" id="tab-btn-spread" onclick="switchTab('spread')">📈 折溢價</button>
+  <button class="tab-btn" id="tab-btn-ai" onclick="switchTab('ai')">🤖 AI 分析</button>
 </nav>
 
 <main>
@@ -493,6 +613,44 @@
 
   </div><!-- /panel-positions -->
 
+  <!-- ════════════════ TAB: AI 分析 ════════════════ -->
+  <div class="tab-panel" id="panel-ai">
+    <div class="ai-wrap">
+
+      <div class="ai-stock-row">
+        <input class="ai-stock-input" id="ai-stock-input" type="text"
+               value="2330" placeholder="股票代號" maxlength="6"
+               onkeydown="if(event.key==='Enter') loadAiData()">
+        <button class="ai-load-btn" onclick="loadAiData()">載入</button>
+        <span class="ai-stock-label">
+          股票：<span class="ai-stock-name" id="ai-stock-name">—</span>
+        </span>
+      </div>
+
+      <div id="ai-crawl-info" class="ai-crawl-time" style="display:none">
+        <span class="dot" id="ai-dot"></span>
+        <span id="ai-crawl-text"></span>
+      </div>
+
+      <div class="q-grid" id="ai-q-grid"></div>
+
+      <div class="ai-answer-box" id="ai-answer-box">
+        <div class="ai-answer-q" id="ai-answer-q" style="display:none">
+          <span class="badge">AI</span>
+          <span id="ai-answer-q-text"></span>
+        </div>
+        <div class="ai-answer-body" id="ai-answer-body">
+          <span class="empty-hint">← 點左側問題查看 AI 分析</span>
+        </div>
+        <div class="ai-footer" id="ai-footer" style="display:none">
+          🤖 AI 生成內容，僅供參考，不構成投資建議 ·
+          資料來源：<a href="https://statementdog.com" target="_blank">財報狗</a>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
 </main>
 
 <script>
@@ -516,14 +674,21 @@
     if (name === 'positions' && !positionsLoaded) {
       fetchPositions();
     }
-    // Update refresh button behaviour label
-    document.getElementById('refreshBtn').textContent = name === 'spread' ? '重新整理' : '更新持倉';
+    if (name === 'ai' && !aiLoaded) {
+      loadAiData();
+    }
+    document.getElementById('refreshBtn').textContent =
+      name === 'spread' ? '重新整理' :
+      name === 'ai'     ? 'AI 重新載入' : '更新持倉';
   }
 
   function onRefresh() {
-    const isSpread = document.getElementById('panel-spread').classList.contains('active');
-    if (isSpread) {
+    const active = [...document.querySelectorAll('.tab-panel.active')].map(e => e.id)[0];
+    if (active === 'panel-spread') {
       refreshAll();
+    } else if (active === 'panel-ai') {
+      aiLoaded = false;
+      loadAiData();
     } else {
       positionsLoaded = false;
       fetchPositions();
@@ -948,6 +1113,139 @@
   fetchPositions();
   refreshAll();
   setInterval(refreshAll, 60000);
+
+  // ── AI 分析 TAB ────────────────────────────────────────────────
+  let aiLoaded = false;
+  let aiData   = null;   // { stock_info, qa_pairs, crawl_time }
+  let aiQA     = {};     // { question -> answer }
+
+  const AI_PRESET_Q = [
+    "公司主要做什麼",
+    "產業前景概況",
+    "市場在看哪些題材",
+    "主要客戶是誰",
+    "產品營收佔比",
+    "競爭對手與優勢",
+    "公司後續展望",
+    "未來兩年預估EPS",
+  ];
+
+  async function loadAiData() {
+    const stockId = document.getElementById('ai-stock-input').value.trim() || '2330';
+    const grid    = document.getElementById('ai-q-grid');
+    const body    = document.getElementById('ai-answer-body');
+
+    grid.innerHTML = '';
+    body.innerHTML = '<span class="loading">載入中…</span>';
+    document.getElementById('ai-answer-q').style.display = 'none';
+    document.getElementById('ai-footer').style.display   = 'none';
+    document.getElementById('ai-crawl-info').style.display = 'none';
+
+    try {
+      const resp = await fetch(`/api/ai-data?stock_id=${encodeURIComponent(stockId)}`);
+      const json = await resp.json();
+
+      if (json.error || !json.qa_pairs || json.qa_pairs.length === 0) {
+        renderAiEmpty();
+        return;
+      }
+
+      aiData = json;
+      aiLoaded = true;
+
+      // index qa by question keyword
+      aiQA = {};
+      json.qa_pairs.forEach(qa => { aiQA[qa.question] = qa.answer; });
+
+      // update stock name
+      const info = json.stock_info || {};
+      document.getElementById('ai-stock-name').textContent =
+        (info.name || stockId) + (info.price ? `  ${info.price}` : '');
+
+      // crawl time badge
+      if (json.crawl_time) {
+        const dt  = new Date(json.crawl_time);
+        const now = new Date();
+        const hrs = (now - dt) / 3600000;
+        const dot = document.getElementById('ai-dot');
+        dot.className = 'dot' + (hrs > 24 ? ' stale' : '');
+        document.getElementById('ai-crawl-text').textContent =
+          `資料更新：${json.crawl_time.slice(0, 16).replace('T', ' ')}` +
+          (hrs < 1 ? '  （剛剛）' : hrs < 24 ? `  （${Math.floor(hrs)} 小時前）` : `  （${Math.floor(hrs/24)} 天前）`);
+        document.getElementById('ai-crawl-info').style.display = 'flex';
+      }
+
+      // render question chips
+      renderQChips();
+      body.innerHTML = '<span class="empty-hint">← 點左側問題查看 AI 分析</span>';
+
+    } catch (e) {
+      renderAiEmpty();
+    }
+  }
+
+  function renderQChips() {
+    const grid = document.getElementById('ai-q-grid');
+    grid.innerHTML = '';
+
+    // use preset order, supplement with any extra from data
+    const dataQs = (aiData?.qa_pairs || []).map(q => q.question);
+    const allQs  = [...new Set([...AI_PRESET_Q, ...dataQs])];
+
+    allQs.forEach(q => {
+      const hasAnswer = !!aiQA[q];
+      const chip = document.createElement('button');
+      chip.className = 'q-chip' + (hasAnswer ? '' : ' disabled-q');
+      chip.style.opacity = hasAnswer ? '1' : '0.4';
+      chip.disabled = !hasAnswer;
+      chip.innerHTML = `<span class="q-icon">?</span>${q}`;
+      chip.onclick = () => showAnswer(q, chip);
+      grid.appendChild(chip);
+    });
+  }
+
+  function showAnswer(question, chipEl) {
+    // highlight chip
+    document.querySelectorAll('.q-chip').forEach(c => c.classList.remove('active'));
+    chipEl.classList.add('active');
+
+    const answer = aiQA[question] || '（無資料）';
+
+    document.getElementById('ai-answer-q-text').textContent = question;
+    document.getElementById('ai-answer-q').style.display = 'flex';
+    document.getElementById('ai-footer').style.display   = 'block';
+    document.getElementById('ai-answer-box').classList.add('has-answer');
+
+    // format answer: newline → <br>, highlight numbers
+    const html = answer
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\n/g, '<br>')
+      .replace(/(\+[\d,.]+%)/g, '<span style="color:var(--green);font-weight:600">$1</span>')
+      .replace(/(-[\d,.]+%)/g,  '<span style="color:var(--red);font-weight:600">$1</span>');
+
+    document.getElementById('ai-answer-body').innerHTML = html;
+  }
+
+  function renderAiEmpty() {
+    const grid = document.getElementById('ai-q-grid');
+    grid.innerHTML = '';
+    AI_PRESET_Q.forEach(q => {
+      const chip = document.createElement('button');
+      chip.className = 'q-chip';
+      chip.style.opacity = '0.35';
+      chip.disabled = true;
+      chip.innerHTML = `<span class="q-icon">?</span>${q}`;
+      grid.appendChild(chip);
+    });
+    document.getElementById('ai-answer-body').innerHTML = `
+      <div class="empty-hint" style="flex-direction:column;align-items:flex-start;gap:10px">
+        <span>尚無 AI 分析資料</span>
+        <span style="font-size:.82rem">請在本機執行爬蟲後 commit &amp; push：</span>
+        <code style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:.82rem;color:#6ee7b7">
+          python statementdog_ai_scraper.py
+        </code>
+      </div>`;
+  }
 </script>
 
 </body>
