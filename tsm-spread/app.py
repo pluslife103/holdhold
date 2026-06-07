@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, render_template_string, request
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
@@ -179,6 +179,32 @@ def positions_data():
 
 # ── AI Analysis ───────────────────────────────────────────────────
 _STATEMENTDOG_SESSION = os.environ.get("STATEMENTDOG_SESSION", "")
+_UPSTASH_URL          = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+_UPSTASH_TOKEN        = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+_HISTORY_KEY          = "ai_qa_history"
+
+def _redis_cmd(*args):
+    """Execute a single Redis command via Upstash pipeline API."""
+    if not _UPSTASH_URL:
+        return None
+    try:
+        r = http_req.post(
+            f"{_UPSTASH_URL}/pipeline",
+            headers={"Authorization": f"Bearer {_UPSTASH_TOKEN}", "Content-Type": "application/json"},
+            json=[list(args)],
+            timeout=5,
+        )
+        results = r.json()
+        return results[0].get("result") if results else None
+    except Exception:
+        return None
+
+def _redis_get(key):
+    return _redis_cmd("GET", key)
+
+def _redis_set(key, value_str):
+    """Store value_str (plain string) in Redis."""
+    _redis_cmd("SET", key, value_str)
 
 _AI_DATA_FILE = os.path.join(os.path.dirname(__file__), "ai_data.json")
 
@@ -204,6 +230,106 @@ def ai_data_api():
         return jsonify({"error": "stock mismatch", "qa_pairs": []})
     return jsonify(data)
 
+
+@app.route("/api/history-load")
+def history_load():
+    raw = _redis_get(_HISTORY_KEY)
+    if not raw:
+        return jsonify({})
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(data, dict):   # 拒絕 array 或其他非 dict
+            return jsonify({})
+        return jsonify(data)
+    except Exception:
+        return jsonify({})
+
+
+@app.route("/api/history-save", methods=["POST"])
+def history_save():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "invalid data"}), 400
+    # _redis_set expects a plain string; serialize dict once here
+    _redis_set(_HISTORY_KEY, json.dumps(data, ensure_ascii=False))
+    return jsonify({"ok": True})
+
+
+_REMOTE_URL_KEY = "remote_url"
+
+@app.route("/api/remote-url", methods=["GET"])
+def remote_url_get():
+    raw = _redis_get(_REMOTE_URL_KEY)
+    if not raw:
+        return jsonify({"url": None}), 404
+    try:
+        data = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {"url": raw}
+        return jsonify(data)
+    except Exception:
+        return jsonify({"url": raw})
+
+@app.route("/api/remote-url", methods=["POST"])
+def remote_url_set():
+    data = request.get_json(force=True, silent=True)
+    if not data or not data.get("url") or data.get("pwd") != "remote2024":
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = json.dumps({"url": data["url"], "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=False)
+    _redis_set(_REMOTE_URL_KEY, payload)
+    return jsonify({"ok": True, "url": data["url"]})
+
+@app.route("/remote")
+def remote_page():
+    return render_template_string("""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>遠端桌面</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#05070f;color:#e2e8f0;font-family:system-ui,sans-serif;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:20px;padding:24px}
+h1{font-size:1.4rem;font-weight:700}
+.url-box{background:#0e1425;border:1px solid #1e2d50;border-radius:12px;padding:16px 20px;
+  word-break:break-all;font-size:.9rem;color:#60a5fa;max-width:480px;width:100%;text-align:center}
+.btn{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:14px 32px;
+  font-size:1rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;margin-top:4px}
+.btn:hover{opacity:.85}
+.muted{color:#7a8ba8;font-size:.8rem}
+.offline{color:#ef4444}
+</style>
+</head>
+<body>
+<div style="font-size:2rem">🖥️</div>
+<h1>遠端桌面</h1>
+<div id="status" class="muted">載入中…</div>
+<div id="url-box" class="url-box" style="display:none"></div>
+<a id="open-btn" class="btn" style="display:none" href="#">開啟遠端桌面</a>
+<div id="time" class="muted"></div>
+<script>
+fetch('/api/remote-url')
+  .then(r => r.ok ? r.json() : null)
+  .then(d => {
+    if (d && d.url) {
+      document.getElementById('status').textContent = '遠端已就緒';
+      document.getElementById('url-box').style.display = 'block';
+      document.getElementById('url-box').textContent = d.url;
+      const btn = document.getElementById('open-btn');
+      btn.href = d.url;
+      btn.style.display = 'inline-block';
+      if (d.updated_at) document.getElementById('time').textContent = '更新時間：' + d.updated_at;
+    } else {
+      document.getElementById('status').className = 'offline';
+      document.getElementById('status').textContent = '遠端目前離線，請先啟動電腦上的遠端桌面';
+    }
+  })
+  .catch(() => {
+    document.getElementById('status').className = 'offline';
+    document.getElementById('status').textContent = '無法連線，請稍後再試';
+  });
+</script>
+</body>
+</html>""")
 
 @app.route("/api/ai-proxy")
 def ai_proxy():
