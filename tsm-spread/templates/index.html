@@ -66,7 +66,11 @@
       padding: 0 28px;
       display: flex;
       gap: 0;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
     }
+    .tab-nav::-webkit-scrollbar { display: none; }
     .tab-btn {
       background: none; border: none; color: var(--muted);
       font-size: 0.88rem; font-weight: 600; cursor: pointer;
@@ -74,6 +78,8 @@
       transition: color .15s;
       border-bottom: 2px solid transparent;
       margin-bottom: -1px;
+      flex-shrink: 0;
+      white-space: nowrap;
     }
     .tab-btn:hover { color: var(--text); }
     .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -779,10 +785,10 @@
       fetchPositions();
     }
     if (name === 'ai' && !aiLoaded) {
-      loadAiData();
+      syncHistoryFromServer().then(loadAiData);
     }
     if (name === 'history') {
-      renderHistoryTab();
+      syncHistoryFromServer().then(renderHistoryTab);
     }
     document.getElementById('refreshBtn').textContent =
       name === 'spread'  ? '重新整理' :
@@ -799,7 +805,7 @@
       aiLoaded = false;
       loadAiData();
     } else if (active === 'panel-history') {
-      renderHistoryTab();
+      syncHistoryFromServer().then(renderHistoryTab);
     } else {
       positionsLoaded = false;
       fetchPositions();
@@ -1241,23 +1247,28 @@
     "未來兩年預估EPS",
   ];
 
-  function loadAiData() {
+  function loadAiData(skipSync) {
     const ticker = document.getElementById('ai-stock-input').value.trim() || '2330';
-    if (ticker !== aiCurrentTicker) {
+    const tickerChanged = ticker !== aiCurrentTicker;
+    if (tickerChanged) {
       aiQA = {};
       aiCurrentTicker = ticker;
-      document.getElementById('ai-stock-name').textContent = '—';
+      // 換了股票，先從 server 拉最新再重新呼叫
+      if (!skipSync) {
+        syncHistoryFromServer().then(() => loadAiData(true));
+        return;
+      }
     }
-    // 從 localStorage 恢復此股票的快取答案
+    // 從 localStorage 恢復此股票的快取答案與名稱
     const h = loadAiHistory();
+    let displayName = ticker;
     if (h[ticker] && h[ticker].answers) {
       Object.entries(h[ticker].answers).forEach(([q, obj]) => {
         if (!aiQA[q]) aiQA[q] = obj.answer;
       });
-      if (h[ticker].stock_name && document.getElementById('ai-stock-name').textContent === '—') {
-        document.getElementById('ai-stock-name').textContent = `${ticker} ${h[ticker].stock_name}`;
-      }
+      if (h[ticker].stock_name) displayName = `${ticker} ${h[ticker].stock_name}`;
     }
+    document.getElementById('ai-stock-name').textContent = displayName;
     renderQChips();
     document.getElementById('ai-answer-body').innerHTML = '<span class="empty-hint">← 點左側問題查看 AI 分析</span>';
     document.getElementById('ai-answer-q').style.display = 'none';
@@ -1400,12 +1411,56 @@
   }
 
   // ── 問答紀錄 (localStorage) ────────────────────────────────────────
+  function _isValidHistory(obj) {
+    return obj && typeof obj === 'object' && !Array.isArray(obj);
+  }
   function loadAiHistory() {
-    try { return JSON.parse(localStorage.getItem('ai_qa_history') || '{}'); }
-    catch { return {}; }
+    try {
+      const data = JSON.parse(localStorage.getItem('ai_qa_history') || '{}');
+      if (!_isValidHistory(data)) {
+        localStorage.removeItem('ai_qa_history');
+        return {};
+      }
+      return data;
+    } catch {
+      localStorage.removeItem('ai_qa_history');
+      return {};
+    }
   }
   function saveAiHistory(h) {
+    if (!_isValidHistory(h)) return;
     localStorage.setItem('ai_qa_history', JSON.stringify(h));
+    // 非同步推到 server（不等待，失敗靜默）
+    fetch('/api/history-save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(h),
+    }).catch(() => {});
+  }
+
+  // 從 server 拉最新紀錄，以 server 為基底，local 新問答覆蓋
+  async function syncHistoryFromServer() {
+    try {
+      const resp = await fetch('/api/history-load');
+      if (!resp.ok) return;
+      const server = await resp.json();
+      if (!_isValidHistory(server)) return;   // 防衛：拒絕 array 或 null
+      const local  = loadAiHistory();
+      // server 為基底，local 只補充 server 沒有的條目 / 問題
+      const merged = JSON.parse(JSON.stringify(server));  // deep copy
+      Object.entries(local).forEach(([ticker, ld]) => {
+        if (!_isValidHistory(ld)) return;
+        if (!merged[ticker]) {
+          merged[ticker] = ld;
+        } else {
+          if (ld.stock_name) merged[ticker].stock_name = ld.stock_name;
+          const serverAnswers = merged[ticker].answers || {};
+          const localAnswers  = ld.answers || {};
+          merged[ticker].answers = Object.assign({}, serverAnswers, localAnswers);
+        }
+      });
+      localStorage.setItem('ai_qa_history', JSON.stringify(merged));
+    } catch (e) { /* 靜默 */ }
   }
 
   function clearAllHistory() {
