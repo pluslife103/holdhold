@@ -298,6 +298,9 @@
       border-color: var(--accent); background: rgba(59,130,246,.15);
       color: #93c5fd;
     }
+    .q-chip.answered { border-color: rgba(52,211,153,.35); }
+    .q-chip.answered .q-icon { color: #34d399; opacity: .9; }
+    .q-chip:disabled { opacity: .55; cursor: wait; }
     .q-chip .q-icon { font-size: .75rem; opacity: .6; }
 
     .ai-answer-box {
@@ -687,6 +690,7 @@
     if (active === 'panel-spread') {
       refreshAll();
     } else if (active === 'panel-ai') {
+      aiQA = {};
       aiLoaded = false;
       loadAiData();
     } else {
@@ -1116,8 +1120,8 @@
 
   // ── AI 分析 TAB ────────────────────────────────────────────────
   let aiLoaded = false;
-  let aiData   = null;   // { stock_info, qa_pairs, crawl_time }
-  let aiQA     = {};     // { question -> answer }
+  let aiQA            = {};     // { question -> cached answer }
+  let aiCurrentTicker = '2330';
 
   const AI_PRESET_Q = [
     "公司主要做什麼",
@@ -1130,121 +1134,92 @@
     "未來兩年預估EPS",
   ];
 
-  async function loadAiData() {
-    const stockId = document.getElementById('ai-stock-input').value.trim() || '2330';
-    const grid    = document.getElementById('ai-q-grid');
-    const body    = document.getElementById('ai-answer-body');
-
-    grid.innerHTML = '';
-    body.innerHTML = '<span class="loading">載入中…</span>';
+  function loadAiData() {
+    const ticker = document.getElementById('ai-stock-input').value.trim() || '2330';
+    if (ticker !== aiCurrentTicker) {
+      aiQA = {};
+      aiCurrentTicker = ticker;
+      document.getElementById('ai-stock-name').textContent = '—';
+    }
+    renderQChips();
+    document.getElementById('ai-answer-body').innerHTML = '<span class="empty-hint">← 點左側問題查看 AI 分析</span>';
     document.getElementById('ai-answer-q').style.display = 'none';
     document.getElementById('ai-footer').style.display   = 'none';
     document.getElementById('ai-crawl-info').style.display = 'none';
-
-    try {
-      const resp = await fetch(`/api/ai-data?stock_id=${encodeURIComponent(stockId)}`);
-      const json = await resp.json();
-
-      if (json.error || !json.qa_pairs || json.qa_pairs.length === 0) {
-        renderAiEmpty();
-        return;
-      }
-
-      aiData = json;
-      aiLoaded = true;
-
-      // index qa by question keyword
-      aiQA = {};
-      json.qa_pairs.forEach(qa => { aiQA[qa.question] = qa.answer; });
-
-      // update stock name
-      const info = json.stock_info || {};
-      document.getElementById('ai-stock-name').textContent =
-        (info.name || stockId) + (info.price ? `  ${info.price}` : '');
-
-      // crawl time badge
-      if (json.crawl_time) {
-        const dt  = new Date(json.crawl_time);
-        const now = new Date();
-        const hrs = (now - dt) / 3600000;
-        const dot = document.getElementById('ai-dot');
-        dot.className = 'dot' + (hrs > 24 ? ' stale' : '');
-        document.getElementById('ai-crawl-text').textContent =
-          `資料更新：${json.crawl_time.slice(0, 16).replace('T', ' ')}` +
-          (hrs < 1 ? '  （剛剛）' : hrs < 24 ? `  （${Math.floor(hrs)} 小時前）` : `  （${Math.floor(hrs/24)} 天前）`);
-        document.getElementById('ai-crawl-info').style.display = 'flex';
-      }
-
-      // render question chips
-      renderQChips();
-      body.innerHTML = '<span class="empty-hint">← 點左側問題查看 AI 分析</span>';
-
-    } catch (e) {
-      renderAiEmpty();
-    }
+    aiLoaded = true;
   }
 
   function renderQChips() {
     const grid = document.getElementById('ai-q-grid');
     grid.innerHTML = '';
-
-    // use preset order, supplement with any extra from data
-    const dataQs = (aiData?.qa_pairs || []).map(q => q.question);
-    const allQs  = [...new Set([...AI_PRESET_Q, ...dataQs])];
-
-    allQs.forEach(q => {
-      const hasAnswer = !!aiQA[q];
+    AI_PRESET_Q.forEach(q => {
       const chip = document.createElement('button');
-      chip.className = 'q-chip' + (hasAnswer ? '' : ' disabled-q');
-      chip.style.opacity = hasAnswer ? '1' : '0.4';
-      chip.disabled = !hasAnswer;
-      chip.innerHTML = `<span class="q-icon">?</span>${q}`;
-      chip.onclick = () => showAnswer(q, chip);
+      chip.className = 'q-chip' + (aiQA[q] ? ' answered' : '');
+      chip.innerHTML = `<span class="q-icon">${aiQA[q] ? '✓' : '?'}</span>${q}`;
+      chip.onclick = () => fetchAnswer(q, chip);
       grid.appendChild(chip);
     });
   }
 
-  function showAnswer(question, chipEl) {
-    // highlight chip
+  async function fetchAnswer(question, chipEl) {
     document.querySelectorAll('.q-chip').forEach(c => c.classList.remove('active'));
     chipEl.classList.add('active');
-
-    const answer = aiQA[question] || '（無資料）';
-
     document.getElementById('ai-answer-q-text').textContent = question;
     document.getElementById('ai-answer-q').style.display = 'flex';
-    document.getElementById('ai-footer').style.display   = 'block';
     document.getElementById('ai-answer-box').classList.add('has-answer');
 
-    // format answer: newline → <br>, highlight numbers
-    const html = answer
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    // 有快取直接顯示
+    if (aiQA[question]) {
+      renderAnswerHtml(aiQA[question]);
+      document.getElementById('ai-footer').style.display = 'block';
+      return;
+    }
+
+    // 呼叫 proxy
+    document.getElementById('ai-answer-body').innerHTML = '<span class="loading">AI 分析中，請稍候（約 15–30 秒）…</span>';
+    document.getElementById('ai-footer').style.display = 'none';
+    chipEl.disabled = true;
+
+    const ticker = document.getElementById('ai-stock-input').value.trim() || '2330';
+    try {
+      const resp = await fetch(
+        `/api/ai-proxy?ticker=${encodeURIComponent(ticker)}&question=${encodeURIComponent(question)}`
+      );
+      const data = await resp.json();
+      if (data.error) {
+        document.getElementById('ai-answer-body').innerHTML =
+          `<span style="color:var(--red)">錯誤：${data.error}</span>`;
+      } else {
+        aiQA[question] = data.answer;
+        if (data.stock_name) {
+          document.getElementById('ai-stock-name').textContent =
+            `${ticker} ${data.stock_name}`;
+        }
+        renderAnswerHtml(data.answer);
+        document.getElementById('ai-footer').style.display = 'block';
+        // 更新 chip 顯示已回答
+        chipEl.innerHTML = `<span class="q-icon">✓</span>${question}`;
+        chipEl.classList.add('answered');
+      }
+    } catch (e) {
+      document.getElementById('ai-answer-body').innerHTML =
+        `<span style="color:var(--red)">網路錯誤：${e.message}</span>`;
+    } finally {
+      chipEl.disabled = false;
+    }
+  }
+
+  function renderAnswerHtml(answer) {
+    const escaped = answer
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const html = escaped
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/^#{1,3} (.+)$/gm, '<br><span style="font-size:1.05em;font-weight:700;color:#e2e8f0">$1</span><br>')
+      .replace(/^- (.+)$/gm, '<br>• $1')
       .replace(/\n/g, '<br>')
       .replace(/(\+[\d,.]+%)/g, '<span style="color:var(--green);font-weight:600">$1</span>')
       .replace(/(-[\d,.]+%)/g,  '<span style="color:var(--red);font-weight:600">$1</span>');
-
     document.getElementById('ai-answer-body').innerHTML = html;
-  }
-
-  function renderAiEmpty() {
-    const grid = document.getElementById('ai-q-grid');
-    grid.innerHTML = '';
-    AI_PRESET_Q.forEach(q => {
-      const chip = document.createElement('button');
-      chip.className = 'q-chip';
-      chip.style.opacity = '0.35';
-      chip.disabled = true;
-      chip.innerHTML = `<span class="q-icon">?</span>${q}`;
-      grid.appendChild(chip);
-    });
-    document.getElementById('ai-answer-body').innerHTML = `
-      <div class="empty-hint" style="flex-direction:column;align-items:flex-start;gap:10px">
-        <span>尚無 AI 分析資料</span>
-        <span style="font-size:.82rem">請在本機執行爬蟲後 commit &amp; push：</span>
-        <code style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:.82rem;color:#6ee7b7">
-          python statementdog_ai_scraper.py
-        </code>
-      </div>`;
   }
 </script>
 

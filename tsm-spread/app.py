@@ -2,7 +2,8 @@ from flask import Flask, jsonify, render_template, request
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
-import os, json
+import os, json, re
+import requests as http_req
 
 app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), "templates"))
 
@@ -176,7 +177,8 @@ def positions_data():
         return jsonify({"error": str(e)}), 500
 
 
-# ── AI Analysis ───────────────────────────────────────────────────────────────
+# ── AI Analysis ───────────────────────────────────────────────────
+_STATEMENTDOG_SESSION = os.environ.get("STATEMENTDOG_SESSION", "")
 
 _AI_DATA_FILE = os.path.join(os.path.dirname(__file__), "ai_data.json")
 
@@ -201,6 +203,127 @@ def ai_data_api():
     if info.get("id", stock_id) != stock_id:
         return jsonify({"error": "stock mismatch", "qa_pairs": []})
     return jsonify(data)
+
+
+@app.route("/api/ai-proxy")
+def ai_proxy():
+    ticker   = request.args.get("ticker", "2330").strip()
+    question = request.args.get("question", "").strip()
+    if not question:
+        return jsonify({"error": "缺少 question 參數"}), 400
+
+    session_cookie = _STATEMENTDOG_SESSION
+    if not session_cookie:
+        return jsonify({"error": "未設定 STATEMENTDOG_SESSION 環境變數"}), 500
+
+    ua           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    cookie_hdr   = f"_statementdog_session_v2={session_cookie}"
+    analysis_url = f"https://statementdog.com/analysis/{ticker}"
+
+    # 取頁面 HTML（用於 page_context）
+    try:
+        page_r = http_req.get(
+            analysis_url,
+            headers={"Cookie": cookie_hdr, "User-Agent": ua},
+            timeout=15,
+        )
+        page_html = page_r.text
+    except Exception as e:
+        return jsonify({"error": f"無法取得頁面: {e}"}), 500
+
+    # 從 title 抽股票名稱
+    m = re.search(r"<title>(\d{4,6})([一-鿿]+)股票", page_html)
+    stock_name = m.group(2) if m else ticker
+
+    # 注入 analysis-app-meta-data（讓 AI 識別正確股票）
+    meta_attrs = (
+        f' data-route="/{ticker}"'
+        f' data-ticker="{ticker}"'
+        f' data-stock-name="{stock_name}"'
+        f' data-stock-company-name="{stock_name}"'
+        f' data-stock-country="tw"'
+        f' data-ticker-name="{ticker} {stock_name}"'
+    )
+    if 'id="analysis-app-meta-data"' in page_html:
+        page_html = re.sub(
+            r'<div id="analysis-app-meta-data"[^>]*>',
+            f'<div id="analysis-app-meta-data"{meta_attrs}>',
+            page_html, count=1,
+        )
+    else:
+        page_html += f'<div id="analysis-app-meta-data"{meta_attrs}></div>'
+
+    # 問題加入股票代號讓 AI 定位正確
+    user_input = f"{ticker} {stock_name} {question}"
+
+    payload = {
+        "user_input": user_input,
+        "metadata": {
+            "page_context":     page_html,
+            "selected_context": "",
+            "current_url":      analysis_url,
+            "labels":           [f"{ticker} {stock_name}"],
+            "question_from":    "page_default_question",
+        },
+    }
+    api_hdrs = {
+        "Cookie":       cookie_hdr,
+        "User-Agent":   ua,
+        "Content-Type": "application/json",
+        "Referer":      analysis_url,
+    }
+
+    try:
+        r = http_req.post(
+            "https://statementdog.com/api/v1/ai_chat",
+            json=payload, headers=api_hdrs,
+            stream=True, timeout=90,
+        )
+        r.encoding = "utf-8"
+
+        full_text = ""
+        buf = b""
+
+        def parse_event(evt_bytes):
+            try:
+                text = evt_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text = evt_bytes.decode("utf-8", errors="replace")
+            parts = []
+            for ln in text.splitlines():
+                if ln.startswith("data:"):
+                    parts.append(ln[5:].lstrip(" "))
+            return "".join(parts)
+
+        for chunk in r.iter_content(chunk_size=None):
+            if not chunk:
+                continue
+            buf += chunk
+            while b"\n\n" in buf:
+                evt, buf = buf.split(b"\n\n", 1)
+                data_str = parse_event(evt)
+                if not data_str or data_str.strip() == "[DONE]":
+                    continue
+                try:
+                    d = json.loads(data_str)
+                    t = d.get("type", "")
+                    if t == "delta":
+                        full_text += d.get("content", "")
+                    elif t == "done":
+                        content = d.get("content", "")
+                        if content and not full_text:
+                            full_text = content
+                except json.JSONDecodeError:
+                    pass
+
+        return jsonify({
+            "answer":     full_text,
+            "question":   question,
+            "ticker":     ticker,
+            "stock_name": stock_name,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
