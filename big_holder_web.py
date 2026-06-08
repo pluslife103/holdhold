@@ -131,6 +131,9 @@ def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataF
     for attempt in range(3):
         try:
             r = requests.get(FINMIND_BASE, params=params, timeout=60)
+            if r.status_code == 402:
+                body402 = r.json() if r.content else {}
+                raise _FinMindRateLimit(body402.get("msg", "FinMind 402: 超過請求頻率限制"))
             if r.status_code in (400, 403):
                 # Permanent error (not subscribed / bad request) — cache empty to skip future calls
                 _cset(key, pd.DataFrame())
@@ -141,8 +144,12 @@ def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataF
                 df = pd.DataFrame(body.get("data", []))
                 _cset(key, df)
                 return df
+            if body.get("status") == 402:
+                raise _FinMindRateLimit(body.get("msg", "FinMind 402: 超過請求頻率限制"))
             print(f"  FinMind [{dataset}][{sid}]: {body.get('msg','')}")
             return pd.DataFrame()
+        except _FinMindRateLimit:
+            raise
         except Exception as exc:
             if attempt == 2:
                 print(f"  FinMind error [{dataset}][{sid}]: {exc}")
@@ -227,6 +234,16 @@ def _load_stocks() -> None:
                 mcap[sid] = cap
     _STOCK_MCAP = mcap
     print(f"  股票清單：{len(_STOCKS)} 支，產業別已知：{sum(1 for v in _STOCK_INDUSTRY.values() if v)} 支，市值已知：{len(_STOCK_MCAP)} 支")
+
+
+def _thold_for(stock_id: str) -> float:
+    """主力門檻：市值千分之1.5，上限 5,000 萬，下限 800 萬。"""
+    mcap_億 = (_STOCK_MCAP.get(stock_id)
+               or _GRADING.get(stock_id, {}).get("market_cap_億")
+               or 0)
+    if mcap_億 and mcap_億 > 0:
+        return max(8_000_000, min(mcap_億 * 150_000, 50_000_000))
+    return 8_000_000
 
 
 def _load_stocks_from_twse_openapi() -> pd.DataFrame:
@@ -427,7 +444,12 @@ def _run_grading() -> None:
     with ThreadPoolExecutor(max_workers=GRADE_WORKERS) as ex:
         futs = {ex.submit(_fetch_one_grading, sid): sid for sid in sids}
         for fut in as_completed(futs):
-            result = fut.result()
+            try:
+                result = fut.result()
+            except _FinMindRateLimit:
+                result = None
+            except Exception:
+                result = None
             if result:
                 raw.append(result)
             with _CLOCK:
@@ -449,6 +471,7 @@ def _run_grading() -> None:
     _GRADE_PROG["running"] = False
     print(f"  分級完成：{len(raw)}/{len(sids)} 支股票有詳細資料，_GRADING 共 {len(_GRADING)} 支")
     import gc; gc.collect()  # release DataFrame memory held by grading workers
+    _save_grading_snapshot()
 
 
 # ── 資料處理 ──────────────────────────────────────────────────────────────
@@ -776,9 +799,11 @@ def _startup_tasks():
     _load_stocks()
     _load_ov_snapshot()       # 恢復大戶總覽掃描結果
     _load_indcap_snapshot()   # 恢復產業市值走勢快照
-    _init_tier_grading()   # 立即從市值預分層，讓 tier 按鈕可用
-    _prefetch_industry_chain()  # 預熱 cache，避免 grading 耗盡 quota 後使用者遇到 rate limit
-    _run_grading()         # 背景逐支抓詳細資料（更新 grade / sparkline）
+    _init_tier_grading()      # 立即從市值預分層，讓 tier 按鈕可用
+    _prefetch_industry_chain()
+    grading_fresh = _load_grading_snapshot()  # 若快照 < 26h，跳過重新 grading（節省 ~5000 API calls）
+    if not grading_fresh:
+        _run_grading()        # 快照過期或不存在，重新抓詳細資料
     threading.Thread(target=_auto_scan_loop, daemon=True).start()  # 每日 06:00 TW 自動掃描
 
 
@@ -950,7 +975,7 @@ def api_broker(
         _cset(ckey, result)
         return result
 
-    INST_THRESHOLD = 8_000_000  # 買進+賣出金額合計 > 800萬 → 主力
+    INST_THRESHOLD = _thold_for(stock_id)
 
     # 序號連號且分點名稱相同 → 合併為同一筆
     processed = []
@@ -1059,11 +1084,11 @@ def api_broker_trader(
         _cset(ckey, result)
         return result
 
-    INST_THRESHOLD = 8_000_000
     processed = []
     i = 0
     while i < len(rows_raw):
         sid  = rows_raw[i].get("stock_id", "")
+        _thold_sid = _thold_for(sid)
         g_buy_s = g_sell_s = g_buy_amt = g_sell_amt = 0.0
         j2 = i
         while j2 < len(rows_raw) and rows_raw[j2].get("stock_id", "") == sid:
@@ -1089,7 +1114,7 @@ def api_broker_trader(
             "sell_price":  avg_sell_px,
             "buy_amount":  round(g_buy_amt),
             "sell_amount": round(g_sell_amt),
-            "is_retail":   g_buy_amt <= INST_THRESHOLD and g_sell_amt <= INST_THRESHOLD,
+            "is_retail":   g_buy_amt <= _thold_sid and g_sell_amt <= _thold_sid,
         })
         i = j2
 
@@ -1121,6 +1146,13 @@ class _FinMindRateLimit(Exception):
     pass
 
 
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(_FinMindRateLimit)
+async def _rate_limit_handler(request, exc):
+    return JSONResponse(status_code=429, content={"detail": f"FinMind API 每小時配額已用盡（402），請稍後再試。{exc}"})
+
+
 def _fetch_broker_day(token: str, stock_id: str, date: str):
     """Fetch+process one stock's broker data for one date. Cached. Returns rows list or []."""
     ckey = f"broker|{stock_id}|{date}"
@@ -1146,7 +1178,7 @@ def _fetch_broker_day(token: str, stock_id: str, date: str):
     if not rows_raw:
         _cset(ckey, {"stock_id": stock_id, "date": date, "rows": [], "summary": {}})
         return []
-    THOLD = 8_000_000
+    THOLD = _thold_for(stock_id)
     processed, i = [], 0
     while i < len(rows_raw):
         name = rows_raw[i].get("securities_trader", "")
@@ -1202,7 +1234,8 @@ _OV_SCAN: dict = {
 _OV_SCAN_LOCK = threading.Lock()
 _DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent))
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
-_OV_SNAPSHOT_PATH = _DATA_DIR / "ov_scan_snapshot.json"
+_OV_SNAPSHOT_PATH      = _DATA_DIR / "ov_scan_snapshot.json"
+_GRADING_SNAPSHOT_PATH = _DATA_DIR / "grading_snapshot.json"
 
 
 def _save_ov_snapshot():
@@ -1218,6 +1251,43 @@ def _save_ov_snapshot():
         print(f"[Snapshot] 已儲存 {len(data['results'])} 支股票 → {_OV_SNAPSHOT_PATH.name}")
     except Exception as exc:
         print(f"[Snapshot] 儲存失敗: {exc}")
+
+
+def _save_grading_snapshot():
+    try:
+        with _CLOCK:
+            snap = {k: v for k, v in _GRADING.items()}
+        data = {"saved_at": datetime.utcnow().isoformat(), "grading": snap}
+        _GRADING_SNAPSHOT_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(f"[GradingSnap] 已儲存 {len(snap)} 支 → {_GRADING_SNAPSHOT_PATH.name}")
+    except Exception as exc:
+        print(f"[GradingSnap] 儲存失敗: {exc}")
+
+
+def _load_grading_snapshot() -> bool:
+    """載入 grading snapshot。若快照存在且不超過 26 小時，直接填入 _GRADING，回傳 True（跳過重跑）。"""
+    if not _GRADING_SNAPSHOT_PATH.exists():
+        return False
+    try:
+        data = json.loads(_GRADING_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        saved_at_str = data.get("saved_at", "")
+        if saved_at_str:
+            from datetime import timezone
+            saved_at = datetime.fromisoformat(saved_at_str)
+            age_h = (datetime.utcnow() - saved_at).total_seconds() / 3600
+            if age_h > 26:
+                print(f"[GradingSnap] 快照已過期（{age_h:.1f}h），重新計算")
+                return False
+        snap = data.get("grading", {})
+        if not snap:
+            return False
+        with _CLOCK:
+            _GRADING.update(snap)
+        print(f"[GradingSnap] 已載入 {len(snap)} 支（儲存於 {saved_at_str[:19]}）")
+        return True
+    except Exception as exc:
+        print(f"[GradingSnap] 載入失敗: {exc}")
+        return False
 
 
 def _load_ov_snapshot():
@@ -1276,7 +1346,7 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
     if not rows_raw:
         _cset(ckey, [])
         return []
-    THOLD = 8_000_000
+    THOLD = _thold_for(stock_id)
     agg: dict = defaultdict(
         lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0, "buy_amt": 0.0, "sell_amt": 0.0}
     )
@@ -1306,26 +1376,80 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
 
 
 def _fetch_broker_range(token: str, stock_id: str, dates: list, force: bool = False) -> dict:
-    """Fetch broker data one day at a time using start_date=end_date per call.
+    """Fetch broker data for a range of dates using ONE bulk API call for uncached dates.
     Returns {date_str: [processed_rows]}."""
+    from collections import defaultdict
     if not dates:
         return {}
 
     result: dict = {}
+    uncached: list = []
+
     for date_str in dates:
         day_ckey = f"broker_day|{stock_id}|{date_str}"
         if force:
-            # Clear stale per-day cache so we re-fetch from API
             with _CLOCK:
                 _CACHE.pop(day_ckey, None)
         cached_day = _cget(day_ckey, ttl_h=12)
-        if cached_day is None:
-            time.sleep(0.13)  # ~7 API calls/sec = 420/min, safely under 600/min
-            rows = _fetch_broker_day(token, stock_id, date_str)  # raises _FinMindRateLimit on 402
+        if cached_day is not None:
+            if cached_day:
+                result[date_str] = cached_day
         else:
-            rows = cached_day
-        if rows:
-            result[date_str] = rows
+            uncached.append(date_str)
+
+    if uncached:
+        # FinMind TaiwanStockTradingDailyReport only accepts single-day queries (no end_date).
+        THOLD = _thold_for(stock_id)
+        for date_str in uncached:
+            day_ok = False
+            day_data: list = []
+            try:
+                rb = requests.get(
+                    FINMIND_BASE,
+                    params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                            "start_date": date_str, "token": token},
+                    timeout=30,
+                )
+                j = rb.json()
+                if rb.status_code == 402 or j.get("status") == 402:
+                    raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
+                day_ok = rb.status_code == 200 and j.get("status") in (200, None)
+                if day_ok:
+                    day_data = j.get("data", [])
+            except _FinMindRateLimit:
+                raise
+            except Exception:
+                day_ok = False
+
+            agg: dict = defaultdict(
+                lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0,
+                         "buy_amt": 0.0, "sell_amt": 0.0}
+            )
+            for row in day_data:
+                bid   = row.get("securities_trader_id", "")
+                buy_s = float(row.get("buy",   0) or 0)
+                sel_s = float(row.get("sell",  0) or 0)
+                px    = float(row.get("price", 0) or 0)
+                agg[bid]["name"]     = row.get("securities_trader", "")
+                agg[bid]["buy_s"]   += buy_s
+                agg[bid]["sell_s"]  += sel_s
+                agg[bid]["buy_amt"] += buy_s * px
+                agg[bid]["sell_amt"]+= sel_s * px
+            processed = []
+            for bid, v in agg.items():
+                processed.append({
+                    "name": v["name"], "id": bid,
+                    "buy":  round(v["buy_s"] / 1000),
+                    "sell": round(v["sell_s"] / 1000),
+                    "net":  round((v["buy_s"] - v["sell_s"]) / 1000),
+                    "buy_amount": v["buy_amt"], "sell_amount": v["sell_amt"],
+                    "is_retail": v["buy_amt"] <= THOLD and v["sell_amt"] <= THOLD,
+                })
+            day_ckey = f"broker_day|{stock_id}|{date_str}"
+            _cset(day_ckey, processed)
+            if processed:
+                result[date_str] = processed
+            time.sleep(0.35)
 
     return result
 
@@ -1335,7 +1459,7 @@ def _scan_one_stock(token: str, stock_id: str, dates: list, start: str, end: str
     """Fetch + compute overview item for one stock."""
     broker_data = _fetch_broker_range(token, stock_id, dates, force=force)
     price_map   = _fetch_price_range(stock_id, start, end)
-    THOLD = 8_000_000
+    THOLD = _thold_for(stock_id)
     timeline = []
     for dt in sorted(dates):
         rows  = broker_data.get(dt, [])
@@ -1404,30 +1528,30 @@ def _ov_scan_worker(token: str, stock_ids: list, days: int, force: bool = False)
                     _OV_SCAN["done"] += 1
                 continue
 
-        for attempt in range(3):
-            try:
-                item = _scan_one_stock(token, stock_id, dates, start, end, force=force)
-                _cset(ckey, item)
-                with _OV_SCAN_LOCK:
-                    _OV_SCAN["results"][stock_id] = item
-                    _OV_SCAN["done"] += 1
-                break
-            except _FinMindRateLimit as rl_exc:
-                if attempt < 2:
-                    time.sleep(60)
-                else:
-                    with _OV_SCAN_LOCK:
-                        _OV_SCAN["done"] += 1
-                        _OV_SCAN["skip"] += 1
-                        _OV_SCAN["last_err"] = f"FinMind 402: {rl_exc or '每日API次數超限'}"
-            except Exception as exc:
-                import traceback
-                with _OV_SCAN_LOCK:
-                    _OV_SCAN["done"] += 1
-                    _OV_SCAN["skip"] += 1
-                    _OV_SCAN["last_err"] = f"{stock_id}: {exc}"
-                print(f"  [OV] {stock_id} error: {traceback.format_exc()[:300]}")
-                break
+        rate_limited = False
+        try:
+            item = _scan_one_stock(token, stock_id, dates, start, end, force=force)
+            _cset(ckey, item)
+            with _OV_SCAN_LOCK:
+                _OV_SCAN["results"][stock_id] = item
+                _OV_SCAN["done"] += 1
+        except _FinMindRateLimit as rl_exc:
+            with _OV_SCAN_LOCK:
+                _OV_SCAN["done"] += 1
+                _OV_SCAN["skip"] += 1
+                _OV_SCAN["last_err"] = f"FinMind 配額已用盡（402），掃描中止，請稍後重新掃描"
+            print(f"  [OV] 402 quota exhausted — aborting scan at {stock_id}")
+            rate_limited = True
+        except Exception as exc:
+            import traceback
+            with _OV_SCAN_LOCK:
+                _OV_SCAN["done"] += 1
+                _OV_SCAN["skip"] += 1
+                _OV_SCAN["last_err"] = f"{stock_id}: {exc}"
+            print(f"  [OV] {stock_id} error: {traceback.format_exc()[:300]}")
+
+        if rate_limited:
+            break
 
         time.sleep(0.5)   # extra buffer between stocks on top of per-day throttle inside _fetch_broker_range
 
@@ -1545,7 +1669,11 @@ def api_ov_scan_start(
         else:
             stock_ids = tier_stocks
     else:
-        stock_ids = [s["stock_id"] for s in _STOCKS]
+        with _CLOCK:
+            stock_ids = sorted(
+                [s["stock_id"] for s in _STOCKS],
+                key=lambda sid: TIER_ORDER.get(_GRADING.get(sid, {}).get("tier", ""), 999)
+            )
     with _OV_SCAN_LOCK:
         _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
                          "error": "", "days": days, "skip": 0, "last_err": "",
@@ -2322,7 +2450,6 @@ def api_multi_timeline(
             dates.append(d.isoformat())
         d += td(days=1)
 
-    THOLD = 8_000_000
     raw: dict       = {s: {} for s in stock_list}
     price_raw: dict = {s: {} for s in stock_list}
     rate_err: list  = []
@@ -2360,6 +2487,7 @@ def api_multi_timeline(
 
     output = []
     for stock_id in stock_list:
+        THOLD = _thold_for(stock_id)
         timeline = []
         for dt in sorted(dates):
             rows  = raw[stock_id].get(dt, [])
@@ -2453,91 +2581,92 @@ def api_big_player_timeline(
             dates.append(d.isoformat())
         d += td(days=1)
 
-    THRESHOLD = 8_000_000
+    THRESHOLD = _thold_for(stock_id)
 
-    def _fetch_one(date: str):
+    # ── step 1: check per-day cache ────────────────────────────────────────
+    day_map: dict = {}
+    uncached: list = []
+    for date in dates:
         ckey = f"broker|{stock_id}|{date}"
         cached = _cget(ckey, ttl_h=6)
         if cached is not None:
-            return date, cached.get("rows", [])
-        try:
-            r = requests.get(
-                FINMIND_BASE,
-                params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
-                        "start_date": date, "end_date": date, "token": token},
-                timeout=20,
-            )
-            j = r.json()
-        except Exception:
-            return date, None
-        if r.status_code != 200 or j.get("status") not in (200, None):
-            return date, None
-        rows_raw = j.get("data", [])
-        if not rows_raw:
-            _cset(ckey, {"stock_id": stock_id, "date": date, "rows": [], "summary": {}})
-            return date, []
-        processed = []
-        i = 0
-        while i < len(rows_raw):
-            name = rows_raw[i].get("securities_trader", "")
-            bid  = rows_raw[i].get("securities_trader_id", "")
-            g_buy_s = g_sell_s = g_buy_amt = g_sell_amt = 0.0
-            j2 = i
-            while j2 < len(rows_raw) and rows_raw[j2].get("securities_trader", "") == name:
-                row = rows_raw[j2]
-                bs  = float(row.get("buy",   0) or 0)
-                ss  = float(row.get("sell",  0) or 0)
-                px  = float(row.get("price", 0) or 0)
-                g_buy_s += bs; g_sell_s += ss
-                g_buy_amt += bs * px; g_sell_amt += ss * px
-                j2 += 1
-            buy_lots  = g_buy_s  / 1000
-            sell_lots = g_sell_s / 1000
-            avg_buy_px  = round(g_buy_amt  / g_buy_s,  2) if g_buy_s  else 0.0
-            avg_sell_px = round(g_sell_amt / g_sell_s, 2) if g_sell_s else 0.0
-            processed.append({
-                "broker_id":   bid,
-                "broker_name": name,
-                "buy":         int(buy_lots),
-                "sell":        int(sell_lots),
-                "net":         int(buy_lots - sell_lots),
-                "buy_price":   avg_buy_px,
-                "sell_price":  avg_sell_px,
-                "buy_amount":  round(g_buy_amt),
-                "sell_amount": round(g_sell_amt),
-                "is_retail":   g_buy_amt <= THRESHOLD and g_sell_amt <= THRESHOLD,
-            })
-            i = j2
-        retail = [r for r in processed if r["is_retail"]]
-        inst   = [r for r in processed if not r["is_retail"]]
-        result = {
-            "stock_id": stock_id,
-            "date":     date,
-            "rows":     processed,
-            "summary": {
-                "total":        len(processed),
-                "retail_count": len(retail),
-                "inst_count":   len(inst),
-                "retail_buy":   sum(r["buy"]  for r in retail),
-                "retail_sell":  sum(r["sell"] for r in retail),
-                "retail_net":   sum(r["net"]  for r in retail),
-                "inst_buy":     sum(r["buy"]  for r in inst),
-                "inst_sell":    sum(r["sell"] for r in inst),
-                "inst_net":     sum(r["net"]  for r in inst),
-            },
-        }
-        _cset(ckey, result)
-        return date, processed
+            day_map[date] = cached.get("rows", [])
+        else:
+            uncached.append(date)
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futs = {ex.submit(_fetch_one, d): d for d in dates}
-        day_map = {}
-        for fut in as_completed(futs):
-            date, rows = fut.result()
-            day_map[date] = rows
+    # ── step 2: chunked bulk API calls for uncached dates (15-day chunks) ───
+    def _process_bulk_rows(raw_rows: list, dates_chunk: list):
+        raw_by_date: dict = {}
+        for rrow in raw_rows:
+            ds = str(rrow.get("date", ""))[:10]
+            raw_by_date.setdefault(ds, []).append(rrow)
+        for date in dates_chunk:
+            rrows = sorted(raw_by_date.get(date, []),
+                           key=lambda x: x.get("securities_trader", ""))
+            processed: list = []
+            pi = 0
+            while pi < len(rrows):
+                nm = rrows[pi].get("securities_trader", "")
+                bid = rrows[pi].get("securities_trader_id", "")
+                g_bs = g_ss = g_ba = g_sa = 0.0
+                pj = pi
+                while pj < len(rrows) and rrows[pj].get("securities_trader", "") == nm:
+                    rr = rrows[pj]
+                    bs2 = float(rr.get("buy",   0) or 0)
+                    ss2 = float(rr.get("sell",  0) or 0)
+                    px2 = float(rr.get("price", 0) or 0)
+                    g_bs += bs2; g_ss += ss2
+                    g_ba += bs2 * px2; g_sa += ss2 * px2
+                    pj += 1
+                bl = g_bs / 1000; sl = g_ss / 1000
+                processed.append({
+                    "broker_id":   bid,
+                    "broker_name": nm,
+                    "buy":         int(bl),
+                    "sell":        int(sl),
+                    "net":         int(bl - sl),
+                    "buy_price":   round(g_ba / g_bs, 2) if g_bs else 0.0,
+                    "sell_price":  round(g_sa / g_ss, 2) if g_ss else 0.0,
+                    "buy_amount":  round(g_ba),
+                    "sell_amount": round(g_sa),
+                    "is_retail":   g_ba <= 8_000_000 and g_sa <= 8_000_000,
+                })
+                pi = pj
+            ckey = f"broker|{stock_id}|{date}"
+            _cset(ckey, {"stock_id": stock_id, "date": date, "rows": processed, "summary": {}})
+            day_map[date] = processed
+
+    # FinMind TaiwanStockTradingDailyReport only accepts single-day queries (no end_date).
+    if uncached:
+        for date in uncached:
+            try:
+                rb_resp = requests.get(
+                    FINMIND_BASE,
+                    params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
+                            "start_date": date, "token": token},
+                    timeout=30,
+                )
+                rb_json = rb_resp.json()
+                rb_ok = rb_resp.status_code == 200 and rb_json.get("status") in (200, None)
+                print(f"[TL] {stock_id} day {date} "
+                      f"http={rb_resp.status_code} fm={rb_json.get('status')} "
+                      f"rows={len(rb_json.get('data',[]))} ok={rb_ok}")
+            except Exception as exc:
+                rb_ok = False
+                print(f"[TL] {stock_id} day {date} exc={exc}")
+                rb_json = {}
+            if rb_ok:
+                _process_bulk_rows(rb_json.get("data", []), [date])
+            else:
+                if rb_json.get("status") == 402 or (
+                        hasattr(rb_resp, "status_code") and rb_resp.status_code == 402):
+                    raise HTTPException(429, f"FinMind API 每小時配額已用盡（402），請約 1 小時後再試")
+                day_map[date] = []
+            time.sleep(0.35)
 
     # ── fetch price + volume first so we can use close for broker scoring ──
     pdf = _fm("TaiwanStockPrice", stock_id, start_d.isoformat(), end_d.isoformat())
+    print(f"[TL] {stock_id} price_rows={len(pdf)} day_map_keys={len(day_map)}")
     price_map: dict = {}
     if not pdf.empty:
         for _, pr in pdf.iterrows():
@@ -2554,23 +2683,30 @@ def api_big_player_timeline(
     # FinMind TaiwanStockTradingDailyReport has no price field, so buy_amount
     # in the cached rows is 0. Recalculate using closing price.
     all_dates = sorted(set(price_map.keys()) | set(day_map.keys()))
+    FIXED_8M = 8_000_000
     timeline = []
     for date in all_dates:
         rows  = day_map.get(date) or []
         pr    = price_map.get(date, {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0})
         close = pr["close"]
-        bs = ss = rb = rs = 0
+        bs = ss = rb = rs = bs8 = ss8 = 0
         for row in rows:
             buy_lots  = row.get("buy",  0)
             sell_lots = row.get("sell", 0)
             buy_amt  = buy_lots  * 1000 * close if close > 0 else row.get("buy_amount",  0)
             sell_amt = sell_lots * 1000 * close if close > 0 else row.get("sell_amount", 0)
-            if buy_amt > THRESHOLD or sell_amt > THRESHOLD:
-                bs += int(buy_amt  // THRESHOLD)
-                ss += int(sell_amt // THRESHOLD)
+            # 大戶金額：固定 800萬 門檻（大戶定義）
+            if buy_amt > FIXED_8M or sell_amt > FIXED_8M:
+                bs8 += int(buy_amt  // FIXED_8M)
+                ss8 += int(sell_amt // FIXED_8M)
+            # 散戶：買賣皆 ≤ 800萬
             else:
                 rb += buy_lots
                 rs += sell_lots
+            # 主力強度：市值千分之1.5 門檻（相對強度）
+            if buy_amt > THRESHOLD or sell_amt > THRESHOLD:
+                bs += int(buy_amt  // THRESHOLD)
+                ss += int(sell_amt // THRESHOLD)
         timeline.append({
             "date":        date,
             "buy_score":   bs,
@@ -2578,6 +2714,8 @@ def api_big_player_timeline(
             "net_score":   bs - ss,
             "retail_buy":  rb,
             "retail_sell": rs,
+            "buy_8m":      bs8,
+            "sell_8m":     ss8,
             "open":        pr["open"],
             "high":        pr["high"],
             "low":         pr["low"],
@@ -2585,7 +2723,8 @@ def api_big_player_timeline(
             "volume":      pr["volume"],
         })
 
-    return {"stock_id": stock_id, "timeline": timeline}
+    stock_name = _STOCK_MAP.get(stock_id, "")
+    return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2604,6 +2743,7 @@ _HTML = r"""<!DOCTYPE html>
 <title>千張大戶分析</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
 :root{
   --bg:#0d1117;--sur:#161b22;--sur2:#21262d;--bor:#30363d;
@@ -2651,8 +2791,9 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 
 /* ── Main ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.tabs{display:flex;gap:0;padding:0 16px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur)}
-.tab{padding:10px 18px;cursor:pointer;border-bottom:2px solid transparent;color:var(--mut);font-size:13px;transition:.15s}
+.tabs{display:flex;gap:0;padding:0 16px;border-bottom:1px solid var(--bor);flex-shrink:0;background:var(--sur);overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{padding:10px 18px;cursor:pointer;border-bottom:2px solid transparent;color:var(--mut);font-size:13px;transition:.15s;white-space:nowrap;flex-shrink:0}
 .tab:hover{color:var(--txt)}
 .tab.active{color:var(--acc);border-bottom-color:var(--acc)}
 .pane{display:none;flex:1;overflow:hidden;flex-direction:column}
@@ -2921,6 +3062,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('grade')">分級排行</div>
       <div class="tab" onclick="switchTab('broker')">🏦 分點籌碼</div>
       <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
+      <div class="tab" onclick="switchTab('snapshots')">📷 截圖紀錄 <span id="snap-count-badge" style="display:none;font-size:10px;padding:1px 5px;background:var(--sur2);border-radius:8px;margin-left:4px"></span></div>
       <div class="tab" onclick="switchTab('kline')">📈 K線分析</div>
       <div class="tab" onclick="switchTab('chain')">🏭 產業鏈</div>
       <div class="tab" onclick="switchTab('flow')">🔗 傳導鏈</div>
@@ -3177,6 +3319,8 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;font-size:12px">重新掃描</button>
           <button class="sort-btn" onclick="ovToggleCustom()"
             style="font-size:11px;padding:3px 10px" id="ov-custom-btn">自訂股票</button>
+          <button class="sort-btn" onclick="ovSnapshot()" id="ov-snap-btn"
+            style="font-size:11px;padding:3px 10px" title="將目前大戶總覽擷取為 PNG 圖片下載">截圖</button>
         </div>
         <!-- 規模篩選 -->
         <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;align-items:center">
@@ -3205,6 +3349,19 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
                display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
                gap:10px;align-content:start">
         <div class="empty" style="grid-column:1/-1;color:var(--mut)">← 點左側規模按鈕開始掃描</div>
+      </div>
+    </div>
+
+    <!-- 截圖紀錄 pane -->
+    <div class="pane" id="pane-snapshots">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;display:flex;align-items:center;gap:12px">
+        <span style="font-weight:700;font-size:13px">截圖紀錄</span>
+        <span id="snap-count-label" style="font-size:11px;color:var(--mut)">尚無截圖</span>
+        <button class="sort-btn" onclick="_snapClearAll()" style="font-size:10px;padding:2px 10px;color:var(--red);margin-left:auto">全部清除</button>
+      </div>
+      <div id="ov-snap-list"
+        style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-wrap:wrap;gap:16px;align-content:flex-start">
+        <div class="empty" style="color:var(--mut);width:100%">在大戶總覽按「截圖」後，截圖會出現在這裡</div>
       </div>
     </div>
 
@@ -3434,6 +3591,13 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
     </svg>
     <span>總覽</span>
+  </button>
+  <button class="bnav-btn" id="bnav-snapshots" onclick="switchTab('snapshots')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
+      <circle cx="12" cy="13" r="4"/>
+    </svg>
+    <span>截圖</span>
   </button>
   <button class="bnav-btn" id="bnav-kline" onclick="switchTab('kline')">
     <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
@@ -3912,7 +4076,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview','kline','chain','flow','indcap'];
+  const tabNames = ['single','compare','grade','broker','overview','snapshots','kline','chain','flow','indcap'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -4012,23 +4176,30 @@ async function loadTimeline() {
       wrap.innerHTML = '<div class="empty">此區間無大戶活動資料</div>';
       return;
     }
-    renderTimeline(d.timeline, stock);
+    renderTimeline(d.timeline, stock, d.thold || 8000000, d.stock_name || '');
   } catch(e) {
     wrap.innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
   }
 }
 
-function renderTimeline(tl, stock) {
+function _fmtThold(t) {
+  if (t >= 1e8) return (t / 1e8).toFixed(1) + '億';
+  return Math.round(t / 1e4) + '萬';
+}
+
+function renderTimeline(tl, stock, thold, stockName) {
+  thold = thold || 8000000;
   const wrap = document.getElementById('broker-timeline-wrap');
 
   const total_buy  = tl.reduce((s,d) => s+d.buy_score,  0);
   const total_sell = tl.reduce((s,d) => s+d.sell_score, 0);
   const total_net  = total_buy - total_sell;
   const netColor   = total_net > 0 ? '#f85149' : total_net < 0 ? '#3fb950' : '#8b949e';
+  const tholdStr   = _fmtThold(thold);
 
   wrap.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:4px">
-      <span style="font-weight:700;font-size:13px">${stock} 大戶時間軸</span>
+      <span style="font-weight:700;font-size:13px">${stock}${stockName ? ' ' + stockName : ''} 大戶時間軸</span>
       <div style="display:flex;gap:12px;font-size:12px">
         <span style="color:#f85149">主力買 +${total_buy}</span>
         <span style="color:#3fb950">主力賣 -${total_sell}</span>
@@ -4036,12 +4207,14 @@ function renderTimeline(tl, stock) {
       </div>
     </div>
     <div style="font-size:10px;color:#8b949e;margin-bottom:6px;line-height:1.7">
-      <span style="color:#c9d1d9;font-weight:600">主力判斷：</span>單一分點當日買進<em>或</em>賣出金額 &gt; 800萬 NTD 即視為主力。
+      <span style="color:#58a6ff;font-weight:600">大戶定義：</span>單一分點當日買進<em>或</em>賣出金額 &gt; <span style="color:#e3b341">800萬 NTD</span> 即視為大戶。
       <span style="color:#c9d1d9;font-weight:600;margin-left:8px">柱高單位：</span>該分點金額 ÷ 800萬（無條件捨去），例如買 1,600萬 = 2格、買 4,000萬 = 5格。
-      <span style="color:#c9d1d9;font-weight:600;margin-left:8px">散戶：</span>單日買賣 ≤ 800萬 的分點，柱高單位為<em>張數</em>。
+      <span style="color:#c9d1d9;font-weight:600;margin-left:8px">散戶：</span>單日買賣 ≤ 800萬 的分點，柱高單位為大戶。
+      <br>
+      <span style="color:#f78166;font-weight:600">主力定義：</span>單一分點當日買進<em>或</em>賣出金額 &gt; 該公司市值 × <span style="color:#e3b341">0.15%</span>（千分之1.5）即視為主力。
       <span style="margin-left:8px">紅漲綠跌（台股慣例）</span>
     </div>
-    <div id="tl-chart" style="width:100%;height:620px"></div>`;
+    <div id="tl-chart" style="width:100%;height:820px"></div>`;
 
   const dates       = tl.map(d => d.date);
   const closes      = tl.map(d => d.close  || null);
@@ -4051,6 +4224,8 @@ function renderTimeline(tl, stock) {
   const volumes     = tl.map(d => d.volume || 0);
   const buyScores   = tl.map(d =>  d.buy_score);
   const sellScores  = tl.map(d => -d.sell_score);
+  const buy8m       = tl.map(d =>  (d.buy_8m  || 0));
+  const sell8m      = tl.map(d => -(d.sell_8m || 0));
   const retailBuys  = tl.map(d =>  (d.retail_buy  || 0));
   const retailSells = tl.map(d => -(d.retail_sell || 0));
   const hasPrice    = closes.some(c => c && c > 0);
@@ -4095,6 +4270,20 @@ function renderTimeline(tl, stock) {
     hovertemplate: '%{x}<br>主力賣 %{y}<extra></extra>',
   });
 
+  // 大戶金額（固定 800萬門檻）
+  traces.push({
+    type: 'bar', x: dates, y: buy8m,
+    name: '大戶買(金額)', marker: { color: 'rgba(248,81,73,0.75)' },
+    xaxis: 'x', yaxis: 'y5',
+    hovertemplate: '%{x}<br>大戶買(800萬格) +%{y}<extra></extra>',
+  });
+  traces.push({
+    type: 'bar', x: dates, y: sell8m,
+    name: '大戶賣(金額)', marker: { color: 'rgba(63,185,80,0.75)' },
+    xaxis: 'x', yaxis: 'y5',
+    hovertemplate: '%{x}<br>大戶賣(800萬格) %{y}<extra></extra>',
+  });
+
   // 散戶
   traces.push({
     type: 'bar', x: dates, y: retailBuys,
@@ -4109,10 +4298,11 @@ function renderTimeline(tl, stock) {
     hovertemplate: '%{x}<br>散戶賣 %{y}張<extra></extra>',
   });
 
-  // domain: 價格[0.54,1.0]  主力[0.30,0.51]  散戶[0,0.26]
-  const pD = [0.54, 1.00];
-  const iD = [0.30, 0.51];
-  const rD = [0.00, 0.26];
+  // domain: 價格[0.56,1.0]  主力強度[0.41,0.53]  大戶金額[0.22,0.37]  散戶[0,0.18]
+  const pD = [0.56, 1.00];
+  const iD = [0.41, 0.53];
+  const mD = [0.22, 0.37];
+  const rD = [0.00, 0.18];
   const maxVol = hasVolume ? Math.max(...volumes) : 1;
 
   const layout = {
@@ -4139,6 +4329,13 @@ function renderTimeline(tl, stock) {
       title:     { text: '主力強度', font: { size: 10 } },
       gridcolor: '#30363d', linecolor: '#30363d',
       domain: iD,
+      zeroline: true, zerolinecolor: '#8b949e', zerolinewidth: 1,
+      tickfont: { size: 10 },
+    },
+    yaxis5: {
+      title:     { text: '大戶金額', font: { size: 10 } },
+      gridcolor: '#30363d', linecolor: '#30363d',
+      domain: mD,
       zeroline: true, zerolinecolor: '#8b949e', zerolinewidth: 1,
       tickfont: { size: 10 },
     },
@@ -4352,6 +4549,125 @@ async function _ovPollTick() {
 }
 
 function ovSort() { if (_ovData) renderOverviewGrid(); }
+
+const _ovSnapshots = [];  // { id, ts, label, fullUrl, thumbUrl }
+
+async function ovSnapshot() {
+  if (typeof html2canvas === 'undefined') {
+    alert('html2canvas 尚未載入，請稍後再試');
+    return;
+  }
+  const btn = document.getElementById('ov-snap-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '擷取中…'; }
+
+  const grid = document.getElementById('overview-grid');
+  const pane = document.getElementById('pane-overview');
+
+  // 暫時展開 grid 使全部內容可見
+  const origOverflow = grid.style.overflowY;
+  const origHeight   = grid.style.height;
+  const origMaxH     = grid.style.maxHeight;
+  grid.style.overflowY = 'visible';
+  grid.style.height     = 'auto';
+  grid.style.maxHeight  = 'none';
+
+  try {
+    const canvas = await html2canvas(pane, {
+      backgroundColor: '#0d1117',
+      useCORS: true,
+      scale: window.devicePixelRatio || 1,
+      scrollX: 0,
+      scrollY: -window.scrollY,
+      logging: false,
+    });
+
+    const fullUrl  = canvas.toDataURL('image/png');
+
+    // 縮圖：等比例縮到寬 360px
+    const thumbW = 360;
+    const thumbH = Math.round(canvas.height * thumbW / canvas.width);
+    const tc = document.createElement('canvas');
+    tc.width = thumbW; tc.height = thumbH;
+    tc.getContext('2d').drawImage(canvas, 0, 0, thumbW, thumbH);
+    const thumbUrl = tc.toDataURL('image/jpeg', 0.75);
+
+    const ts = new Date();
+    const label = ts.getFullYear() + '-'
+      + String(ts.getMonth()+1).padStart(2,'0') + '-'
+      + String(ts.getDate()).padStart(2,'0') + ' '
+      + String(ts.getHours()).padStart(2,'0') + ':'
+      + String(ts.getMinutes()).padStart(2,'0');
+    const fname = `大戶總覽_${label.replace(/[-: ]/g,'').slice(0,12)}.png`;
+
+    _ovSnapshots.unshift({ id: Date.now(), ts: label, label: fname, fullUrl, thumbUrl });
+    if (_ovSnapshots.length > 5) _ovSnapshots.length = 5;
+    _renderSnapGallery();
+    showToast(`截圖已儲存（共 ${_ovSnapshots.length} 張），可切換到「截圖紀錄」分頁查看`);
+  } catch(e) {
+    alert('截圖失敗：' + e.message);
+  } finally {
+    grid.style.overflowY = origOverflow;
+    grid.style.height     = origHeight;
+    grid.style.maxHeight  = origMaxH;
+    if (btn) { btn.disabled = false; btn.textContent = '截圖'; }
+  }
+}
+
+function _renderSnapGallery() {
+  const list = document.getElementById('ov-snap-list');
+  if (!list) return;
+
+  // 更新 badge 和計數標籤
+  const n = _ovSnapshots.length;
+  const badge = document.getElementById('snap-count-badge');
+  const label = document.getElementById('snap-count-label');
+  if (badge) { badge.textContent = n || ''; badge.style.display = n ? '' : 'none'; }
+  if (label) label.textContent = n ? `共 ${n} 張（最多 5 張）` : '尚無截圖';
+
+  if (!n) {
+    list.innerHTML = '<div class="empty" style="color:var(--mut);width:100%">在大戶總覽按「截圖」後，截圖會出現在這裡</div>';
+    return;
+  }
+  list.innerHTML = _ovSnapshots.map((s, i) => `
+    <div style="background:#161b22;border:1px solid var(--bor);border-radius:8px;padding:10px;width:360px;flex-shrink:0">
+      <img src="${s.thumbUrl}" style="width:100%;border-radius:4px;display:block;cursor:pointer"
+           onclick="_snapView(${i})" title="點擊新分頁開啟全尺寸">
+      <div style="font-size:10px;color:var(--mut);margin-top:6px">${s.ts}</div>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button class="sort-btn" onclick="_snapDownload(${i})" style="font-size:11px;padding:3px 12px">下載 PNG</button>
+        <button class="sort-btn" onclick="_snapDelete(${i})" style="font-size:11px;padding:3px 12px;color:var(--red)">刪除</button>
+      </div>
+    </div>`).join('');
+}
+
+function _snapView(i) {
+  const s = _ovSnapshots[i];
+  if (!s) return;
+  const w = window.open('', '_blank');
+  w.document.write(`<!DOCTYPE html><html><head><title>${s.label}</title>
+    <style>body{margin:0;background:#000;display:flex;justify-content:center}
+    img{max-width:100%;height:auto}</style></head>
+    <body><img src="${s.fullUrl}"></body></html>`);
+}
+
+function _snapDownload(i) {
+  const s = _ovSnapshots[i];
+  if (!s) return;
+  const a = document.createElement('a');
+  a.download = s.label;
+  a.href = s.fullUrl;
+  a.click();
+}
+
+function _snapDelete(i) {
+  _ovSnapshots.splice(i, 1);
+  _renderSnapGallery();
+}
+
+function _snapClearAll() {
+  _ovSnapshots.length = 0;
+  _renderSnapGallery();
+}
 
 const OV_TIERS = [
   { key: 'tril', label: '兆',    icon: '🌐', range: '≥ 1兆'       },
