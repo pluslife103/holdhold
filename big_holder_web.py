@@ -1572,7 +1572,7 @@ def _run_auto_scan_once(label: str = "AutoScan"):
     with _CLOCK:
         stock_ids = sorted(
             [sid for sid, g in _GRADING.items() if g.get("tier", "")],
-            key=lambda sid: TIER_ORDER.get(_GRADING.get(sid, {}).get("tier", ""), 999)
+            key=lambda sid: -(_GRADING.get(sid, {}).get("market_cap_億", 0) or 0)
         )
 
     token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
@@ -1614,7 +1614,7 @@ def _run_auto_scan_once(label: str = "AutoScan"):
 
 
 def _auto_scan_loop():
-    """每日台灣時間 01:00 自動掃描；若無快照（如 redeploy 後）則啟動後立即補跑一次。"""
+    """每日台灣時間 16:30（收盤後）自動掃描最新資料；若無快照（如 redeploy 後）則啟動後立即補跑一次。"""
     TW_OFFSET = timedelta(hours=8)
 
     # redeploy 後快照消失，立即補跑一次（在背景不阻塞其他啟動任務）
@@ -1624,11 +1624,11 @@ def _auto_scan_loop():
 
     while True:
         now_tw = datetime.utcnow() + TW_OFFSET
-        target_tw = now_tw.replace(hour=1, minute=0, second=0, microsecond=0)
+        target_tw = now_tw.replace(hour=16, minute=30, second=0, microsecond=0)
         if now_tw >= target_tw:
             target_tw += timedelta(days=1)
         wait_sec = (target_tw - now_tw).total_seconds()
-        print(f"[AutoScan] 下次掃描 {target_tw.strftime('%Y-%m-%d 01:00')} TW，等待 {wait_sec/3600:.1f}h")
+        print(f"[AutoScan] 下次掃描 {target_tw.strftime('%Y-%m-%d 16:30')} TW，等待 {wait_sec/3600:.1f}h")
         time.sleep(wait_sec)
         _run_auto_scan_once("AutoScan")
 
@@ -1672,7 +1672,7 @@ def api_ov_scan_start(
         with _CLOCK:
             stock_ids = sorted(
                 [s["stock_id"] for s in _STOCKS],
-                key=lambda sid: TIER_ORDER.get(_GRADING.get(sid, {}).get("tier", ""), 999)
+                key=lambda sid: -(_GRADING.get(sid, {}).get("market_cap_億", 0) or 0)
             )
     with _OV_SCAN_LOCK:
         _OV_SCAN.update({"running": True, "done": 0, "total": len(stock_ids),
