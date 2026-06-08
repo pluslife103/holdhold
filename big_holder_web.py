@@ -1421,6 +1421,12 @@ def _fetch_broker_range(token: str, stock_id: str, dates: list, force: bool = Fa
             except Exception:
                 day_ok = False
 
+            if not day_ok:
+                # 抓取失敗（網路逾時/連線錯誤等）：不快取，留待下次掃描重試，
+                # 避免把「失敗」誤當成「當天無資料」永久快取 12 小時
+                time.sleep(0.35)
+                continue
+
             agg: dict = defaultdict(
                 lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0,
                          "buy_amt": 0.0, "sell_amt": 0.0}
