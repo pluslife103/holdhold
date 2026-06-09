@@ -2733,6 +2733,30 @@ def api_big_player_timeline(
     return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
+@app.get("/api/deriv/tech-stocks")
+def api_deriv_tech_stocks():
+    TECH_INDS = {
+        "半導體業", "電腦及周邊設備業", "光電業", "通信網路業",
+        "電子零組件業", "電子通路業", "資訊服務業", "其他電子業",
+    }
+    rows = []
+    for sid, g in _GRADING.items():
+        ind = g.get("industry", "") or ""
+        cap = float(g.get("market_cap_億", 0) or 0)
+        if cap < 3000:
+            continue
+        if ind not in TECH_INDS and not any(kw in ind for kw in ("電子", "半導體", "光電", "通信")):
+            continue
+        rows.append({
+            "stock_id":     sid,
+            "stock_name":   g.get("stock_name", sid),
+            "industry":     ind,
+            "market_cap_億": round(cap, 0),
+        })
+    rows.sort(key=lambda r: -r["market_cap_億"])
+    return {"stocks": rows, "total": len(rows)}
+
+
 @app.get("/api/deriv/futures")
 def api_deriv_futures(contract: str = Query("TE"), days: int = Query(120)):
     import os
@@ -6556,8 +6580,10 @@ function derivSetType(type) {
 function _derivRenderPresets() {
   document.getElementById('deriv-presets').innerHTML =
     DERIV_PRESETS[_derivType].map(p =>
-      `<button class="sort-btn${_derivContract===p.code?' active':''}"
-         onclick="derivPickPreset('${p.code}')">${p.label}</button>`
+      p.code === null
+        ? `<span style="color:var(--bor);padding:0 2px;line-height:26px;user-select:none">│</span>`
+        : `<button class="sort-btn${_derivContract===p.code?' active':''}"
+             onclick="derivPickPreset('${p.code}')">${p.label}</button>`
     ).join('');
 }
 
@@ -6650,9 +6676,29 @@ function _derivRenderOptions(rows, contract) {
   }, {responsive:true, displayModeBar:false});
 }
 
-function derivInit() {
+async function derivInit() {
   if (_derivInited) return;
   _derivInited = true;
+  try {
+    const r  = await fetch('/api/deriv/tech-stocks');
+    const d  = await r.json();
+    const sp = (d.stocks || []).map(s => ({code: s.stock_id, label: s.stock_name}));
+    const sep = {code: null, label: '│'};
+    DERIV_PRESETS.futures = [
+      {code:'TX',  label:'台指期'}, {code:'TE',  label:'電子期'},
+      {code:'TF',  label:'金融期'}, {code:'MTX', label:'小台期'},
+      sep, ...sp
+    ];
+    DERIV_PRESETS.options = [
+      {code:'TXO', label:'台指選'}, {code:'TEO', label:'電子選'},
+      {code:'TFO', label:'金融選'},
+      sep, ...sp
+    ];
+    if (sp.length > 0) {
+      document.getElementById('deriv-status').textContent =
+        `已載入 ${sp.length} 支科技業大型股（市值 ≥ 3,000億）`;
+    }
+  } catch(e) { console.warn('tech-stocks', e); }
   _derivRenderPresets();
 }
 </script>
