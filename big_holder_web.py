@@ -2733,6 +2733,68 @@ def api_big_player_timeline(
     return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
+@app.get("/api/deriv/futures")
+def api_deriv_futures(contract: str = Query("TE"), days: int = Query(120)):
+    import os
+    from datetime import date as dt_date, timedelta as td
+    from collections import defaultdict
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+    start = (dt_date.today() - td(days=int(days * 1.5))).isoformat()
+    end   = dt_date.today().isoformat()
+    df = _fm("TaiwanFuturesDaily", contract.strip(), start, end)
+    if df.empty:
+        return {"data": [], "contract": contract, "msg": f"查無資料（{contract}）"}
+    rows = []
+    for _, r in df.sort_values("date").iterrows():
+        rows.append({
+            "date":   str(r.get("date", ""))[:10],
+            "contract": str(r.get("contract_id", r.get("futures_id", contract))),
+            "open":   float(r.get("open",  0) or 0),
+            "high":   float(r.get("high",  0) or 0),
+            "low":    float(r.get("low",   0) or 0),
+            "close":  float(r.get("close", 0) or 0),
+            "volume": int(r.get("volume", 0) or 0),
+            "oi":     int(r.get("open_interest", 0) or 0),
+        })
+    # keep near-month (max volume) per date
+    by_date: dict = defaultdict(list)
+    for row in rows:
+        by_date[row["date"]].append(row)
+    merged = [max(v, key=lambda x: x["volume"]) for _, v in sorted(by_date.items())]
+    return {"data": merged[-days:], "contract": contract}
+
+
+@app.get("/api/deriv/options")
+def api_deriv_options(contract: str = Query("TXO"), days: int = Query(120)):
+    import os
+    from datetime import date as dt_date, timedelta as td
+    from collections import defaultdict
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+    start = (dt_date.today() - td(days=int(days * 1.5))).isoformat()
+    end   = dt_date.today().isoformat()
+    df = _fm("TaiwanOptionDaily", contract.strip(), start, end)
+    if df.empty:
+        return {"data": [], "contract": contract, "msg": f"查無資料（{contract}）"}
+    daily: dict = defaultdict(lambda: {"call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0})
+    for _, r in df.iterrows():
+        d     = str(r.get("date", ""))[:10]
+        right = str(r.get("option_right", "")).strip().lower()
+        oi    = int(r.get("open_interest", 0) or 0)
+        vol   = int(r.get("volume", 0) or 0)
+        if right in ("call", "c", "買權"):
+            daily[d]["call_oi"]  += oi
+            daily[d]["call_vol"] += vol
+        elif right in ("put", "p", "賣權"):
+            daily[d]["put_oi"]  += oi
+            daily[d]["put_vol"] += vol
+    rows = [{"date": d, **v} for d, v in sorted(daily.items())]
+    return {"data": rows[-days:], "contract": contract}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return _HTML
@@ -3073,6 +3135,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('chain')">🏭 產業鏈</div>
       <div class="tab" onclick="switchTab('flow')">🔗 傳導鏈</div>
       <div class="tab" onclick="switchTab('indcap')">📊 產業市值</div>
+      <div class="tab" onclick="switchTab('deriv')">📉 期權行情</div>
     </div>
 
     <!-- 個股 pane -->
@@ -3553,6 +3616,34 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
+    <!-- ── 期權行情 ── -->
+    <div class="pane" id="pane-deriv">
+      <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+        <!-- controls -->
+        <div style="padding:10px 14px;border-bottom:1px solid var(--bor);flex-shrink:0;display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+          <div style="display:flex;gap:3px">
+            <button class="sort-btn active" id="deriv-btn-futures" onclick="derivSetType('futures')">期貨</button>
+            <button class="sort-btn" id="deriv-btn-options" onclick="derivSetType('options')">選擇權</button>
+          </div>
+          <input id="deriv-contract-input" type="text" value="TE"
+            style="width:90px;font-size:12px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 8px;border-radius:5px"
+            placeholder="合約代碼" onkeydown="if(event.key==='Enter')derivFetch()">
+          <div id="deriv-presets" style="display:flex;flex-wrap:wrap;gap:3px"></div>
+          <div style="display:flex;gap:3px;margin-left:auto">
+            <button class="sort-btn" id="deriv-d30"  onclick="derivSetDays(30)">1M</button>
+            <button class="sort-btn" id="deriv-d60"  onclick="derivSetDays(60)">2M</button>
+            <button class="sort-btn active" id="deriv-d120" onclick="derivSetDays(120)">4M</button>
+            <button class="sort-btn" id="deriv-d250" onclick="derivSetDays(250)">1Y</button>
+          </div>
+          <button class="sort-btn active" onclick="derivFetch()" style="padding:4px 14px">載入</button>
+        </div>
+        <!-- status -->
+        <div style="padding:6px 14px;font-size:11px;color:var(--mut);flex-shrink:0" id="deriv-status">選擇合約後點「載入」</div>
+        <!-- chart -->
+        <div id="deriv-chart" style="flex:1;min-height:0;padding:0 8px 8px"></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -3631,6 +3722,12 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 4-6"/>
     </svg>
     <span>產業</span>
+  </button>
+  <button class="bnav-btn" id="bnav-deriv" onclick="switchTab('deriv')">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+      <path d="M3 17l4-8 4 4 4-6 4 3"/><path d="M21 21H3"/>
+    </svg>
+    <span>期權</span>
   </button>
 </nav>
 
@@ -4082,7 +4179,7 @@ function plotCompare(stocks) {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview','snapshots','kline','chain','flow','indcap'];
+  const tabNames = ['single','compare','grade','broker','overview','snapshots','kline','chain','flow','indcap','deriv'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -4118,6 +4215,7 @@ function switchTab(name) {
   if (name === 'chain') chainLoad();
   if (name === 'flow') flowInit();
   if (name === 'indcap') icapInit();
+  if (name === 'deriv') derivInit();
   setTimeout(() => Plotly.Plots.resize(), 80);
 }
 
@@ -6420,6 +6518,142 @@ function _flowRenderList(data) {
       ${rows}${moreWith}${noCapLine}
     </details>`;
   }).join('');
+}
+
+// ── 期權行情 ──────────────────────────────────────────────────────────────
+let _derivType     = 'futures';
+let _derivContract = 'TE';
+let _derivDays     = 120;
+let _derivInited   = false;
+
+const DERIV_PRESETS = {
+  futures: [
+    {code:'TE',  label:'電子期'},
+    {code:'TF',  label:'金融期'},
+    {code:'TX',  label:'台指期'},
+    {code:'MTX', label:'小台期'},
+    {code:'2330',label:'台積電'},
+    {code:'2317',label:'鴻海'},
+    {code:'2303',label:'聯電'},
+  ],
+  options: [
+    {code:'TXO', label:'台指選'},
+    {code:'TEO', label:'電子選'},
+    {code:'TFO', label:'金融選'},
+    {code:'2330',label:'台積電'},
+  ]
+};
+
+function derivSetType(type) {
+  _derivType = type;
+  document.getElementById('deriv-btn-futures').classList.toggle('active', type === 'futures');
+  document.getElementById('deriv-btn-options').classList.toggle('active', type === 'options');
+  _derivContract = DERIV_PRESETS[type][0].code;
+  document.getElementById('deriv-contract-input').value = _derivContract;
+  _derivRenderPresets();
+}
+
+function _derivRenderPresets() {
+  document.getElementById('deriv-presets').innerHTML =
+    DERIV_PRESETS[_derivType].map(p =>
+      `<button class="sort-btn${_derivContract===p.code?' active':''}"
+         onclick="derivPickPreset('${p.code}')">${p.label}</button>`
+    ).join('');
+}
+
+function derivPickPreset(code) {
+  _derivContract = code;
+  document.getElementById('deriv-contract-input').value = code;
+  _derivRenderPresets();
+}
+
+function derivSetDays(d) {
+  _derivDays = d;
+  [30, 60, 120, 250].forEach(n =>
+    document.getElementById(`deriv-d${n}`)?.classList.toggle('active', n === d)
+  );
+}
+
+async function derivFetch() {
+  const contract = (document.getElementById('deriv-contract-input').value || '').trim() || _derivContract;
+  _derivContract = contract;
+  _derivRenderPresets();
+
+  const statusEl = document.getElementById('deriv-status');
+  const chartEl  = document.getElementById('deriv-chart');
+  statusEl.textContent = '載入中…';
+  chartEl.innerHTML = '';
+
+  const ep = _derivType === 'futures' ? '/api/deriv/futures' : '/api/deriv/options';
+  try {
+    const resp = await fetch(`${ep}?contract=${encodeURIComponent(contract)}&days=${_derivDays}`);
+    const d    = await resp.json();
+    if (!d.data || d.data.length === 0) {
+      statusEl.textContent = d.msg || `查無「${contract}」資料，請確認合約代碼`;
+      return;
+    }
+    statusEl.textContent = `${contract}　共 ${d.data.length} 個交易日`;
+    _derivType === 'futures' ? _derivRenderFutures(d.data, contract)
+                             : _derivRenderOptions(d.data, contract);
+  } catch(e) {
+    statusEl.textContent = '載入失敗：' + e.message;
+  }
+}
+
+const _dLayout = (title) => ({
+  paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+  margin: {t:36, r:70, b:48, l:60},
+  legend: {orientation:'h', y:1.08, font:{color:'#8b949e', size:11}},
+  font:  {color:'#8b949e', size:11},
+  title: {text: title, font:{color:'#e6edf3', size:13}, x:0.04},
+  xaxis: {gridcolor:'#21262d', tickfont:{size:10}},
+});
+
+function _derivRenderFutures(rows, contract) {
+  const dates  = rows.map(r => r.date);
+  const closes = rows.map(r => r.close);
+  const vols   = rows.map(r => r.volume);
+  const ois    = rows.map(r => r.oi);
+
+  Plotly.react('deriv-chart', [
+    {x:dates, y:closes, type:'scatter', mode:'lines', name:'收盤價',
+     line:{color:'#58a6ff', width:2}},
+    {x:dates, y:vols,   type:'bar', name:'成交量',
+     marker:{color:'rgba(63,185,80,0.45)'}, yaxis:'y2'},
+    {x:dates, y:ois,    type:'scatter', mode:'lines', name:'未平倉量',
+     line:{color:'#f97316', width:1.5, dash:'dot'}, yaxis:'y3'},
+  ], {
+    ..._dLayout(`${contract} 期貨`),
+    yaxis:  {gridcolor:'#21262d', title:'收盤價', titlefont:{size:11}},
+    yaxis2: {overlaying:'y', side:'right', showgrid:false, title:'成交量', titlefont:{size:11}},
+    yaxis3: {overlaying:'y', side:'right', showgrid:false, anchor:'free', position:0.98,
+             title:'未平倉', titlefont:{size:11}},
+  }, {responsive:true, displayModeBar:false});
+}
+
+function _derivRenderOptions(rows, contract) {
+  const dates    = rows.map(r => r.date);
+  const callOIs  = rows.map(r => r.call_oi);
+  const putOIs   = rows.map(r => r.put_oi);
+  const pcRatios = rows.map(r => r.call_oi > 0 ? +(r.put_oi / r.call_oi).toFixed(3) : null);
+
+  Plotly.react('deriv-chart', [
+    {x:dates, y:callOIs,  type:'bar', name:'Call 未平倉', marker:{color:'rgba(63,185,80,0.65)'}},
+    {x:dates, y:putOIs,   type:'bar', name:'Put 未平倉',  marker:{color:'rgba(248,81,73,0.65)'}},
+    {x:dates, y:pcRatios, type:'scatter', mode:'lines', name:'P/C 比',
+     line:{color:'#facc15', width:1.8}, yaxis:'y2'},
+  ], {
+    ..._dLayout(`${contract} 選擇權`),
+    barmode: 'group',
+    yaxis:  {gridcolor:'#21262d', title:'未平倉口數', titlefont:{size:11}},
+    yaxis2: {overlaying:'y', side:'right', showgrid:false, title:'P/C 比', titlefont:{size:11}},
+  }, {responsive:true, displayModeBar:false});
+}
+
+function derivInit() {
+  if (_derivInited) return;
+  _derivInited = true;
+  _derivRenderPresets();
 }
 </script>
 </body>
