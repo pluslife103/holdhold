@@ -2733,6 +2733,94 @@ def api_big_player_timeline(
     return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
+@app.get("/api/deriv/integrated/{stock_id}")
+def api_deriv_integrated(stock_id: str, days: int = Query(120)):
+    """一次回傳現貨/期貨/選擇權/大戶四合一資料，供期權行情整合圖使用。"""
+    import os
+    from datetime import date as dt_date, timedelta as td
+    from collections import defaultdict
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+    stock_id = stock_id.strip()
+    start = (dt_date.today() - td(days=int(days * 1.5))).isoformat()
+    end   = dt_date.today().isoformat()
+
+    # 1. 現貨 OHLCV
+    stock_prices: list = []
+    price_df = _fm("TaiwanStockPrice", stock_id, start, end)
+    if not price_df.empty:
+        for _, r in price_df.sort_values("date").iterrows():
+            c = float(r.get("close", 0) or 0)
+            if c > 0:
+                stock_prices.append({
+                    "date":   str(r.get("date", ""))[:10],
+                    "open":   float(r.get("open", 0) or 0),
+                    "high":   float(r.get("max",  0) or 0),
+                    "low":    float(r.get("min",  0) or 0),
+                    "close":  c,
+                    "volume": round(int(r.get("Trading_Volume", 0) or 0) / 1000),
+                })
+
+    # 2. 個股期貨
+    futures: list = []
+    fut_df = _fm("TaiwanFuturesDaily", stock_id, start, end)
+    if not fut_df.empty:
+        by_date: dict = defaultdict(list)
+        for _, r in fut_df.iterrows():
+            by_date[str(r.get("date", ""))[:10]].append(r)
+        prev_oi = None
+        for d in sorted(by_date.keys()):
+            r   = max(by_date[d], key=lambda x: int(x.get("volume", 0) or 0))
+            oi  = int(r.get("open_interest", 0) or 0)
+            chg = oi - prev_oi if prev_oi is not None else 0
+            prev_oi = oi
+            futures.append({
+                "date":   d,
+                "close":  float(r.get("close", 0) or 0),
+                "volume": int(r.get("volume", 0) or 0),
+                "oi":     oi,
+                "oi_chg": chg,
+            })
+
+    # 3. 個股選擇權（全履約價彙總）
+    options: list = []
+    opt_df = _fm("TaiwanOptionDaily", stock_id, start, end)
+    if not opt_df.empty:
+        daily: dict = defaultdict(lambda: {"call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0})
+        for _, r in opt_df.iterrows():
+            d     = str(r.get("date", ""))[:10]
+            right = str(r.get("option_right", "")).strip().lower()
+            oi    = int(r.get("open_interest", 0) or 0)
+            vol   = int(r.get("volume", 0) or 0)
+            if right in ("call", "c", "買權"):
+                daily[d]["call_oi"]  += oi
+                daily[d]["call_vol"] += vol
+            elif right in ("put", "p", "賣權"):
+                daily[d]["put_oi"]  += oi
+                daily[d]["put_vol"] += vol
+        options = [{"date": d, **v} for d, v in sorted(daily.items())]
+
+    # 4. 大戶掃描快取
+    holder: list = []
+    d_key = _OV_SCAN.get("days", 20)
+    cached = _cget(f"ov_item|{stock_id}|{d_key}")
+    if cached:
+        holder = cached.get("timeline", [])
+
+    g = _GRADING.get(stock_id, {})
+    return {
+        "stock_id":      stock_id,
+        "stock_name":    _STOCK_MAP.get(stock_id, stock_id),
+        "industry":      _STOCK_INDUSTRY.get(stock_id, ""),
+        "market_cap_億": g.get("market_cap_億", 0),
+        "stock_prices":  stock_prices[-days:],
+        "futures":       futures[-days:],
+        "options":       options[-days:],
+        "holder":        holder[-days:],
+    }
+
+
 @app.get("/api/deriv/tech-stocks")
 def api_deriv_tech_stocks():
     TECH_INDS = {
@@ -3643,28 +3731,31 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
     <!-- ── 期權行情 ── -->
     <div class="pane" id="pane-deriv">
       <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-        <!-- controls -->
-        <div style="padding:10px 14px;border-bottom:1px solid var(--bor);flex-shrink:0;display:flex;flex-wrap:wrap;align-items:center;gap:8px">
-          <div style="display:flex;gap:3px">
-            <button class="sort-btn active" id="deriv-btn-futures" onclick="derivSetType('futures')">期貨</button>
-            <button class="sort-btn" id="deriv-btn-options" onclick="derivSetType('options')">選擇權</button>
+        <!-- 選股列 -->
+        <div style="padding:8px 14px 6px;border-bottom:1px solid var(--bor);flex-shrink:0">
+          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:5px">
+            <span style="font-size:11px;color:var(--mut);white-space:nowrap;flex-shrink:0">科技大型股：</span>
+            <div id="deriv-presets" style="display:flex;flex-wrap:wrap;gap:3px"></div>
           </div>
-          <input id="deriv-contract-input" type="text" value="TE"
-            style="width:90px;font-size:12px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 8px;border-radius:5px"
-            placeholder="合約代碼" onkeydown="if(event.key==='Enter')derivFetch()">
-          <div id="deriv-presets" style="display:flex;flex-wrap:wrap;gap:3px"></div>
-          <div style="display:flex;gap:3px;margin-left:auto">
-            <button class="sort-btn" id="deriv-d30"  onclick="derivSetDays(30)">1M</button>
-            <button class="sort-btn" id="deriv-d60"  onclick="derivSetDays(60)">2M</button>
-            <button class="sort-btn active" id="deriv-d120" onclick="derivSetDays(120)">4M</button>
-            <button class="sort-btn" id="deriv-d250" onclick="derivSetDays(250)">1Y</button>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <input id="deriv-contract-input" type="text" value="2330"
+              style="width:76px;font-size:12px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 8px;border-radius:5px"
+              placeholder="股票代碼" onkeydown="if(event.key==='Enter')derivFetch()">
+            <span style="font-size:11px;color:var(--mut)" id="deriv-stock-info"></span>
+            <div style="display:flex;gap:3px;margin-left:auto">
+              <button class="sort-btn" id="deriv-d60"  onclick="derivSetDays(60)">2M</button>
+              <button class="sort-btn active" id="deriv-d120" onclick="derivSetDays(120)">4M</button>
+              <button class="sort-btn" id="deriv-d250" onclick="derivSetDays(250)">1Y</button>
+            </div>
+            <button class="sort-btn active" onclick="derivFetch()" style="padding:4px 14px">載入</button>
           </div>
-          <button class="sort-btn active" onclick="derivFetch()" style="padding:4px 14px">載入</button>
         </div>
-        <!-- status -->
-        <div style="padding:6px 14px;font-size:11px;color:var(--mut);flex-shrink:0" id="deriv-status">選擇合約後點「載入」</div>
-        <!-- chart -->
-        <div id="deriv-chart" style="flex:1;min-height:0;padding:0 8px 8px"></div>
+        <!-- 主力意圖信號面板 -->
+        <div id="deriv-signal" style="display:none;padding:6px 14px;border-bottom:1px solid var(--bor);background:rgba(30,35,40,0.6);flex-shrink:0"></div>
+        <!-- 狀態列 -->
+        <div style="padding:2px 14px;font-size:11px;color:var(--mut);flex-shrink:0" id="deriv-status">選擇股票後點「載入」</div>
+        <!-- 整合圖表 -->
+        <div id="deriv-chart" style="flex:1;min-height:0;padding:0 6px 6px"></div>
       </div>
     </div>
 
@@ -6544,42 +6635,15 @@ function _flowRenderList(data) {
   }).join('');
 }
 
-// ── 期權行情 ──────────────────────────────────────────────────────────────
-let _derivType     = 'futures';
-let _derivContract = 'TE';
+// ── 期權行情（整合視圖）──────────────────────────────────────────────────
+let _derivContract = '2330';
 let _derivDays     = 120;
 let _derivInited   = false;
-
-const DERIV_PRESETS = {
-  futures: [
-    {code:'TE',  label:'電子期'},
-    {code:'TF',  label:'金融期'},
-    {code:'TX',  label:'台指期'},
-    {code:'MTX', label:'小台期'},
-    {code:'2330',label:'台積電'},
-    {code:'2317',label:'鴻海'},
-    {code:'2303',label:'聯電'},
-  ],
-  options: [
-    {code:'TXO', label:'台指選'},
-    {code:'TEO', label:'電子選'},
-    {code:'TFO', label:'金融選'},
-    {code:'2330',label:'台積電'},
-  ]
-};
-
-function derivSetType(type) {
-  _derivType = type;
-  document.getElementById('deriv-btn-futures').classList.toggle('active', type === 'futures');
-  document.getElementById('deriv-btn-options').classList.toggle('active', type === 'options');
-  _derivContract = DERIV_PRESETS[type][0].code;
-  document.getElementById('deriv-contract-input').value = _derivContract;
-  _derivRenderPresets();
-}
+let _derivPresets  = [];   // [{code, label}, ...]
 
 function _derivRenderPresets() {
   document.getElementById('deriv-presets').innerHTML =
-    DERIV_PRESETS[_derivType].map(p =>
+    _derivPresets.map(p =>
       p.code === null
         ? `<span style="color:var(--bor);padding:0 2px;line-height:26px;user-select:none">│</span>`
         : `<button class="sort-btn${_derivContract===p.code?' active':''}"
@@ -6591,89 +6655,276 @@ function derivPickPreset(code) {
   _derivContract = code;
   document.getElementById('deriv-contract-input').value = code;
   _derivRenderPresets();
+  derivFetch();
 }
 
 function derivSetDays(d) {
   _derivDays = d;
-  [30, 60, 120, 250].forEach(n =>
+  [60, 120, 250].forEach(n =>
     document.getElementById(`deriv-d${n}`)?.classList.toggle('active', n === d)
   );
 }
 
 async function derivFetch() {
-  const contract = (document.getElementById('deriv-contract-input').value || '').trim() || _derivContract;
-  _derivContract = contract;
+  const sid = (document.getElementById('deriv-contract-input').value || '').trim() || _derivContract;
+  _derivContract = sid;
   _derivRenderPresets();
 
   const statusEl = document.getElementById('deriv-status');
-  const chartEl  = document.getElementById('deriv-chart');
   statusEl.textContent = '載入中…';
-  chartEl.innerHTML = '';
+  document.getElementById('deriv-chart').innerHTML = '';
+  document.getElementById('deriv-signal').style.display = 'none';
 
-  const ep = _derivType === 'futures' ? '/api/deriv/futures' : '/api/deriv/options';
   try {
-    const resp = await fetch(`${ep}?contract=${encodeURIComponent(contract)}&days=${_derivDays}`);
+    const resp = await fetch(`/api/deriv/integrated/${encodeURIComponent(sid)}?days=${_derivDays}`);
     const d    = await resp.json();
-    if (!d.data || d.data.length === 0) {
-      statusEl.textContent = d.msg || `查無「${contract}」資料，請確認合約代碼`;
+    const name = d.stock_name || sid;
+    const cap  = d.market_cap_億 ? `　市值 ${Math.round(d.market_cap_億).toLocaleString()} 億` : '';
+    const ind  = d.industry ? `　${d.industry}` : '';
+    document.getElementById('deriv-stock-info').textContent = `${name}${ind}${cap}`;
+
+    const hasSp  = (d.stock_prices || []).length > 0;
+    const hasFut = (d.futures      || []).length > 0;
+    const hasOpt = (d.options      || []).length > 0;
+    const hasHld = (d.holder       || []).length > 0;
+
+    if (!hasFut && !hasOpt) {
+      statusEl.textContent = `查無「${sid}」期貨/選擇權資料，請確認代碼（個股期貨用股票代碼，如 2330）`;
       return;
     }
-    statusEl.textContent = `${contract}　共 ${d.data.length} 個交易日`;
-    _derivType === 'futures' ? _derivRenderFutures(d.data, contract)
-                             : _derivRenderOptions(d.data, contract);
+
+    const parts = [];
+    if (hasSp)  parts.push(`現貨 ${d.stock_prices.length}日`);
+    if (hasFut) parts.push(`期貨 ${d.futures.length}日`);
+    if (hasOpt) parts.push(`選擇權 ${d.options.length}日`);
+    if (hasHld) parts.push(`大戶 ${d.holder.length}日`);
+    statusEl.textContent = parts.join('　');
+
+    _derivSignal(d);
+    _derivRenderIntegrated(d, sid, name);
   } catch(e) {
     statusEl.textContent = '載入失敗：' + e.message;
   }
 }
 
-const _dLayout = (title) => ({
-  paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-  margin: {t:36, r:70, b:48, l:60},
-  legend: {orientation:'h', y:1.08, font:{color:'#8b949e', size:11}},
-  font:  {color:'#8b949e', size:11},
-  title: {text: title, font:{color:'#e6edf3', size:13}, x:0.04},
-  xaxis: {gridcolor:'#21262d', tickfont:{size:10}},
-});
+// ── 主力意圖信號面板 ───────────────────────────────────────────────
+function _derivSignal(d) {
+  const N  = 5;
+  const sf = (d.futures || []).slice(-N);
+  const so = (d.options || []).slice(-N);
+  const sh = (d.holder  || []).slice(-N);
+  const spLast = (d.stock_prices || []).slice(-1)[0];
+  const ftLast = sf.slice(-1)[0];
 
-function _derivRenderFutures(rows, contract) {
-  const dates  = rows.map(r => r.date);
-  const closes = rows.map(r => r.close);
-  const vols   = rows.map(r => r.volume);
-  const ois    = rows.map(r => r.oi);
+  const cards = [];
 
-  Plotly.react('deriv-chart', [
-    {x:dates, y:closes, type:'scatter', mode:'lines', name:'收盤價',
-     line:{color:'#58a6ff', width:2}},
-    {x:dates, y:vols,   type:'bar', name:'成交量',
-     marker:{color:'rgba(63,185,80,0.45)'}, yaxis:'y2'},
-    {x:dates, y:ois,    type:'scatter', mode:'lines', name:'未平倉量',
-     line:{color:'#f97316', width:1.5, dash:'dot'}, yaxis:'y3'},
-  ], {
-    ..._dLayout(`${contract} 期貨`),
-    yaxis:  {gridcolor:'#21262d', title:'收盤價', titlefont:{size:11}},
-    yaxis2: {overlaying:'y', side:'right', showgrid:false, title:'成交量', titlefont:{size:11}},
-    yaxis3: {overlaying:'y', side:'right', showgrid:false, anchor:'free', position:0.98,
-             title:'未平倉', titlefont:{size:11}},
-  }, {responsive:true, displayModeBar:false});
+  // 1. 期貨溢折價
+  if (ftLast && spLast && spLast.close > 0) {
+    const basis    = ftLast.close - spLast.close;
+    const basisPct = (basis / spLast.close * 100).toFixed(2);
+    const bull = basis > spLast.close * 0.003;
+    const bear = basis < -spLast.close * 0.003;
+    cards.push({
+      label: bull ? '期貨溢價' : bear ? '期貨折價' : '期貨平水',
+      val:   `${basis >= 0 ? '+' : ''}${basis.toFixed(0)} (${basisPct}%)`,
+      bull, bear,
+    });
+  }
+
+  // 2. 未平倉口數 5日趨勢
+  if (sf.length >= 2) {
+    const oiSum  = sf.reduce((s, r) => s + (r.oi_chg || 0), 0);
+    const lastOI = sf[sf.length-1].oi;
+    const bull   = oiSum > 0 && ftLast && ftLast.close >= sf[0].close;
+    const bear   = oiSum < 0 && ftLast && ftLast.close <= sf[0].close;
+    cards.push({
+      label: oiSum > 200 ? 'OI 增倉' : oiSum < -200 ? 'OI 減倉' : 'OI 持平',
+      val:   `${oiSum >= 0 ? '+' : ''}${oiSum.toLocaleString()} 口 (共${lastOI.toLocaleString()})`,
+      bull, bear,
+    });
+  }
+
+  // 3. P/C 比（最新 + 5日均）
+  if (so.length) {
+    const last5pc = so.filter(r => r.call_oi > 0).map(r => r.put_oi / r.call_oi);
+    if (last5pc.length) {
+      const avg5 = last5pc.reduce((s, v) => s + v, 0) / last5pc.length;
+      const latestPc = last5pc[last5pc.length - 1];
+      const bull = latestPc < 0.8;
+      const bear = latestPc > 1.2;
+      cards.push({
+        label: bull ? 'P/C 偏低(偏多)' : bear ? 'P/C 偏高(偏空)' : 'P/C 中性',
+        val:   `${latestPc.toFixed(2)}（5日均 ${avg5.toFixed(2)}）`,
+        bull, bear,
+      });
+    }
+  }
+
+  // 4. 大戶近 N 日淨分
+  if (sh.length) {
+    const netSum  = sh.reduce((s, r) => s + (r.net_score || 0), 0);
+    const avgNet  = (netSum / sh.length).toFixed(1);
+    const bull    = netSum > 0;
+    const bear    = netSum < 0;
+    cards.push({
+      label: bull ? '大戶買超' : bear ? '大戶賣超' : '大戶觀望',
+      val:   `近5日淨 ${netSum >= 0 ? '+' : ''}${netSum}（均 ${avgNet}）`,
+      bull, bear,
+    });
+  }
+
+  if (!cards.length) return;
+
+  const bullN    = cards.filter(c => c.bull).length;
+  const bearN    = cards.filter(c => c.bear).length;
+  const overall  = bullN > bearN ? {txt: '偏多', col: '#3fb950'}
+                 : bearN > bullN ? {txt: '偏空', col: '#f85149'}
+                 : {txt: '中性', col: '#8b949e'};
+
+  const el = document.getElementById('deriv-signal');
+  el.style.display = 'block';
+  el.innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px">
+      <div style="font-size:12px;font-weight:700;color:${overall.col};white-space:nowrap;padding:2px 0">
+        主力意圖：${overall.txt}
+        <span style="font-size:10px;font-weight:400;color:var(--mut)">&nbsp;(${bullN}多/${bearN}空/${cards.length-bullN-bearN}中)</span>
+      </div>
+      ${cards.map(c => `
+        <div style="display:flex;align-items:center;gap:4px;padding:2px 8px;
+             background:${c.bull?'rgba(63,185,80,0.1)':c.bear?'rgba(248,81,73,0.1)':'rgba(139,148,158,0.08)'};
+             border:1px solid ${c.bull?'rgba(63,185,80,0.35)':c.bear?'rgba(248,81,73,0.35)':'rgba(139,148,158,0.2)'};
+             border-radius:5px;white-space:nowrap">
+          <span style="font-size:10px;color:var(--mut)">${c.label}</span>
+          <span style="font-size:11px;font-weight:600;color:${c.bull?'#3fb950':c.bear?'#f85149':'#8b949e'}">${c.val}</span>
+        </div>`).join('')}
+    </div>`;
 }
 
-function _derivRenderOptions(rows, contract) {
-  const dates    = rows.map(r => r.date);
-  const callOIs  = rows.map(r => r.call_oi);
-  const putOIs   = rows.map(r => r.put_oi);
-  const pcRatios = rows.map(r => r.call_oi > 0 ? +(r.put_oi / r.call_oi).toFixed(3) : null);
+// ── 4 panel 整合圖（共用 x 軸，縮放聯動）────────────────────────────────
+function _derivRenderIntegrated(d, sid, name) {
+  const hasSp  = (d.stock_prices || []).length > 0;
+  const hasFut = (d.futures      || []).length > 0;
+  const hasOpt = (d.options      || []).length > 0;
+  const hasHld = (d.holder       || []).length > 0;
 
-  Plotly.react('deriv-chart', [
-    {x:dates, y:callOIs,  type:'bar', name:'Call 未平倉', marker:{color:'rgba(63,185,80,0.65)'}},
-    {x:dates, y:putOIs,   type:'bar', name:'Put 未平倉',  marker:{color:'rgba(248,81,73,0.65)'}},
-    {x:dates, y:pcRatios, type:'scatter', mode:'lines', name:'P/C 比',
-     line:{color:'#facc15', width:1.8}, yaxis:'y2'},
-  ], {
-    ..._dLayout(`${contract} 選擇權`),
-    barmode: 'group',
-    yaxis:  {gridcolor:'#21262d', title:'未平倉口數', titlefont:{size:11}},
-    yaxis2: {overlaying:'y', side:'right', showgrid:false, title:'P/C 比', titlefont:{size:11}},
-  }, {responsive:true, displayModeBar:false});
+  const traces = [];
+
+  // Panel 1 — 現貨 + 期貨收盤
+  if (hasSp) {
+    const sp = d.stock_prices;
+    traces.push({
+      x: sp.map(r=>r.date), y: sp.map(r=>r.close),
+      type:'scatter', mode:'lines', name:'現貨', xaxis:'x', yaxis:'y',
+      line:{color:'#58a6ff', width:2},
+    });
+  }
+  if (hasFut) {
+    const ft = d.futures;
+    traces.push({
+      x: ft.map(r=>r.date), y: ft.map(r=>r.close),
+      type:'scatter', mode:'lines', name:'期貨', xaxis:'x', yaxis: hasSp ? 'y' : 'y',
+      line:{color:'#a78bfa', width:1.6, dash: hasSp ? 'dot' : 'solid'},
+    });
+
+    // Panel 2 — 未平倉 + OI 日增減
+    const ois    = ft.map(r => r.oi);
+    const oiChgs = ft.map(r => r.oi_chg);
+    traces.push({
+      x: ft.map(r=>r.date), y: ois,
+      type:'scatter', mode:'lines', name:'未平倉', fill:'tozeroy',
+      xaxis:'x2', yaxis:'y3',
+      line:{color:'#f97316', width:1.5},
+      fillcolor:'rgba(249,115,22,0.12)',
+    });
+    traces.push({
+      x: ft.map(r=>r.date), y: oiChgs,
+      type:'bar', name:'OI日增減', xaxis:'x2', yaxis:'y4',
+      marker:{color: oiChgs.map(v => v >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)')},
+    });
+  }
+
+  // Panel 3 — 選擇權 P/C
+  if (hasOpt) {
+    const op      = d.options;
+    const callOIs = op.map(r => r.call_oi);
+    const putOIs  = op.map(r => r.put_oi);
+    const pcs     = op.map(r => r.call_oi > 0 ? +(r.put_oi / r.call_oi).toFixed(3) : null);
+    traces.push(
+      {x:op.map(r=>r.date), y:callOIs, type:'bar', name:'Call OI', barmode:'stack',
+       xaxis:'x3', yaxis:'y5', marker:{color:'rgba(63,185,80,0.6)'}},
+      {x:op.map(r=>r.date), y:putOIs,  type:'bar', name:'Put OI',
+       xaxis:'x3', yaxis:'y5', marker:{color:'rgba(248,81,73,0.6)'}},
+      {x:op.map(r=>r.date), y:pcs,     type:'scatter', mode:'lines', name:'P/C 比',
+       xaxis:'x3', yaxis:'y6', line:{color:'#facc15', width:2}},
+    );
+  }
+
+  // Panel 4 — 大戶淨分
+  if (hasHld) {
+    const hd   = d.holder;
+    const nets = hd.map(r => r.net_score || 0);
+    traces.push({
+      x: hd.map(r=>r.date), y: nets,
+      type:'bar', name:'大戶淨分', xaxis:'x4', yaxis:'y7',
+      marker:{color: nets.map(v => v >= 0 ? 'rgba(63,185,80,0.75)' : 'rgba(248,81,73,0.75)')},
+    });
+  }
+
+  // 計算各 panel 高度區間（bottom → top）
+  // 根據有無資料動態分配比例
+  const panels  = [true, hasFut, hasOpt, hasHld];   // 4 panels
+  const weights = [0.38, 0.22, 0.26, 0.14];
+  const active  = panels.map((on, i) => on ? weights[i] : 0);
+  const total   = active.reduce((s, v) => s + v, 0) || 1;
+  const norm    = active.map(v => v / total);
+  // cumulative bottom edges
+  const bottoms = norm.reduce((acc, v, i) => { acc.push((acc[i] || 0) + (norm[i-1] || 0)); return acc; }, []);
+  const tops    = bottoms.map((b, i) => b + norm[i]);
+  const gap     = 0.03;
+  const domains = bottoms.map((b, i) => [b + (i > 0 ? gap/2 : 0), tops[i] - (i < 3 ? gap/2 : 0)]);
+  // Reverse so panel 1 is at top
+  domains.reverse();
+
+  const GC = '#21262d';
+  const yStyle = (domain, title) => ({
+    domain, gridcolor: GC, tickfont:{size:10},
+    title:{text: title, font:{color:'#8b949e', size:10}}, titlefont:{size:10},
+    zeroline:false,
+  });
+
+  const layout = {
+    paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+    margin:{t:10, r:65, b:36, l:58},
+    font:{color:'#8b949e', size:11},
+    legend:{orientation:'h', y:1.02, x:0, font:{color:'#8b949e', size:10}, bgcolor:'transparent'},
+    barmode:'relative',
+
+    xaxis:  {domain:[0,1], anchor:'y',  showticklabels:false, gridcolor:GC, tickfont:{size:9}},
+    xaxis2: {domain:[0,1], anchor:'y3', showticklabels:false, gridcolor:GC, tickfont:{size:9}, matches:'x'},
+    xaxis3: {domain:[0,1], anchor:'y5', showticklabels:false, gridcolor:GC, tickfont:{size:9}, matches:'x'},
+    xaxis4: {domain:[0,1], anchor:'y7', showticklabels:true,  gridcolor:GC, tickfont:{size:9}, matches:'x'},
+
+    yaxis:  yStyle(domains[0], '收盤'),
+    yaxis2: {domain:domains[0], overlaying:'y',  side:'right', showgrid:false, tickfont:{size:9}, zeroline:false},
+    yaxis3: yStyle(domains[1], '未平倉'),
+    yaxis4: {domain:domains[1], overlaying:'y3', side:'right', showgrid:false, tickfont:{size:9}, zeroline:true, zerolinecolor:'#444'},
+    yaxis5: yStyle(domains[2], 'OI 口數'),
+    yaxis6: {domain:domains[2], overlaying:'y5', side:'right', showgrid:false, tickfont:{size:9}, title:{text:'P/C',font:{size:9}}, zeroline:false},
+    yaxis7: yStyle(domains[3], '大戶淨分'),
+
+    annotations: [
+      {xref:'paper',yref:'paper',x:0.01,y:tops[0]-0.01, xanchor:'left',yanchor:'top',
+       text:`${name}  現貨 + 期貨`, font:{color:'#c9d1d9',size:11}, showarrow:false},
+      hasFut ? {xref:'paper',yref:'paper',x:0.01,y:tops[1]-0.01, xanchor:'left',yanchor:'top',
+       text:'未平倉口數', font:{color:'#f97316',size:10}, showarrow:false} : null,
+      hasOpt ? {xref:'paper',yref:'paper',x:0.01,y:tops[2]-0.01, xanchor:'left',yanchor:'top',
+       text:'選擇權 P/C 比', font:{color:'#facc15',size:10}, showarrow:false} : null,
+      hasHld ? {xref:'paper',yref:'paper',x:0.01,y:tops[3]-0.01, xanchor:'left',yanchor:'top',
+       text:'大戶動向', font:{color:'#8b949e',size:10}, showarrow:false} : null,
+    ].filter(Boolean),
+  };
+
+  Plotly.react('deriv-chart', traces, layout, {responsive:true, displayModeBar:false});
 }
 
 async function derivInit() {
@@ -6683,20 +6934,15 @@ async function derivInit() {
     const r  = await fetch('/api/deriv/tech-stocks');
     const d  = await r.json();
     const sp = (d.stocks || []).map(s => ({code: s.stock_id, label: s.stock_name}));
-    const sep = {code: null, label: '│'};
-    DERIV_PRESETS.futures = [
-      {code:'TX',  label:'台指期'}, {code:'TE',  label:'電子期'},
-      {code:'TF',  label:'金融期'}, {code:'MTX', label:'小台期'},
-      sep, ...sp
+    _derivPresets = [
+      {code:'TX', label:'台指期'}, {code:'TE', label:'電子期'},
+      {code:'MTX',label:'小台期'}, {code:'TXO',label:'台指選'},
+      {code: null, label:'│'},
+      ...sp,
     ];
-    DERIV_PRESETS.options = [
-      {code:'TXO', label:'台指選'}, {code:'TEO', label:'電子選'},
-      {code:'TFO', label:'金融選'},
-      sep, ...sp
-    ];
-    if (sp.length > 0) {
+    if (sp.length) {
       document.getElementById('deriv-status').textContent =
-        `已載入 ${sp.length} 支科技業大型股（市值 ≥ 3,000億）`;
+        `${sp.length} 支科技業大型股（市值 ≥ 3,000億），點選股票自動載入`;
     }
   } catch(e) { console.warn('tech-stocks', e); }
   _derivRenderPresets();
