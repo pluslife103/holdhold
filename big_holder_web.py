@@ -2733,6 +2733,115 @@ def api_big_player_timeline(
     return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
+@app.get("/api/broker_stats")
+def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
+    """查詢指定券商(分點)在最近N個交易日的股票操作歷史，回傳各股累積買賣超。"""
+    import os
+    from datetime import date as dt_date, timedelta
+
+    trader_id = trader_id.strip()
+    if not trader_id:
+        raise HTTPException(400, "請輸入券商代碼")
+
+    ckey = f"broker_stats|{trader_id}|{days}"
+    cached = _cget(ckey, ttl_h=1)
+    if cached is not None:
+        return cached
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+
+    today = dt_date.today()
+    start = (today - timedelta(days=max(days * 2, 90))).isoformat()
+    end   = today.isoformat()
+
+    try:
+        r = requests.get(
+            FINMIND_BROKER_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"securities_trader_id": trader_id, "start_date": start, "end_date": end},
+            timeout=60,
+        )
+        j = r.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(502, f"無法連線 FinMind API: {type(e).__name__}")
+    except Exception:
+        raise HTTPException(502, "回應解析失敗")
+
+    if j.get("status") not in (200, None):
+        msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
+        raise HTTPException(502, f"FinMind error: {msg}")
+
+    rows_all = j.get("data", [])
+    trader_name = trader_id
+
+    if not rows_all:
+        result = {"trader_id": trader_id, "trader_name": trader_name, "days": 0,
+                  "total_buy": 0, "total_sell": 0, "total_net": 0, "stock_count": 0, "stocks": []}
+        _cset(ckey, result)
+        return result
+
+    # Determine most recent N trading days in the data
+    all_dates = sorted({str(r.get("date",""))[:10] for r in rows_all if r.get("date")}, reverse=True)
+    recent_dates = set(all_dates[:days])
+    rows_filtered = [r for r in rows_all if str(r.get("date",""))[:10] in recent_dates]
+
+    if rows_filtered:
+        trader_name = rows_filtered[0].get("securities_trader", trader_id) or trader_id
+
+    # Aggregate: (stock_id, date) → {buy, sell}
+    by_sd: dict = {}
+    for row in rows_filtered:
+        sid = str(row.get("stock_id", "")).strip()
+        dt  = str(row.get("date",     ""))[:10]
+        if not sid or not dt:
+            continue
+        key = (sid, dt)
+        if key not in by_sd:
+            by_sd[key] = {"buy": 0.0, "sell": 0.0}
+        by_sd[key]["buy"]  += float(row.get("buy",  0) or 0)
+        by_sd[key]["sell"] += float(row.get("sell", 0) or 0)
+
+    # Aggregate by stock_id only
+    stock_agg: dict = {}
+    for (sid, dt), v in by_sd.items():
+        buy_l  = int(v["buy"]  / 1000)
+        sell_l = int(v["sell"] / 1000)
+        if sid not in stock_agg:
+            stock_agg[sid] = {"stock_id": sid, "buy": 0, "sell": 0, "net": 0, "days": 0, "last_date": ""}
+        stock_agg[sid]["buy"]  += buy_l
+        stock_agg[sid]["sell"] += sell_l
+        stock_agg[sid]["net"]  += buy_l - sell_l
+        stock_agg[sid]["days"] += 1
+        if dt > stock_agg[sid]["last_date"]:
+            stock_agg[sid]["last_date"] = dt
+
+    # Attach stock names and market cap
+    for sid, v in stock_agg.items():
+        g = _GRADING.get(sid, {})
+        v["stock_name"]     = g.get("stock_name", sid)
+        v["market_cap_億"]  = round(float(g.get("market_cap_億", 0) or 0), 0)
+
+    result_rows = sorted(stock_agg.values(), key=lambda x: abs(x["net"]), reverse=True)
+
+    total_buy  = sum(r["buy"]  for r in result_rows)
+    total_sell = sum(r["sell"] for r in result_rows)
+
+    result = {
+        "trader_id":   trader_id,
+        "trader_name": trader_name,
+        "days":        len(recent_dates),
+        "total_buy":   total_buy,
+        "total_sell":  total_sell,
+        "total_net":   total_buy - total_sell,
+        "stock_count": len(result_rows),
+        "stocks":      result_rows[:200],
+    }
+    _cset(ckey, result)
+    return result
+
+
 @app.get("/api/deriv/integrated/{stock_id}")
 def api_deriv_integrated(stock_id: str, days: int = Query(120)):
     """一次回傳現貨/期貨/選擇權/大戶四合一資料，供期權行情整合圖使用。"""
@@ -3261,7 +3370,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
   <main class="main">
     <div class="tabs">
       <div class="tab active" onclick="switchTab('single')">個股分析</div>
-      <div class="tab" onclick="switchTab('compare')">對比分析 <span id="compare-count" style="font-size:10px;padding:1px 5px;background:var(--sur2);border-radius:8px;margin-left:4px"></span></div>
+      <div class="tab" onclick="switchTab('compare')">券商統計</div>
       <div class="tab" onclick="switchTab('grade')">分級排行</div>
       <div class="tab" onclick="switchTab('broker')">🏦 分點籌碼</div>
       <div class="tab" onclick="switchTab('overview')">📊 大戶總覽</div>
@@ -3287,27 +3396,34 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 
     <!-- 對比 pane -->
     <div class="pane" id="pane-compare">
-      <div class="compare-wrap">
-        <div class="compare-head">
-          <span style="color:var(--mut);font-size:12px;white-space:nowrap">已選股票：</span>
-          <div class="compare-chips" id="compare-chips">
-            <span style="color:var(--mut);font-size:11px;font-style:italic">點選股票右側 + 加入比較</span>
+      <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+        <!-- 查詢列 -->
+        <div style="padding:8px 14px 6px;border-bottom:1px solid var(--bor);flex-shrink:0">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <span style="font-size:11px;color:var(--mut);white-space:nowrap;flex-shrink:0">券商代碼：</span>
+            <input id="bstats-input" type="text" maxlength="10"
+              style="width:90px;font-size:13px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 8px;border-radius:5px"
+              placeholder="例：1480" onkeydown="if(event.key==='Enter')bstatsLoad()">
+            <div style="display:flex;gap:3px">
+              <button class="sort-btn" id="bstats-d10" onclick="bstatsSetDays(10)">10天</button>
+              <button class="sort-btn active" id="bstats-d20" onclick="bstatsSetDays(20)">20天</button>
+              <button class="sort-btn" id="bstats-d40" onclick="bstatsSetDays(40)">40天</button>
+              <button class="sort-btn" id="bstats-d60" onclick="bstatsSetDays(60)">60天</button>
+            </div>
+            <button class="sort-btn active" onclick="bstatsLoad()" style="padding:4px 14px;flex-shrink:0">查詢</button>
           </div>
-          <select class="years-sel" id="compare-years" onchange="updateCompare()">
-            <option value="1">1 年</option>
-            <option value="2" selected>2 年</option>
-            <option value="3">3 年</option>
-          </select>
-          <button class="sort-btn" onclick="updateCompare()" style="padding:4px 12px">更新</button>
-        </div>
-        <div id="compare-body" style="flex:1;overflow:hidden;display:flex;flex-direction:column;gap:10px;min-height:0">
-          <div class="empty">
-            <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-              <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8M12 8v8"/>
-            </svg>
-            <span>尚無選擇股票</span>
+          <div style="font-size:10px;color:var(--mut);margin-top:4px">
+            代碼可在「分點籌碼」頁查詢，或直接輸入 4 碼券商分點代碼
           </div>
         </div>
+        <!-- 狀態列 -->
+        <div id="bstats-status" style="padding:4px 14px;font-size:11px;color:var(--mut);flex-shrink:0">輸入券商代碼後點「查詢」</div>
+        <!-- 摘要卡片 -->
+        <div id="bstats-summary" style="display:none;flex-shrink:0;padding:6px 14px;border-bottom:1px solid var(--bor);display:none;gap:12px;flex-wrap:wrap"></div>
+        <!-- 長條圖 -->
+        <div id="bstats-chart" style="flex-shrink:0;height:0px;min-height:0"></div>
+        <!-- 表格 + 排序按鈕 -->
+        <div id="bstats-table-wrap" style="flex:1;overflow-y:auto;min-height:0"></div>
       </div>
     </div>
 
@@ -3803,10 +3919,9 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
   </button>
   <button class="bnav-btn" id="bnav-compare" onclick="switchTab('compare')">
     <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
-      <rect x="3" y="3" width="8" height="18" rx="1"/><rect x="13" y="8" width="8" height="13" rx="1"/>
+      <circle cx="12" cy="7" r="4"/><path d="M6 21v-1a6 6 0 0112 0v1"/><path d="M17 11l2 2 4-4"/>
     </svg>
-    <span>對比</span>
-    <span class="bnav-badge" id="bnav-badge" style="display:none"></span>
+    <span>券商</span>
   </button>
   <button class="bnav-btn" id="bnav-grade" onclick="switchTab('grade')">
     <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
@@ -3873,7 +3988,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 // ── State ──────────────────────────────────────────────────────────────
 let allStocks = [];       // [{stock_id, stock_name, type}]
 let stockCache = {};      // id -> processed data
-let compareSel = [];      // list of stock_ids in compare
+let compareSel = [];      // kept for compat (unused)
 let sortKey = 'code';
 let activeId = null;
 let activeYears = 2;
@@ -3989,18 +4104,13 @@ function renderList(src) {
           <div class="pct-chg ${cls}">${sign}${chg.toFixed(2)}</div>
         </div>`;
     }
-    return `<div class="stock-item ${isAct ? 'active' : ''} ${inCmp && !isAct ? 'compare-sel' : ''}"
+    return `<div class="stock-item ${isAct ? 'active' : ''}"
               onclick="selectStock('${s.stock_id}')" id="si-${s.stock_id}">
       <div class="stock-info">
         <div class="stock-code">${s.stock_id}</div>
         <div class="stock-name">${s.stock_name}</div>
       </div>
       ${metricsHtml}
-      <div class="add-compare ${inCmp ? 'added' : ''}"
-           onclick="toggleCompare(event,'${s.stock_id}')"
-           title="${inCmp ? '移出比較' : '加入比較'}">
-        ${inCmp ? '✓' : '+'}
-      </div>
     </div>`;
   }).join('');
 
@@ -4157,161 +4267,125 @@ function plotLag(d) {
   }, {responsive:true, displayModeBar:false});
 }
 
-// ── Compare ────────────────────────────────────────────────────────────
-function toggleCompare(e, sid) {
-  e.stopPropagation();
-  const idx = compareSel.indexOf(sid);
-  if (idx >= 0) {
-    compareSel.splice(idx, 1);
-  } else {
-    if (compareSel.length >= 8) { showToast('最多比較 8 支股票', true); return; }
-    compareSel.push(sid);
-  }
-  updateCompareCount();
-  renderList();
-  if (document.getElementById('pane-compare').classList.contains('active')) {
-    updateCompare();
-  }
-}
+// ── 券商統計 ────────────────────────────────────────────────────────────
+let _bstatsDays = 20;
+let _bstatsSortCol = 'net';
+let _bstatsData = null;
 
-function updateCompareCount() {
-  const n = compareSel.length;
-  const el = document.getElementById('compare-count');
-  if (el) el.textContent = n > 0 ? n : '';
-  // bottom nav badge
-  const badge = document.getElementById('bnav-badge');
-  if (badge) {
-    badge.textContent = n;
-    badge.style.display = n > 0 ? '' : 'none';
-  }
-}
-
-function removeFromCompare(sid) {
-  const idx = compareSel.indexOf(sid);
-  if (idx >= 0) compareSel.splice(idx, 1);
-  updateCompareCount();
-  renderList();
-  renderCompareChips();
-  updateCompare();
-}
-
-function renderCompareChips() {
-  const el = document.getElementById('compare-chips');
-  if (compareSel.length === 0) {
-    el.innerHTML = '<span style="color:var(--mut);font-size:11px;font-style:italic">點選股票右側 + 加入比較</span>';
-    return;
-  }
-  el.innerHTML = compareSel.map((sid, i) => {
-    const s = allStocks.find(x => x.stock_id === sid);
-    const name = s ? s.stock_name : sid;
-    const color = COLORS[i % COLORS.length];
-    return `<span class="chip" style="border-color:${color}40">
-      <span style="color:${color};font-weight:700">${sid}</span>
-      <span style="color:var(--mut)">${name}</span>
-      <span class="chip-rm" onclick="removeFromCompare('${sid}')">×</span>
-    </span>`;
-  }).join('');
-}
-
-async function updateCompare() {
-  renderCompareChips();
-  const body = document.getElementById('compare-body');
-  if (compareSel.length === 0) {
-    body.innerHTML = `<div class="empty">
-      <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-        <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8M12 8v8"/>
-      </svg><span>尚無選擇股票</span></div>`;
-    return;
-  }
-
-  body.innerHTML = '<div class="loading"><div class="spinner"></div><span>載入比較資料...</span></div>';
-  const years = document.getElementById('compare-years').value;
-
-  const r = await fetch('/api/compare', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({stocks: compareSel, years: parseInt(years)})
+function bstatsSetDays(d) {
+  _bstatsDays = d;
+  [10, 20, 40, 60].forEach(n => {
+    const el = document.getElementById(`bstats-d${n}`);
+    if (el) el.classList.toggle('active', n === d);
   });
-  const j = await r.json();
-
-  if (!j.stocks || j.stocks.length === 0) {
-    body.innerHTML = '<div class="empty">無法取得比較資料</div>';
-    return;
-  }
-
-  body.innerHTML = `
-    <div class="compare-charts-row" style="flex:1;min-height:0">
-      <div class="chart-box" style="flex:1">
-        <div class="chart-title">標準化股價（= 100 at 起始）</div>
-        <div id="cmp-price" style="height:calc(100% - 32px)"></div>
-      </div>
-      <div class="chart-box" style="flex:1">
-        <div class="chart-title">千張大戶持股%</div>
-        <div id="cmp-bpct" style="height:calc(100% - 32px)"></div>
-      </div>
-    </div>
-    <div class="compare-table-wrap">
-      <table class="ctable" id="cmp-table"></table>
-    </div>`;
-
-  plotCompare(j.stocks);
 }
 
-function plotCompare(stocks) {
-  const traces_price = [], traces_bpct = [];
-  stocks.forEach((s, i) => {
-    const color = COLORS[i % COLORS.length];
-    const dates = s.rows.map(r => r.date);
-    traces_price.push({
-      x: dates, y: s.rows.map(r => r.norm), name: `${s.stock_id} ${s.stock_name}`,
-      type:'scatter', mode:'lines', line:{color, width:2},
-      hovertemplate:'%{x}<br>%{y:.1f}<extra>' + s.stock_id + '</extra>',
-    });
-    traces_bpct.push({
-      x: dates, y: s.rows.map(r => r.bpct), name: `${s.stock_id} ${s.stock_name}`,
-      type:'scatter', mode:'lines', line:{color, width:2},
-      hovertemplate:'%{x}<br>%{y:.2f}%<extra>' + s.stock_id + '</extra>',
-    });
-  });
+async function bstatsLoad() {
+  const tid = (document.getElementById('bstats-input').value || '').trim();
+  if (!tid) { showToast('請輸入券商代碼', true); return; }
 
-  const commonLayout = {...PLY, hovermode:'x unified',
-                        legend:{bgcolor:'transparent',font:{size:10},orientation:'h',y:-0.15}};
-  Plotly.newPlot('cmp-price', traces_price, {
-    ...commonLayout,
-    yaxis:{gridcolor:'#21262d', zeroline:false, title:'標準化價格'},
-    shapes:[{type:'line',x0:0,x1:1,xref:'paper',y0:100,y1:100,
-             line:{color:'#30363d',width:1,dash:'dot'}}],
-  }, {responsive:true, displayModeBar:false});
+  document.getElementById('bstats-status').textContent = '載入中…';
+  const sumEl = document.getElementById('bstats-summary');
+  sumEl.style.display = 'none';
+  document.getElementById('bstats-chart').style.height = '0px';
+  document.getElementById('bstats-chart').innerHTML = '';
+  document.getElementById('bstats-table-wrap').innerHTML = '';
 
-  Plotly.newPlot('cmp-bpct', traces_bpct, {
-    ...commonLayout,
-    yaxis:{gridcolor:'#21262d', zeroline:false, title:'千張大戶%'},
-  }, {responsive:true, displayModeBar:false});
+  try {
+    const res = await fetch(`/api/broker_stats?trader_id=${encodeURIComponent(tid)}&days=${_bstatsDays}`);
+    const j = await res.json();
+    if (!res.ok) {
+      document.getElementById('bstats-status').textContent = `錯誤: ${j.detail || res.status}`;
+      return;
+    }
+    _bstatsData = j;
+    bstatsRender(j);
+  } catch(e) {
+    document.getElementById('bstats-status').textContent = `載入失敗: ${e.message}`;
+  }
+}
+
+function bstatsRender(d) {
+  const name = d.trader_name && d.trader_name !== d.trader_id ? `${d.trader_name} (${d.trader_id})` : d.trader_id;
+  document.getElementById('bstats-status').textContent =
+    `${name} | 近 ${d.days} 個交易日 | 共 ${d.stock_count} 支股票`;
+
+  // Summary cards
+  const sumEl = document.getElementById('bstats-summary');
+  sumEl.style.display = 'flex';
+  const nc = d.total_net > 0 ? '#ef4444' : d.total_net < 0 ? '#22c55e' : 'var(--txt)';
+  sumEl.innerHTML = `
+    <div class="stat-box"><div class="stat-val" style="color:${nc}">${d.total_net > 0?'+':''}${d.total_net.toLocaleString()}</div><div class="stat-sub">淨買超（張）</div></div>
+    <div class="stat-box"><div class="stat-val" style="color:#ef4444">${d.total_buy.toLocaleString()}</div><div class="stat-sub">累積買進（張）</div></div>
+    <div class="stat-box"><div class="stat-val" style="color:#22c55e">${d.total_sell.toLocaleString()}</div><div class="stat-sub">累積賣出（張）</div></div>
+    <div class="stat-box"><div class="stat-val">${d.stock_count}</div><div class="stat-sub">交易股票數</div></div>`;
+
+  // Bar chart: top 20 by |net|
+  const top20 = d.stocks.slice(0, 20);
+  if (top20.length > 0) {
+    const chartEl = document.getElementById('bstats-chart');
+    chartEl.style.height = '200px';
+    const barColors = top20.map(r => r.net > 0 ? '#ef4444' : '#22c55e');
+    Plotly.newPlot('bstats-chart', [{
+      x: top20.map(r => `${r.stock_id} ${r.stock_name}`),
+      y: top20.map(r => r.net),
+      type: 'bar',
+      marker: {color: barColors},
+      hovertemplate: '%{x}<br>淨: %{y:+,.0f} 張<extra></extra>',
+    }], {
+      ...PLY,
+      yaxis: {gridcolor:'#21262d', zeroline:true, zerolinecolor:'#444', title:'張'},
+      margin: {t:6, b:70, l:50, r:10},
+      height: 200,
+    }, {responsive:true, displayModeBar:false});
+  }
 
   // Table
-  const tbl = document.getElementById('cmp-table');
-  tbl.innerHTML = `<tr>
-    <th style="text-align:left">代號</th><th>名稱</th><th>千張大戶%</th>
-    <th>週增減pp</th><th>人數</th><th>收盤價</th><th>期間漲跌%</th>
-  </tr>` + stocks.map((s, i) => {
-    const color = COLORS[i % COLORS.length];
-    const first = s.rows[0]?.close ?? 0;
-    const last  = s.rows.at(-1)?.close ?? 0;
-    const perf  = first > 0 ? ((last - first) / first * 100).toFixed(1) : '—';
-    const perfCls = parseFloat(perf) > 0 ? 'pct-up' : parseFloat(perf) < 0 ? 'pct-dn' : '';
-    const lastR = s.rows.at(-1) ?? {};
-    const chg = lastR.pct_chg ?? 0;
-    const chgCls = chg > 0 ? 'pct-up' : chg < 0 ? 'pct-dn' : '';
-    return `<tr>
-      <td><span style="color:${color};font-weight:700">${s.stock_id}</span></td>
-      <td style="text-align:left;color:var(--mut)">${s.stock_name}</td>
-      <td>${s.latest_bpct?.toFixed(2) ?? '—'}%</td>
-      <td class="${chgCls}">${chg > 0 ? '+' : ''}${chg.toFixed(3)}</td>
-      <td>${lastR.bp?.toLocaleString() ?? '—'}</td>
-      <td style="color:var(--blu)">${s.latest_close?.toFixed(0) ?? '—'}</td>
-      <td class="${perfCls}">${chg >= 0 ? '+' : ''}${perf}%</td>
+  bstatsRenderTable();
+}
+
+function bstatsRenderTable() {
+  if (!_bstatsData) return;
+  const d = _bstatsData;
+  const sc = _bstatsSortCol;
+  const sorted = [...d.stocks].sort((a, b) => {
+    if (sc === 'net')  return Math.abs(b.net)  - Math.abs(a.net);
+    if (sc === 'buy')  return b.buy  - a.buy;
+    if (sc === 'sell') return b.sell - a.sell;
+    if (sc === 'days') return b.days - a.days;
+    return 0;
+  });
+
+  const sortBtns = [
+    {k:'net',  label:'|淨買超|↓'},
+    {k:'buy',  label:'買進量↓'},
+    {k:'sell', label:'賣出量↓'},
+    {k:'days', label:'天數↓'},
+  ].map(c => `<button class="sort-btn ${sc===c.k?'active':''}" onclick="_bstatsSortCol='${c.k}';bstatsRenderTable()">${c.label}</button>`).join('');
+
+  const rows = sorted.map(r => {
+    const nc  = r.net > 0 ? 'pct-up' : r.net < 0 ? 'pct-dn' : '';
+    const cap = r.market_cap_億 > 0 ? r.market_cap_億.toLocaleString() : '—';
+    return `<tr onclick="selectStock('${r.stock_id}');switchTab('single')" style="cursor:pointer">
+      <td style="font-weight:700;color:var(--blu)">${r.stock_id}</td>
+      <td style="text-align:left;color:var(--mut)">${r.stock_name}</td>
+      <td style="color:var(--mut);font-size:10px">${cap}</td>
+      <td style="color:#ef4444">${r.buy.toLocaleString()}</td>
+      <td style="color:#22c55e">${r.sell.toLocaleString()}</td>
+      <td class="${nc}" style="font-weight:700">${r.net > 0 ? '+' : ''}${r.net.toLocaleString()}</td>
+      <td style="color:var(--mut)">${r.days}</td>
+      <td style="color:var(--mut);font-size:10px">${r.last_date}</td>
     </tr>`;
   }).join('');
+
+  document.getElementById('bstats-table-wrap').innerHTML = `
+    <div style="display:flex;gap:4px;padding:6px 14px;flex-shrink:0;flex-wrap:wrap">${sortBtns}</div>
+    <div style="overflow-x:auto">
+      <table class="ctable" style="min-width:600px">
+        <tr><th>代號</th><th>名稱</th><th>市值(億)</th><th>買進(張)</th><th>賣出(張)</th><th>淨買超</th><th>天數</th><th>最後交易</th></tr>
+        ${rows}
+      </table>
+    </div>`;
 }
 
 // ── Tab switch ─────────────────────────────────────────────────────────
@@ -4330,8 +4404,7 @@ function switchTab(name) {
   if (navBtn) navBtn.classList.add('active');
 
   if (name === 'compare') {
-    renderCompareChips();
-    if (compareSel.length > 0) updateCompare();
+    // broker stats tab — no auto-load needed
   }
   if (name === 'grade') {
     loadGrading();
