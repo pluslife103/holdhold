@@ -2808,6 +2808,28 @@ def api_deriv_integrated(stock_id: str, days: int = Query(120)):
     if cached:
         holder = cached.get("timeline", [])
 
+    # 5. 融資融券
+    margin: list = []
+    mg_df = _fm("TaiwanStockMarginPurchaseShortSale", stock_id, start, end)
+    if not mg_df.empty:
+        for _, r in mg_df.sort_values("date").iterrows():
+            d    = str(r.get("date", ""))[:10]
+            m_b  = int(r.get("MarginPurchaseTodayBalance",     0) or 0)
+            m_by = int(r.get("MarginPurchaseYesterdayBalance", 0) or 0)
+            s_b  = int(r.get("ShortSaleTodayBalance",          0) or 0)
+            s_by = int(r.get("ShortSaleYesterdayBalance",      0) or 0)
+            m_lim = int(r.get("MarginPurchaseLimit", 0) or 0)
+            s_lim = int(r.get("ShortSaleLimit",      0) or 0)
+            margin.append({
+                "date":       d,
+                "margin_bal": m_b,
+                "margin_chg": m_b - m_by,
+                "short_bal":  s_b,
+                "short_chg":  s_b - s_by,
+                "margin_util": round(m_b / m_lim * 100, 1) if m_lim > 0 else 0,
+                "short_util":  round(s_b / s_lim * 100, 1) if s_lim > 0 else 0,
+            })
+
     g = _GRADING.get(stock_id, {})
     return {
         "stock_id":      stock_id,
@@ -2818,6 +2840,7 @@ def api_deriv_integrated(stock_id: str, days: int = Query(120)):
         "futures":       futures[-days:],
         "options":       options[-days:],
         "holder":        holder[-days:],
+        "margin":        margin[-days:],
     }
 
 
@@ -6687,9 +6710,10 @@ async function derivFetch() {
     const hasFut = (d.futures      || []).length > 0;
     const hasOpt = (d.options      || []).length > 0;
     const hasHld = (d.holder       || []).length > 0;
+    const hasMg  = (d.margin       || []).length > 0;
 
-    if (!hasFut && !hasOpt) {
-      statusEl.textContent = `查無「${sid}」期貨/選擇權資料，請確認代碼（個股期貨用股票代碼，如 2330）`;
+    if (!hasFut && !hasOpt && !hasMg) {
+      statusEl.textContent = `查無「${sid}」期貨/選擇權/融資融券資料，請確認代碼`;
       return;
     }
 
@@ -6697,6 +6721,7 @@ async function derivFetch() {
     if (hasSp)  parts.push(`現貨 ${d.stock_prices.length}日`);
     if (hasFut) parts.push(`期貨 ${d.futures.length}日`);
     if (hasOpt) parts.push(`選擇權 ${d.options.length}日`);
+    if (hasMg)  parts.push(`融資融券 ${d.margin.length}日`);
     if (hasHld) parts.push(`大戶 ${d.holder.length}日`);
     statusEl.textContent = parts.join('　');
 
@@ -6713,6 +6738,7 @@ function _derivSignal(d) {
   const sf = (d.futures || []).slice(-N);
   const so = (d.options || []).slice(-N);
   const sh = (d.holder  || []).slice(-N);
+  const sm = (d.margin  || []).slice(-N);
   const spLast = (d.stock_prices || []).slice(-1)[0];
   const ftLast = sf.slice(-1)[0];
 
@@ -6753,14 +6779,39 @@ function _derivSignal(d) {
       const bull = latestPc < 0.8;
       const bear = latestPc > 1.2;
       cards.push({
-        label: bull ? 'P/C 偏低(偏多)' : bear ? 'P/C 偏高(偏空)' : 'P/C 中性',
-        val:   `${latestPc.toFixed(2)}（5日均 ${avg5.toFixed(2)}）`,
+        label: bull ? 'P/C 偏低↑多' : bear ? 'P/C 偏高↑空' : 'P/C 中性',
+        val:   `${latestPc.toFixed(2)}（5均 ${avg5.toFixed(2)}）`,
         bull, bear,
       });
     }
   }
 
-  // 4. 大戶近 N 日淨分
+  // 4. 融資融券（近 N 日增減）
+  if (sm.length) {
+    const mChg    = sm.reduce((s, r) => s + (r.margin_chg || 0), 0);
+    const sChg    = sm.reduce((s, r) => s + (r.short_chg  || 0), 0);
+    const lastMg  = sm[sm.length-1];
+    const mUtil   = lastMg ? lastMg.margin_util : 0;
+    const sUtil   = lastMg ? lastMg.short_util  : 0;
+    // 融資減少 + 股價漲 = 籌碼轉優(多); 融資增加過快 = 散戶過熱(警示)
+    const mgBull  = mChg < -1000 && spLast && ftLast && ftLast.close >= sf[0]?.close;
+    const mgBear  = mChg > 3000;
+    cards.push({
+      label: mgBull ? '融資減碼↑' : mgBear ? '融資追多⚠' : '融資中性',
+      val:   `${mChg >= 0 ? '+' : ''}${mChg.toLocaleString()} 張（使用率 ${mUtil}%）`,
+      bull: mgBull, bear: mgBear,
+    });
+    // 融券增加 = 空方積極(空); 融券使用率高 = 軋空風險(多反向)
+    const sqBull  = sUtil > 60;
+    const sqBear  = sChg  > 500;
+    cards.push({
+      label: sqBull ? '融券高使用率↑軋空' : sqBear ? '融券增空↑空' : '融券中性',
+      val:   `${sChg >= 0 ? '+' : ''}${sChg.toLocaleString()} 張（使用率 ${sUtil}%）`,
+      bull: sqBull, bear: sqBear,
+    });
+  }
+
+  // 5. 大戶近 N 日淨分
   if (sh.length) {
     const netSum  = sh.reduce((s, r) => s + (r.net_score || 0), 0);
     const avgNet  = (netSum / sh.length).toFixed(1);
@@ -6775,24 +6826,24 @@ function _derivSignal(d) {
 
   if (!cards.length) return;
 
-  const bullN    = cards.filter(c => c.bull).length;
-  const bearN    = cards.filter(c => c.bear).length;
-  const overall  = bullN > bearN ? {txt: '偏多', col: '#3fb950'}
-                 : bearN > bullN ? {txt: '偏空', col: '#f85149'}
-                 : {txt: '中性', col: '#8b949e'};
+  const bullN   = cards.filter(c => c.bull).length;
+  const bearN   = cards.filter(c => c.bear).length;
+  const overall = bullN > bearN ? {txt: '偏多', col: '#3fb950'}
+                : bearN > bullN ? {txt: '偏空', col: '#f85149'}
+                : {txt: '中性', col: '#8b949e'};
 
   const el = document.getElementById('deriv-signal');
   el.style.display = 'block';
   el.innerHTML = `
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px">
-      <div style="font-size:12px;font-weight:700;color:${overall.col};white-space:nowrap;padding:2px 0">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:5px">
+      <div style="font-size:12px;font-weight:700;color:${overall.col};white-space:nowrap;padding:2px 4px 2px 0">
         主力意圖：${overall.txt}
-        <span style="font-size:10px;font-weight:400;color:var(--mut)">&nbsp;(${bullN}多/${bearN}空/${cards.length-bullN-bearN}中)</span>
+        <span style="font-size:10px;font-weight:400;color:var(--mut)">(${bullN}多/${bearN}空/${cards.length-bullN-bearN}中)</span>
       </div>
       ${cards.map(c => `
         <div style="display:flex;align-items:center;gap:4px;padding:2px 8px;
-             background:${c.bull?'rgba(63,185,80,0.1)':c.bear?'rgba(248,81,73,0.1)':'rgba(139,148,158,0.08)'};
-             border:1px solid ${c.bull?'rgba(63,185,80,0.35)':c.bear?'rgba(248,81,73,0.35)':'rgba(139,148,158,0.2)'};
+             background:${c.bull?'rgba(63,185,80,0.1)':c.bear?'rgba(248,81,73,0.1)':'rgba(139,148,158,0.07)'};
+             border:1px solid ${c.bull?'rgba(63,185,80,0.35)':c.bear?'rgba(248,81,73,0.35)':'rgba(139,148,158,0.18)'};
              border-radius:5px;white-space:nowrap">
           <span style="font-size:10px;color:var(--mut)">${c.label}</span>
           <span style="font-size:11px;font-weight:600;color:${c.bull?'#3fb950':c.bear?'#f85149':'#8b949e'}">${c.val}</span>
@@ -6800,11 +6851,12 @@ function _derivSignal(d) {
     </div>`;
 }
 
-// ── 4 panel 整合圖（共用 x 軸，縮放聯動）────────────────────────────────
+// ── 5 panel 整合圖（共用 x 軸，縮放聯動）────────────────────────────────
 function _derivRenderIntegrated(d, sid, name) {
   const hasSp  = (d.stock_prices || []).length > 0;
   const hasFut = (d.futures      || []).length > 0;
   const hasOpt = (d.options      || []).length > 0;
+  const hasMg  = (d.margin       || []).length > 0;
   const hasHld = (d.holder       || []).length > 0;
 
   const traces = [];
@@ -6822,7 +6874,7 @@ function _derivRenderIntegrated(d, sid, name) {
     const ft = d.futures;
     traces.push({
       x: ft.map(r=>r.date), y: ft.map(r=>r.close),
-      type:'scatter', mode:'lines', name:'期貨', xaxis:'x', yaxis: hasSp ? 'y' : 'y',
+      type:'scatter', mode:'lines', name:'期貨', xaxis:'x', yaxis:'y',
       line:{color:'#a78bfa', width:1.6, dash: hasSp ? 'dot' : 'solid'},
     });
 
@@ -6850,7 +6902,7 @@ function _derivRenderIntegrated(d, sid, name) {
     const putOIs  = op.map(r => r.put_oi);
     const pcs     = op.map(r => r.call_oi > 0 ? +(r.put_oi / r.call_oi).toFixed(3) : null);
     traces.push(
-      {x:op.map(r=>r.date), y:callOIs, type:'bar', name:'Call OI', barmode:'stack',
+      {x:op.map(r=>r.date), y:callOIs, type:'bar', name:'Call OI',
        xaxis:'x3', yaxis:'y5', marker:{color:'rgba(63,185,80,0.6)'}},
       {x:op.map(r=>r.date), y:putOIs,  type:'bar', name:'Put OI',
        xaxis:'x3', yaxis:'y5', marker:{color:'rgba(248,81,73,0.6)'}},
@@ -6859,42 +6911,68 @@ function _derivRenderIntegrated(d, sid, name) {
     );
   }
 
-  // Panel 4 — 大戶淨分
+  // Panel 4 — 融資融券日增減
+  if (hasMg) {
+    const mg    = d.margin;
+    const mChgs = mg.map(r => r.margin_chg);
+    const sChgs = mg.map(r => r.short_chg);
+    const mUtil = mg.map(r => r.margin_util);
+    traces.push(
+      {x:mg.map(r=>r.date), y:mChgs, type:'bar', name:'融資日增減',
+       xaxis:'x4', yaxis:'y7',
+       marker:{color: mChgs.map(v => v >= 0 ? 'rgba(56,139,253,0.7)' : 'rgba(56,139,253,0.35)')}},
+      {x:mg.map(r=>r.date), y:sChgs, type:'bar', name:'融券日增減',
+       xaxis:'x4', yaxis:'y7',
+       marker:{color: sChgs.map(v => v >= 0 ? 'rgba(210,153,34,0.7)' : 'rgba(210,153,34,0.35)')}},
+      {x:mg.map(r=>r.date), y:mUtil, type:'scatter', mode:'lines', name:'融資使用率%',
+       xaxis:'x4', yaxis:'y8', line:{color:'#38bdf8', width:1.5, dash:'dot'}},
+    );
+  }
+
+  // Panel 5 — 大戶淨分
   if (hasHld) {
     const hd   = d.holder;
     const nets = hd.map(r => r.net_score || 0);
     traces.push({
       x: hd.map(r=>r.date), y: nets,
-      type:'bar', name:'大戶淨分', xaxis:'x4', yaxis:'y7',
+      type:'bar', name:'大戶淨分', xaxis:'x5', yaxis:'y9',
       marker:{color: nets.map(v => v >= 0 ? 'rgba(63,185,80,0.75)' : 'rgba(248,81,73,0.75)')},
     });
   }
 
-  // 計算各 panel 高度區間（bottom → top）
-  // 根據有無資料動態分配比例
-  const panels  = [true, hasFut, hasOpt, hasHld];   // 4 panels
-  const weights = [0.38, 0.22, 0.26, 0.14];
+  // 動態計算各 panel 高度區間
+  const panels  = [true, hasFut, hasOpt, hasMg, hasHld];
+  const weights = [0.34, 0.18, 0.20, 0.18, 0.10];
   const active  = panels.map((on, i) => on ? weights[i] : 0);
   const total   = active.reduce((s, v) => s + v, 0) || 1;
   const norm    = active.map(v => v / total);
-  // cumulative bottom edges
-  const bottoms = norm.reduce((acc, v, i) => { acc.push((acc[i] || 0) + (norm[i-1] || 0)); return acc; }, []);
-  const tops    = bottoms.map((b, i) => b + norm[i]);
-  const gap     = 0.03;
-  const domains = bottoms.map((b, i) => [b + (i > 0 ? gap/2 : 0), tops[i] - (i < 3 ? gap/2 : 0)]);
-  // Reverse so panel 1 is at top
-  domains.reverse();
+  const bottoms = norm.reduce((acc, v, i) => {
+    acc.push(i === 0 ? 0 : acc[i-1] + norm[i-1]);
+    return acc;
+  }, []);
+  const tops = bottoms.map((b, i) => b + norm[i]);
+  const gap  = 0.025;
+  const nPan = panels.length;
+  const domains = bottoms.map((b, i) => [
+    b + (i > 0 ? gap/2 : 0),
+    tops[i] - (i < nPan-1 ? gap/2 : 0),
+  ]);
+  domains.reverse();   // top panel first
 
   const GC = '#21262d';
-  const yStyle = (domain, title) => ({
-    domain, gridcolor: GC, tickfont:{size:10},
-    title:{text: title, font:{color:'#8b949e', size:10}}, titlefont:{size:10},
-    zeroline:false,
+  const yS = (dom, ttl) => ({
+    domain: dom, gridcolor: GC, tickfont:{size:9}, zeroline:false,
+    title:{text: ttl, font:{color:'#8b949e', size:9}},
+  });
+  const yR = (dom, ttl) => ({
+    domain: dom, overlaying: undefined, side:'right', showgrid:false,
+    tickfont:{size:9}, zeroline:false,
+    title:{text: ttl, font:{color:'#8b949e', size:9}},
   });
 
   const layout = {
     paper_bgcolor:'transparent', plot_bgcolor:'transparent',
-    margin:{t:10, r:65, b:36, l:58},
+    margin:{t:10, r:62, b:36, l:52},
     font:{color:'#8b949e', size:11},
     legend:{orientation:'h', y:1.02, x:0, font:{color:'#8b949e', size:10}, bgcolor:'transparent'},
     barmode:'relative',
@@ -6902,24 +6980,29 @@ function _derivRenderIntegrated(d, sid, name) {
     xaxis:  {domain:[0,1], anchor:'y',  showticklabels:false, gridcolor:GC, tickfont:{size:9}},
     xaxis2: {domain:[0,1], anchor:'y3', showticklabels:false, gridcolor:GC, tickfont:{size:9}, matches:'x'},
     xaxis3: {domain:[0,1], anchor:'y5', showticklabels:false, gridcolor:GC, tickfont:{size:9}, matches:'x'},
-    xaxis4: {domain:[0,1], anchor:'y7', showticklabels:true,  gridcolor:GC, tickfont:{size:9}, matches:'x'},
+    xaxis4: {domain:[0,1], anchor:'y7', showticklabels:false, gridcolor:GC, tickfont:{size:9}, matches:'x'},
+    xaxis5: {domain:[0,1], anchor:'y9', showticklabels:true,  gridcolor:GC, tickfont:{size:9}, matches:'x'},
 
-    yaxis:  yStyle(domains[0], '收盤'),
-    yaxis2: {domain:domains[0], overlaying:'y',  side:'right', showgrid:false, tickfont:{size:9}, zeroline:false},
-    yaxis3: yStyle(domains[1], '未平倉'),
-    yaxis4: {domain:domains[1], overlaying:'y3', side:'right', showgrid:false, tickfont:{size:9}, zeroline:true, zerolinecolor:'#444'},
-    yaxis5: yStyle(domains[2], 'OI 口數'),
-    yaxis6: {domain:domains[2], overlaying:'y5', side:'right', showgrid:false, tickfont:{size:9}, title:{text:'P/C',font:{size:9}}, zeroline:false},
-    yaxis7: yStyle(domains[3], '大戶淨分'),
+    yaxis:  yS(domains[0], '收盤'),
+    yaxis2: {...yR(domains[0],''), overlaying:'y'},
+    yaxis3: yS(domains[1], '未平倉'),
+    yaxis4: {...yR(domains[1],'OI增減'), overlaying:'y3', zeroline:true, zerolinecolor:'#444'},
+    yaxis5: yS(domains[2], 'OI口'),
+    yaxis6: {...yR(domains[2],'P/C'), overlaying:'y5'},
+    yaxis7: yS(domains[3], '增減張'),
+    yaxis8: {...yR(domains[3],'使用率%'), overlaying:'y7'},
+    yaxis9: yS(domains[4], '大戶淨'),
 
     annotations: [
-      {xref:'paper',yref:'paper',x:0.01,y:tops[0]-0.01, xanchor:'left',yanchor:'top',
+      {xref:'paper',yref:'paper',x:0.01,y:tops[0]-0.01,xanchor:'left',yanchor:'top',
        text:`${name}  現貨 + 期貨`, font:{color:'#c9d1d9',size:11}, showarrow:false},
-      hasFut ? {xref:'paper',yref:'paper',x:0.01,y:tops[1]-0.01, xanchor:'left',yanchor:'top',
+      hasFut ? {xref:'paper',yref:'paper',x:0.01,y:tops[1]-0.01,xanchor:'left',yanchor:'top',
        text:'未平倉口數', font:{color:'#f97316',size:10}, showarrow:false} : null,
-      hasOpt ? {xref:'paper',yref:'paper',x:0.01,y:tops[2]-0.01, xanchor:'left',yanchor:'top',
-       text:'選擇權 P/C 比', font:{color:'#facc15',size:10}, showarrow:false} : null,
-      hasHld ? {xref:'paper',yref:'paper',x:0.01,y:tops[3]-0.01, xanchor:'left',yanchor:'top',
+      hasOpt ? {xref:'paper',yref:'paper',x:0.01,y:tops[2]-0.01,xanchor:'left',yanchor:'top',
+       text:'選擇權 P/C', font:{color:'#facc15',size:10}, showarrow:false} : null,
+      hasMg  ? {xref:'paper',yref:'paper',x:0.01,y:tops[3]-0.01,xanchor:'left',yanchor:'top',
+       text:'融資(藍)/融券(黃)日增減', font:{color:'#38bdf8',size:10}, showarrow:false} : null,
+      hasHld ? {xref:'paper',yref:'paper',x:0.01,y:tops[4]-0.01,xanchor:'left',yanchor:'top',
        text:'大戶動向', font:{color:'#8b949e',size:10}, showarrow:false} : null,
     ].filter(Boolean),
   };
