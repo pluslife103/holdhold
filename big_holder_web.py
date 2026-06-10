@@ -2733,6 +2733,65 @@ def api_big_player_timeline(
     return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
+@app.get("/api/broker_list")
+def api_broker_list():
+    """查詢 2330 最近一個有資料的交易日，回傳所有分點清單 [{broker_id, broker_name}]。"""
+    import os
+    from datetime import date as dt_date, timedelta
+
+    ckey = "broker_list_v2"
+    cached = _cget(ckey, ttl_h=6)
+    if cached is not None:
+        return cached
+
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+
+    today = dt_date.today()
+    brokers: dict = {}
+
+    # Try the last 5 weekdays on 3 high-volume stocks to collect as many brokers as possible
+    for stock_id in ["2330", "2317", "2454"]:
+        for offset in range(7):
+            d = today - timedelta(days=offset)
+            if d.weekday() >= 5:
+                continue
+            try:
+                resp = requests.get(
+                    FINMIND_BASE,
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={
+                        "dataset":    "TaiwanStockTradingDailyReport",
+                        "data_id":    stock_id,
+                        "start_date": d.isoformat(),
+                        "end_date":   d.isoformat(),
+                    },
+                    timeout=30,
+                )
+                j = resp.json()
+                rows = j.get("data") or []
+                if rows:
+                    for row in rows:
+                        bid   = str(row.get("securities_trader_id", "") or "").strip()
+                        bname = str(row.get("securities_trader",    "") or "").strip()
+                        if bid:
+                            brokers[bid] = bname or bid
+                    break   # got data for this stock; move to next stock
+            except Exception:
+                pass
+
+    if not brokers:
+        raise HTTPException(502, "無法取得分點清單，請稍後再試")
+
+    result = sorted(
+        [{"broker_id": k, "broker_name": v} for k, v in brokers.items()],
+        key=lambda x: x["broker_name"]
+    )
+    _cset(ckey, result)
+    return {"brokers": result, "total": len(result)}
+
+
 @app.get("/api/broker_stats")
 def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
     """查詢指定券商(分點)在最近N個交易日的股票操作歷史，回傳各股累積買賣超。
@@ -3416,36 +3475,51 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       </div>
     </div>
 
-    <!-- 對比 pane -->
+    <!-- 券商統計 pane -->
     <div class="pane" id="pane-compare">
-      <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-        <!-- 查詢列 -->
-        <div style="padding:8px 14px 6px;border-bottom:1px solid var(--bor);flex-shrink:0">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-            <span style="font-size:11px;color:var(--mut);white-space:nowrap;flex-shrink:0">券商代碼：</span>
-            <input id="bstats-input" type="text" maxlength="10"
-              style="width:90px;font-size:13px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 8px;border-radius:5px"
-              placeholder="例：1480" onkeydown="if(event.key==='Enter')bstatsLoad()">
-            <div style="display:flex;gap:3px">
-              <button class="sort-btn" id="bstats-d10" onclick="bstatsSetDays(10)">10天</button>
-              <button class="sort-btn active" id="bstats-d20" onclick="bstatsSetDays(20)">20天</button>
-              <button class="sort-btn" id="bstats-d40" onclick="bstatsSetDays(40)">40天</button>
-              <button class="sort-btn" id="bstats-d60" onclick="bstatsSetDays(60)">60天</button>
+      <div style="display:flex;height:100%;overflow:hidden">
+
+        <!-- ── 左側分點列表 ── -->
+        <div id="bstats-sidebar" style="width:200px;min-width:160px;max-width:220px;border-right:1px solid var(--bor);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden">
+          <!-- 搜尋 + 天數 -->
+          <div style="padding:8px;border-bottom:1px solid var(--bor);flex-shrink:0">
+            <input id="bstats-search" type="text" placeholder="搜尋分點…"
+              style="width:100%;box-sizing:border-box;font-size:12px;background:var(--sur2);border:1px solid var(--bor);color:var(--txt);padding:4px 7px;border-radius:5px"
+              oninput="bstatsFilterList()">
+            <div style="display:flex;gap:2px;margin-top:5px">
+              <button class="sort-btn" id="bstats-d10" onclick="bstatsSetDays(10)" style="flex:1;font-size:10px;padding:2px 0">10天</button>
+              <button class="sort-btn active" id="bstats-d20" onclick="bstatsSetDays(20)" style="flex:1;font-size:10px;padding:2px 0">20天</button>
+              <button class="sort-btn" id="bstats-d40" onclick="bstatsSetDays(40)" style="flex:1;font-size:10px;padding:2px 0">40天</button>
+              <button class="sort-btn" id="bstats-d60" onclick="bstatsSetDays(60)" style="flex:1;font-size:10px;padding:2px 0">60天</button>
             </div>
-            <button class="sort-btn active" onclick="bstatsLoad()" style="padding:4px 14px;flex-shrink:0">查詢</button>
+            <div id="bstats-list-count" style="font-size:10px;color:var(--mut);margin-top:4px"></div>
           </div>
-          <div style="font-size:10px;color:var(--mut);margin-top:4px">
-            代碼可在「分點籌碼」頁查詢，或直接輸入 4 碼券商分點代碼
+          <!-- 分點清單 -->
+          <div id="bstats-broker-list" style="flex:1;overflow-y:auto;font-size:12px">
+            <div class="loading" style="padding:20px 10px"><div class="spinner"></div><span>載入分點清單…</span></div>
           </div>
         </div>
-        <!-- 狀態列 -->
-        <div id="bstats-status" style="padding:4px 14px;font-size:11px;color:var(--mut);flex-shrink:0">輸入券商代碼後點「查詢」</div>
-        <!-- 摘要卡片 -->
-        <div id="bstats-summary" style="display:none;flex-shrink:0;padding:6px 14px;border-bottom:1px solid var(--bor);display:none;gap:12px;flex-wrap:wrap"></div>
-        <!-- 長條圖 -->
-        <div id="bstats-chart" style="flex-shrink:0;height:0px;min-height:0"></div>
-        <!-- 表格 + 排序按鈕 -->
-        <div id="bstats-table-wrap" style="flex:1;overflow-y:auto;min-height:0"></div>
+
+        <!-- ── 右側內容區 ── -->
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden">
+          <!-- 狀態 + 摘要 -->
+          <div id="bstats-status" style="padding:5px 14px;font-size:11px;color:var(--mut);flex-shrink:0;border-bottom:1px solid var(--bor)">← 從左側選擇分點</div>
+          <div id="bstats-summary" style="display:none;flex-shrink:0;padding:5px 14px;border-bottom:1px solid var(--bor);gap:12px;flex-wrap:wrap"></div>
+          <!-- 雙圖表：買超前20 / 賣超前20 -->
+          <div id="bstats-charts-row" style="display:none;flex-shrink:0;height:220px;padding:0 6px 4px;gap:6px;display:none">
+            <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+              <div style="font-size:11px;color:var(--acc);padding:2px 6px;font-weight:600">買超前20（張）</div>
+              <div id="bstats-buy-chart" style="flex:1;min-height:0"></div>
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+              <div style="font-size:11px;color:#22c55e;padding:2px 6px;font-weight:600">賣超前20（張）</div>
+              <div id="bstats-sell-chart" style="flex:1;min-height:0"></div>
+            </div>
+          </div>
+          <!-- 表格 -->
+          <div id="bstats-table-wrap" style="flex:1;overflow-y:auto;min-height:0"></div>
+        </div>
+
       </div>
     </div>
 
@@ -4290,9 +4364,11 @@ function plotLag(d) {
 }
 
 // ── 券商統計 ────────────────────────────────────────────────────────────
-let _bstatsDays = 20;
-let _bstatsSortCol = 'net';
-let _bstatsData = null;
+let _bstatsDays     = 20;
+let _bstatsSortCol  = 'net';
+let _bstatsData     = null;
+let _bstatsAllBrokers = [];   // [{broker_id, broker_name}]
+let _bstatsActiveTid  = '';
 
 function bstatsSetDays(d) {
   _bstatsDays = d;
@@ -4300,22 +4376,61 @@ function bstatsSetDays(d) {
     const el = document.getElementById(`bstats-d${n}`);
     if (el) el.classList.toggle('active', n === d);
   });
+  // Re-query if already viewing a broker
+  if (_bstatsActiveTid) bstatsLoadBroker(_bstatsActiveTid);
 }
 
-async function bstatsLoad() {
-  const tid = (document.getElementById('bstats-input').value || '').trim();
-  if (!tid) { showToast('請輸入券商代碼', true); return; }
+// ── 初始化：載入分點清單 ──────────────────────────────────────────────
+async function bstatsInit() {
+  if (_bstatsAllBrokers.length > 0) return;   // already loaded
+  try {
+    const res = await fetch('/api/broker_list');
+    const j   = await res.json();
+    _bstatsAllBrokers = j.brokers || [];
+    bstatsFilterList();
+  } catch(e) {
+    document.getElementById('bstats-broker-list').innerHTML =
+      `<div style="padding:10px;color:var(--red);font-size:11px">分點清單載入失敗</div>`;
+  }
+}
+
+// ── 過濾 + 渲染分點清單 ──────────────────────────────────────────────
+function bstatsFilterList() {
+  const q    = (document.getElementById('bstats-search')?.value || '').trim().toLowerCase();
+  const list = _bstatsAllBrokers.filter(b =>
+    !q || b.broker_id.includes(q) || b.broker_name.toLowerCase().includes(q)
+  );
+  const cntEl = document.getElementById('bstats-list-count');
+  if (cntEl) cntEl.textContent = `共 ${list.length} 個分點`;
+  const el = document.getElementById('bstats-broker-list');
+  if (!el) return;
+  if (!list.length) { el.innerHTML = '<div style="padding:10px;color:var(--mut);font-size:11px">無符合結果</div>'; return; }
+  el.innerHTML = list.map(b => {
+    const isAct = b.broker_id === _bstatsActiveTid;
+    return `<div onclick="bstatsLoadBroker('${b.broker_id}')"
+      style="padding:6px 10px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04);
+             ${isAct ? 'background:rgba(88,166,255,.12);color:var(--blu);' : ''}">
+      <span style="font-size:10px;color:var(--mut);margin-right:4px">${b.broker_id}</span>
+      <span style="font-size:12px">${b.broker_name}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── 查詢指定分點 ────────────────────────────────────────────────────
+async function bstatsLoadBroker(tid) {
+  _bstatsActiveTid = tid;
+  bstatsFilterList();   // highlight selected row
 
   document.getElementById('bstats-status').textContent = '載入中…';
   const sumEl = document.getElementById('bstats-summary');
   sumEl.style.display = 'none';
-  document.getElementById('bstats-chart').style.height = '0px';
-  document.getElementById('bstats-chart').innerHTML = '';
+  const chartsRow = document.getElementById('bstats-charts-row');
+  chartsRow.style.display = 'none';
   document.getElementById('bstats-table-wrap').innerHTML = '';
 
   try {
     const res = await fetch(`/api/broker_stats?trader_id=${encodeURIComponent(tid)}&days=${_bstatsDays}`);
-    const j = await res.json();
+    const j   = await res.json();
     if (!res.ok) {
       document.getElementById('bstats-status').textContent = `錯誤: ${j.detail || res.status}`;
       return;
@@ -4328,39 +4443,51 @@ async function bstatsLoad() {
 }
 
 function bstatsRender(d) {
-  const name = d.trader_name && d.trader_name !== d.trader_id ? `${d.trader_name} (${d.trader_id})` : d.trader_id;
+  const name = (d.trader_name && d.trader_name !== d.trader_id)
+    ? `${d.trader_name} (${d.trader_id})` : d.trader_id;
   document.getElementById('bstats-status').textContent =
-    `${name} | 近 ${d.days} 個交易日 | 共 ${d.stock_count} 支股票`;
+    `${name} ｜ 近 ${d.days} 個交易日 ｜ 共 ${d.stock_count} 支股票`;
 
   // Summary cards
   const sumEl = document.getElementById('bstats-summary');
   sumEl.style.display = 'flex';
   const nc = d.total_net > 0 ? '#ef4444' : d.total_net < 0 ? '#22c55e' : 'var(--txt)';
   sumEl.innerHTML = `
-    <div class="stat-box"><div class="stat-val" style="color:${nc}">${d.total_net > 0?'+':''}${d.total_net.toLocaleString()}</div><div class="stat-sub">淨買超（張）</div></div>
+    <div class="stat-box"><div class="stat-val" style="color:${nc}">${d.total_net>0?'+':''}${d.total_net.toLocaleString()}</div><div class="stat-sub">淨買超（張）</div></div>
     <div class="stat-box"><div class="stat-val" style="color:#ef4444">${d.total_buy.toLocaleString()}</div><div class="stat-sub">累積買進（張）</div></div>
     <div class="stat-box"><div class="stat-val" style="color:#22c55e">${d.total_sell.toLocaleString()}</div><div class="stat-sub">累積賣出（張）</div></div>
     <div class="stat-box"><div class="stat-val">${d.stock_count}</div><div class="stat-sub">交易股票數</div></div>`;
 
-  // Bar chart: top 20 by |net|
-  const top20 = d.stocks.slice(0, 20);
-  if (top20.length > 0) {
-    const chartEl = document.getElementById('bstats-chart');
-    chartEl.style.height = '200px';
-    const barColors = top20.map(r => r.net > 0 ? '#ef4444' : '#22c55e');
-    Plotly.newPlot('bstats-chart', [{
-      x: top20.map(r => `${r.stock_id} ${r.stock_name}`),
-      y: top20.map(r => r.net),
-      type: 'bar',
-      marker: {color: barColors},
-      hovertemplate: '%{x}<br>淨: %{y:+,.0f} 張<extra></extra>',
-    }], {
-      ...PLY,
-      yaxis: {gridcolor:'#21262d', zeroline:true, zerolinecolor:'#444', title:'張'},
-      margin: {t:6, b:70, l:50, r:10},
-      height: 200,
-    }, {responsive:true, displayModeBar:false});
-  }
+  // 雙圖表 — 買超前20 / 賣超前20
+  const chartsRow = document.getElementById('bstats-charts-row');
+  chartsRow.style.display = 'flex';
+  chartsRow.style.height = '200px';
+
+  const byBuy  = [...d.stocks].sort((a,b) => b.buy  - a.buy ).slice(0, 20);
+  const bySell = [...d.stocks].sort((a,b) => b.sell - a.sell).slice(0, 20);
+
+  const chartLayout = (title) => ({
+    ...PLY, showlegend: false,
+    margin: {t:4, b:72, l:50, r:8},
+    xaxis: {tickangle:-45, tickfont:{size:9}, gridcolor:'transparent'},
+    yaxis: {gridcolor:'#21262d', zeroline:false, title:{text:'張',font:{size:10}}},
+  });
+
+  Plotly.newPlot('bstats-buy-chart', [{
+    x: byBuy.map(r => `${r.stock_id} ${r.stock_name}`),
+    y: byBuy.map(r => r.buy),
+    type: 'bar', name: '買進',
+    marker: {color: '#ef4444'},
+    hovertemplate: '%{x}<br>買進: %{y:,.0f} 張<extra></extra>',
+  }], chartLayout('買超前20'), {responsive:true, displayModeBar:false});
+
+  Plotly.newPlot('bstats-sell-chart', [{
+    x: bySell.map(r => `${r.stock_id} ${r.stock_name}`),
+    y: bySell.map(r => r.sell),
+    type: 'bar', name: '賣出',
+    marker: {color: '#22c55e'},
+    hovertemplate: '%{x}<br>賣出: %{y:,.0f} 張<extra></extra>',
+  }], chartLayout('賣超前20'), {responsive:true, displayModeBar:false});
 
   // Table
   bstatsRenderTable();
@@ -4368,10 +4495,11 @@ function bstatsRender(d) {
 
 function bstatsRenderTable() {
   if (!_bstatsData) return;
-  const d = _bstatsData;
+  const d  = _bstatsData;
   const sc = _bstatsSortCol;
   const sorted = [...d.stocks].sort((a, b) => {
-    if (sc === 'net')  return Math.abs(b.net)  - Math.abs(a.net);
+    if (sc === 'net')  return b.net  - a.net;
+    if (sc === 'netn') return a.net  - b.net;
     if (sc === 'buy')  return b.buy  - a.buy;
     if (sc === 'sell') return b.sell - a.sell;
     if (sc === 'days') return b.days - a.days;
@@ -4379,9 +4507,10 @@ function bstatsRenderTable() {
   });
 
   const sortBtns = [
-    {k:'net',  label:'|淨買超|↓'},
-    {k:'buy',  label:'買進量↓'},
-    {k:'sell', label:'賣出量↓'},
+    {k:'buy',  label:'買進↓'},
+    {k:'sell', label:'賣出↓'},
+    {k:'net',  label:'淨買超↓'},
+    {k:'netn', label:'淨賣超↓'},
     {k:'days', label:'天數↓'},
   ].map(c => `<button class="sort-btn ${sc===c.k?'active':''}" onclick="_bstatsSortCol='${c.k}';bstatsRenderTable()">${c.label}</button>`).join('');
 
@@ -4394,16 +4523,16 @@ function bstatsRenderTable() {
       <td style="color:var(--mut);font-size:10px">${cap}</td>
       <td style="color:#ef4444">${r.buy.toLocaleString()}</td>
       <td style="color:#22c55e">${r.sell.toLocaleString()}</td>
-      <td class="${nc}" style="font-weight:700">${r.net > 0 ? '+' : ''}${r.net.toLocaleString()}</td>
+      <td class="${nc}" style="font-weight:700">${r.net>0?'+':''}${r.net.toLocaleString()}</td>
       <td style="color:var(--mut)">${r.days}</td>
       <td style="color:var(--mut);font-size:10px">${r.last_date}</td>
     </tr>`;
   }).join('');
 
   document.getElementById('bstats-table-wrap').innerHTML = `
-    <div style="display:flex;gap:4px;padding:6px 14px;flex-shrink:0;flex-wrap:wrap">${sortBtns}</div>
+    <div style="display:flex;gap:4px;padding:5px 12px;flex-shrink:0;flex-wrap:wrap;border-bottom:1px solid var(--bor)">${sortBtns}</div>
     <div style="overflow-x:auto">
-      <table class="ctable" style="min-width:600px">
+      <table class="ctable" style="min-width:580px">
         <tr><th>代號</th><th>名稱</th><th>市值(億)</th><th>買進(張)</th><th>賣出(張)</th><th>淨買超</th><th>天數</th><th>最後交易</th></tr>
         ${rows}
       </table>
@@ -4426,7 +4555,7 @@ function switchTab(name) {
   if (navBtn) navBtn.classList.add('active');
 
   if (name === 'compare') {
-    // broker stats tab — no auto-load needed
+    bstatsInit();
   }
   if (name === 'grade') {
     loadGrading();
