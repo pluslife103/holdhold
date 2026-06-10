@@ -2735,9 +2735,12 @@ def api_big_player_timeline(
 
 @app.get("/api/broker_stats")
 def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
-    """查詢指定券商(分點)在最近N個交易日的股票操作歷史，回傳各股累積買賣超。"""
+    """查詢指定券商(分點)在最近N個交易日的股票操作歷史，回傳各股累積買賣超。
+    FinMind taiwan_stock_trading_daily_report 僅支援單日查詢，逐日平行抓取後彙總。
+    """
     import os
     from datetime import date as dt_date, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     trader_id = trader_id.strip()
     if not trader_id:
@@ -2752,67 +2755,86 @@ def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
     if not token:
         raise HTTPException(500, "未設定 FINMIND_TOKEN")
 
+    # Build list of last N weekdays (Mon–Fri); actual trading days filtered by whether data exists
     today = dt_date.today()
-    start = (today - timedelta(days=max(days * 2, 90))).isoformat()
-    end   = today.isoformat()
+    candidate_dates: list[str] = []
+    d = today
+    while len(candidate_dates) < days + 10:   # buffer for holidays
+        if d.weekday() < 5:
+            candidate_dates.append(d.isoformat())
+        d -= timedelta(1)
 
-    try:
-        r = requests.get(
-            FINMIND_BROKER_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            params={"securities_trader_id": trader_id, "start_date": start, "end_date": end},
-            timeout=60,
-        )
-        j = r.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(502, f"無法連線 FinMind API: {type(e).__name__}")
-    except Exception:
-        raise HTTPException(502, "回應解析失敗")
+    def fetch_one(date_str: str) -> list:
+        dckey = f"bstats_day|{trader_id}|{date_str}"
+        hit = _cget(dckey, ttl_h=12)
+        if hit is not None:
+            return hit
+        try:
+            resp = requests.get(
+                FINMIND_BROKER_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                params={"securities_trader_id": trader_id, "date": date_str},
+                timeout=20,
+            )
+            j2 = resp.json()
+        except Exception:
+            return []
+        if j2.get("status") not in (200, None):
+            return []
+        raw = j2.get("data", []) or []
+        # Aggregate rows for the same stock_id (multiple price levels → one entry per stock)
+        agg: dict = {}
+        name_hint = trader_id
+        for row in raw:
+            sid = str(row.get("stock_id", "")).strip()
+            if not sid:
+                continue
+            if name_hint == trader_id:
+                name_hint = row.get("securities_trader", trader_id) or trader_id
+            if sid not in agg:
+                agg[sid] = {"buy": 0.0, "sell": 0.0}
+            agg[sid]["buy"]  += float(row.get("buy",  0) or 0)
+            agg[sid]["sell"] += float(row.get("sell", 0) or 0)
+        result_day = [
+            {"stock_id": sid, "date": date_str,
+             "buy":  int(v["buy"]  / 1000),
+             "sell": int(v["sell"] / 1000),
+             "trader_name": name_hint}
+            for sid, v in agg.items()
+        ]
+        _cset(dckey, result_day)
+        return result_day
 
-    if j.get("status") not in (200, None):
-        msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
-        raise HTTPException(502, f"FinMind error: {msg}")
-
-    rows_all = j.get("data", [])
+    # Parallel fetch with max 5 workers to respect FinMind rate limits
+    all_rows: list = []
     trader_name = trader_id
+    trading_days_found = 0
 
-    if not rows_all:
-        result = {"trader_id": trader_id, "trader_name": trader_name, "days": 0,
-                  "total_buy": 0, "total_sell": 0, "total_net": 0, "stock_count": 0, "stocks": []}
-        _cset(ckey, result)
-        return result
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut_map = {ex.submit(fetch_one, dt_str): dt_str for dt_str in candidate_dates}
+        for fut in as_completed(fut_map):
+            rows_day = fut.result()
+            if rows_day:
+                trading_days_found += 1
+                if rows_day[0].get("trader_name") and rows_day[0]["trader_name"] != trader_id:
+                    trader_name = rows_day[0]["trader_name"]
+                all_rows.extend(rows_day)
 
-    # Determine most recent N trading days in the data
-    all_dates = sorted({str(r.get("date",""))[:10] for r in rows_all if r.get("date")}, reverse=True)
-    recent_dates = set(all_dates[:days])
-    rows_filtered = [r for r in rows_all if str(r.get("date",""))[:10] in recent_dates]
+    # Keep only the most recent `days` trading days that actually had data
+    dates_with_data = sorted({r["date"] for r in all_rows}, reverse=True)[:days]
+    dates_set = set(dates_with_data)
+    all_rows = [r for r in all_rows if r["date"] in dates_set]
 
-    if rows_filtered:
-        trader_name = rows_filtered[0].get("securities_trader", trader_id) or trader_id
-
-    # Aggregate: (stock_id, date) → {buy, sell}
-    by_sd: dict = {}
-    for row in rows_filtered:
-        sid = str(row.get("stock_id", "")).strip()
-        dt  = str(row.get("date",     ""))[:10]
-        if not sid or not dt:
-            continue
-        key = (sid, dt)
-        if key not in by_sd:
-            by_sd[key] = {"buy": 0.0, "sell": 0.0}
-        by_sd[key]["buy"]  += float(row.get("buy",  0) or 0)
-        by_sd[key]["sell"] += float(row.get("sell", 0) or 0)
-
-    # Aggregate by stock_id only
+    # Aggregate by stock_id
     stock_agg: dict = {}
-    for (sid, dt), v in by_sd.items():
-        buy_l  = int(v["buy"]  / 1000)
-        sell_l = int(v["sell"] / 1000)
+    for row in all_rows:
+        sid = row["stock_id"]
+        dt  = row["date"]
         if sid not in stock_agg:
             stock_agg[sid] = {"stock_id": sid, "buy": 0, "sell": 0, "net": 0, "days": 0, "last_date": ""}
-        stock_agg[sid]["buy"]  += buy_l
-        stock_agg[sid]["sell"] += sell_l
-        stock_agg[sid]["net"]  += buy_l - sell_l
+        stock_agg[sid]["buy"]  += row["buy"]
+        stock_agg[sid]["sell"] += row["sell"]
+        stock_agg[sid]["net"]  += row["buy"] - row["sell"]
         stock_agg[sid]["days"] += 1
         if dt > stock_agg[sid]["last_date"]:
             stock_agg[sid]["last_date"] = dt
@@ -2820,8 +2842,8 @@ def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
     # Attach stock names and market cap
     for sid, v in stock_agg.items():
         g = _GRADING.get(sid, {})
-        v["stock_name"]     = g.get("stock_name", sid)
-        v["market_cap_億"]  = round(float(g.get("market_cap_億", 0) or 0), 0)
+        v["stock_name"]    = g.get("stock_name", sid)
+        v["market_cap_億"] = round(float(g.get("market_cap_億", 0) or 0), 0)
 
     result_rows = sorted(stock_agg.values(), key=lambda x: abs(x["net"]), reverse=True)
 
@@ -2831,7 +2853,7 @@ def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
     result = {
         "trader_id":   trader_id,
         "trader_name": trader_name,
-        "days":        len(recent_dates),
+        "days":        len(dates_set),
         "total_buy":   total_buy,
         "total_sell":  total_sell,
         "total_net":   total_buy - total_sell,
