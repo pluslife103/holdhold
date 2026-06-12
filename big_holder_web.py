@@ -1146,6 +1146,120 @@ class _FinMindRateLimit(Exception):
     pass
 
 
+@app.get("/api/broker_chip_history")
+def api_broker_chip_history(
+    stock_id: str = Query(""),
+    days:     int = Query(40),
+    force:    int = Query(0),
+):
+    import os
+    from datetime import date as dt_date, timedelta
+    stock_id = stock_id.strip().upper()
+    if not stock_id:
+        raise HTTPException(400, "請輸入股票代號")
+    days = max(5, min(90, days))
+    ckey = f"broker_chip_hist|{stock_id}|{days}"
+    if not force:
+        cached = _cget(ckey, ttl_h=3)
+        if cached is not None:
+            return cached
+    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "未設定 FINMIND_TOKEN")
+
+    today = dt_date.today()
+    start_date = (today - timedelta(days=int(days * 1.7))).isoformat()
+    end_date = today.isoformat()
+
+    try:
+        r = requests.get(
+            FINMIND_BASE,
+            params={
+                "dataset":    "TaiwanStockTradingDailyReport",
+                "data_id":    stock_id,
+                "start_date": start_date,
+                "end_date":   end_date,
+                "token":      token,
+            },
+            timeout=60,
+        )
+        j = r.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(502, f"無法連線 FinMind API: {type(e).__name__}")
+
+    if r.status_code != 200 or j.get("status") not in (200, None):
+        msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
+        raise HTTPException(502, f"FinMind error: {msg}")
+
+    rows_raw = j.get("data", [])
+    if not rows_raw:
+        result = {"stock_id": stock_id, "stock_name": "", "dates": [], "brokers": []}
+        _cset(ckey, result)
+        return result
+
+    # Collect trading dates, keep last `days`
+    all_dates = sorted(set(row.get("date", "") for row in rows_raw if row.get("date")))
+    if len(all_dates) > days:
+        all_dates = all_dates[-days:]
+    dates_set = set(all_dates)
+
+    # Aggregate net lots per broker per date
+    broker_daily: dict = {}
+    broker_names: dict = {}
+    for row in rows_raw:
+        date = row.get("date", "")
+        if date not in dates_set:
+            continue
+        bid   = str(row.get("securities_trader_id", "")).strip()
+        bname = str(row.get("securities_trader", "")).strip()
+        if not bid:
+            continue
+        buy_lots  = float(row.get("buy",  0) or 0) / 1000
+        sell_lots = float(row.get("sell", 0) or 0) / 1000
+        net       = buy_lots - sell_lots
+        if bid not in broker_daily:
+            broker_daily[bid] = {}
+        broker_daily[bid][date] = broker_daily[bid].get(date, 0.0) + net
+        broker_names[bid] = bname
+
+    # Rank by absolute cumulative net, take top 20
+    broker_totals = {bid: sum(daily.values()) for bid, daily in broker_daily.items()}
+    top20 = sorted(broker_totals, key=lambda b: abs(broker_totals[b]), reverse=True)[:20]
+
+    stock_name = (_GRADING.get(stock_id) or {}).get("stock_name", "")
+
+    brokers_out = []
+    for bid in top20:
+        daily = broker_daily[bid]
+        cum = 0.0
+        daily_arr, cum_arr = [], []
+        for d in all_dates:
+            net = daily.get(d, 0.0)
+            cum += net
+            daily_arr.append(round(net, 1))
+            cum_arr.append(round(cum, 1))
+        total_buy  = round(sum(max(0.0, daily.get(d, 0.0)) for d in all_dates), 1)
+        total_sell = round(sum(abs(min(0.0, daily.get(d, 0.0))) for d in all_dates), 1)
+        brokers_out.append({
+            "id":         bid,
+            "name":       broker_names.get(bid, bid),
+            "total_net":  round(broker_totals[bid], 1),
+            "total_buy":  total_buy,
+            "total_sell": total_sell,
+            "daily_net":  daily_arr,
+            "cum_net":    cum_arr,
+        })
+
+    result = {
+        "stock_id":   stock_id,
+        "stock_name": stock_name,
+        "dates":      all_dates,
+        "brokers":    brokers_out,
+    }
+    _cset(ckey, result)
+    return result
+
+
 from fastapi.responses import JSONResponse
 
 @app.exception_handler(_FinMindRateLimit)
@@ -3654,24 +3768,21 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           </div>
         </div>
 
-        <!-- 控制列：券商模式 -->
+        <!-- 控制列：券商統計模式（依股票查歷史分點水位） -->
         <div id="broker-ctrl-trader" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
-          <input id="broker-trader-id" class="search" placeholder="券商代碼 e.g. 1020" style="width:130px"
-                 onkeydown="if(event.key==='Enter')loadBrokerTrader()">
-          <button class="sort-btn" onclick="setTraderPreset('1020')" style="font-size:11px;padding:3px 8px">1020 合庫</button>
-          <button class="sort-btn" onclick="setTraderPreset('1440')" style="font-size:11px;padding:3px 8px">1440 元大</button>
-          <button class="sort-btn" onclick="setTraderPreset('9200')" style="font-size:11px;padding:3px 8px">9200 富邦</button>
-          <button class="sort-btn" onclick="setTraderPreset('6460')" style="font-size:11px;padding:3px 8px">6460 永豐金</button>
-          <button class="sort-btn" onclick="brokerPrevDay()" style="padding:3px 8px">←</button>
-          <input id="broker-date-trader" type="date" class="search" style="width:140px"
-                 onchange="loadBrokerTrader()">
-          <button class="sort-btn" onclick="brokerNextDay()" style="padding:3px 8px">→</button>
-          <button class="sort-btn" onclick="loadBrokerTrader()" style="background:var(--acc);color:#000;font-weight:700">查詢</button>
-          <div style="display:flex;gap:3px;margin-left:auto">
-            <button class="gf-btn active" id="btf-all"    onclick="setBrokerFilter('all')">全部</button>
-            <button class="gf-btn"        id="btf-inst"   onclick="setBrokerFilter('inst')">主力</button>
-            <button class="gf-btn"        id="btf-retail" onclick="setBrokerFilter('retail')">散戶</button>
-          </div>
+          <input id="trader-stock" class="search" placeholder="股票代號 e.g. 2330" style="width:130px"
+                 onkeydown="if(event.key==='Enter')loadBrokerChipHistory()">
+          <button class="sort-btn" onclick="setTraderStockPreset('2330')" style="font-size:11px;padding:3px 8px">2330</button>
+          <button class="sort-btn" onclick="setTraderStockPreset('2454')" style="font-size:11px;padding:3px 8px">2454</button>
+          <button class="sort-btn" onclick="setTraderStockPreset('2317')" style="font-size:11px;padding:3px 8px">2317</button>
+          <button class="sort-btn" onclick="setTraderStockPreset('2327')" style="font-size:11px;padding:3px 8px">2327</button>
+          <select id="trader-days" class="search" style="width:110px">
+            <option value="20">近20交易日</option>
+            <option value="40" selected>近40交易日</option>
+            <option value="60">近60交易日</option>
+            <option value="90">近90交易日</option>
+          </select>
+          <button class="sort-btn" onclick="loadBrokerChipHistory()" style="background:var(--acc);color:#000;font-weight:700">查詢</button>
         </div>
 
         <!-- 控制列：時間軸模式 -->
@@ -3695,6 +3806,11 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 
         <!-- 時間軸圖表區 -->
         <div id="broker-timeline-wrap" style="display:none;flex-direction:column;gap:6px"></div>
+
+        <!-- 券商統計：分點水位折線圖 -->
+        <div id="broker-chip-chart-wrap" style="display:none;flex-direction:column;gap:8px">
+          <div id="broker-chip-chart" style="width:100%;height:340px"></div>
+        </div>
 
         <!-- 摘要卡 -->
         <div id="broker-summary" style="display:none;gap:8px;flex-wrap:wrap"></div>
@@ -4598,10 +4714,7 @@ function setBrokerMode(mode) {
   document.getElementById('broker-table-wrap').innerHTML = '';
   document.getElementById('broker-timeline-wrap').style.display = 'none';
   document.getElementById('broker-timeline-wrap').innerHTML = '';
-  if (mode === 'trader') {
-    const d = document.getElementById('broker-date-trader');
-    if (!d.value) d.value = document.getElementById('broker-date').value;
-  }
+  document.getElementById('broker-chip-chart-wrap').style.display = 'none';
   if (mode === 'timeline') {
     const end = new Date(); end.setDate(end.getDate() - 1);
     const start = new Date(end); start.setDate(start.getDate() - 55);
@@ -5351,82 +5464,100 @@ function jumpToTimeline(stockId) {
   loadTimeline();
 }
 
-function setTraderPreset(id) {
-  document.getElementById('broker-trader-id').value = id;
-  loadBrokerTrader();
+function setTraderStockPreset(id) {
+  document.getElementById('trader-stock').value = id;
+  loadBrokerChipHistory();
 }
 
-async function loadBrokerTrader() {
-  const tid  = document.getElementById('broker-trader-id').value.trim();
-  const date = document.getElementById('broker-date-trader').value;
-  if (!tid) { document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">請輸入券商代碼</div>'; return; }
+async function loadBrokerChipHistory() {
+  const stock = document.getElementById('trader-stock').value.trim().toUpperCase();
+  const days  = document.getElementById('trader-days').value || '40';
+  if (!stock) { document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">請輸入股票代號</div>'; return; }
   document.getElementById('broker-summary').style.display = 'none';
   document.getElementById('broker-flow-wrap').style.display = 'none';
-  document.getElementById('broker-table-wrap').innerHTML = '<div class="empty" style="padding:40px">抓取券商資料中…</div>';
+  document.getElementById('broker-chip-chart-wrap').style.display = 'none';
+  document.getElementById('broker-table-wrap').innerHTML = '<div class="empty" style="padding:40px">抓取分點歷史資料中（約需 5–15 秒）…</div>';
   try {
-    const res = await fetch(`/api/broker_trader?trader_id=${encodeURIComponent(tid)}&date=${date||''}`);
+    const res = await fetch(`/api/broker_chip_history?stock_id=${encodeURIComponent(stock)}&days=${days}`);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">${err.detail || '載入失敗'}</div>`;
       return;
     }
     const d = await res.json();
-    if (!d.rows || !d.rows.length) {
-      document.getElementById('broker-table-wrap').innerHTML = `<div class="empty">${date||'今日'} 無資料（非交易日或查無資料）</div>`;
+    if (!d.brokers || !d.brokers.length) {
+      document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">此期間無分點資料</div>';
       return;
     }
-    _brokerData = d;
-    renderBrokerSummary(d.summary, d.trader_name || tid, d.date || date);
-    renderTraderTable(d.rows);
+    renderBrokerChipHistory(d);
   } catch(e) {
     document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
   }
 }
 
-function renderTraderTable(rows) {
-  const filtered = rows.filter(r => {
-    if (_brokerFilter === 'inst')   return !r.is_retail;
-    if (_brokerFilter === 'retail') return  r.is_retail;
-    return true;
-  });
-  const { col, asc } = _brokerSort;
-  const sorted = [...filtered].sort((a, b) => {
-    const av = a[col] ?? 0, bv = b[col] ?? 0;
-    return asc ? av - bv : bv - av;
-  });
-  if (!sorted.length) {
-    document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">此分類無資料</div>';
-    return;
-  }
-  const si = c => c === col ? (asc ? '↑' : '↓') : '<span style="opacity:.3">↕</span>';
-  const th = (c, label) => `<th onclick="brokerSortBy('${c}')" style="cursor:pointer;white-space:nowrap">${label} ${si(c)}</th>`;
-  const rows_html = sorted.map((r, i) => `
-    <tr>
-      <td style="color:var(--mut);font-size:11px">${i+1}</td>
-      <td style="font-weight:700;color:var(--acc)">${r.stock_id}</td>
-      <td><span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:700;${r.is_retail ? 'background:#58a6ff22;color:#58a6ff;border:1px solid #58a6ff44' : 'background:#d2992222;color:#d29922;border:1px solid #d2992244'}">${r.is_retail ? '散戶' : '主力'}</span></td>
-      <td style="text-align:right;color:var(--acc)">${r.buy ? r.buy.toLocaleString() : '—'}</td>
-      <td style="text-align:right;color:var(--red)">${r.sell ? r.sell.toLocaleString() : '—'}</td>
-      <td style="text-align:right">${fmtNet(r.net)}</td>
-      <td style="text-align:right;color:var(--mut);font-size:11px">${r.buy_price || '—'}</td>
-      <td style="text-align:right;color:var(--mut);font-size:11px">${r.sell_price || '—'}</td>
-      <td style="text-align:right;font-size:11px;color:var(--mut)">${fmtAmt(r.buy_amount)}</td>
-      <td style="text-align:right;font-size:11px;color:var(--mut)">${fmtAmt(r.sell_amount)}</td>
-    </tr>`).join('');
+function renderBrokerChipHistory(d) {
+  const dates   = d.dates || [];
+  const brokers = d.brokers || [];
+  const title   = `${d.stock_id}${d.stock_name ? ' ' + d.stock_name : ''} — 前20大分點累積持股水位（張）`;
+
+  // ─── Plotly 折線圖 ───
+  const COLORS = [
+    '#ef4444','#3b82f6','#22c55e','#f59e0b','#a855f7',
+    '#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6',
+    '#6366f1','#e11d48','#0ea5e9','#16a34a','#d97706',
+    '#7c3aed','#0891b2','#65a30d','#be185d','#0369a1',
+  ];
+  const traces = brokers.map((b, i) => ({
+    type: 'scatter', mode: 'lines',
+    x: dates, y: b.cum_net,
+    name: `${b.id} ${b.name}`,
+    line: { color: COLORS[i % COLORS.length], width: 1.5 },
+    hovertemplate: `%{x}<br>${b.id} ${b.name}<br>累積 %{y}張<extra></extra>`,
+  }));
+
+  const layout = {
+    title: { text: title, font: { size: 12, color: '#c9d1d9' } },
+    paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
+    font: { color: '#c9d1d9', size: 11 },
+    xaxis: { gridcolor: '#21262d', tickfont: { size: 10 } },
+    yaxis: { gridcolor: '#21262d', tickfont: { size: 10 }, title: '累積淨買超（張）' },
+    legend: { font: { size: 10 }, bgcolor: 'transparent', x: 1.01, y: 1, xanchor: 'left' },
+    margin: { l: 55, r: 160, t: 36, b: 40 },
+    hovermode: 'x unified',
+    shapes: [{ type: 'line', x0: dates[0], x1: dates[dates.length-1], y0: 0, y1: 0,
+               line: { color: '#444', width: 1, dash: 'dot' } }],
+  };
+
+  document.getElementById('broker-chip-chart-wrap').style.display = 'flex';
+  Plotly.newPlot('broker-chip-chart', traces, layout, { responsive: true, displayModeBar: false });
+
+  // ─── 排名表格 ───
+  const rows_html = brokers.map((b, i) => {
+    const netColor = b.total_net > 0 ? 'var(--acc)' : b.total_net < 0 ? 'var(--red)' : 'var(--mut)';
+    const dot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${COLORS[i % COLORS.length]};margin-right:5px"></span>`;
+    return `<tr style="cursor:pointer" onclick="">
+      <td style="color:var(--mut);font-size:11px;padding:5px 8px">${i+1}</td>
+      <td style="padding:5px 8px">${dot}${b.id}</td>
+      <td style="padding:5px 8px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${b.name}</td>
+      <td style="text-align:right;color:var(--acc);padding:5px 8px">${b.total_buy > 0 ? '+'+b.total_buy.toLocaleString() : '—'}</td>
+      <td style="text-align:right;color:var(--red);padding:5px 8px">${b.total_sell > 0 ? '-'+b.total_sell.toLocaleString() : '—'}</td>
+      <td style="text-align:right;font-weight:700;color:${netColor};padding:5px 8px">${b.total_net > 0 ? '+' : ''}${b.total_net.toLocaleString()}</td>
+      <td style="text-align:right;color:var(--mut);font-size:11px;padding:5px 8px">${b.cum_net.length ? b.cum_net[b.cum_net.length-1].toLocaleString() : '—'}</td>
+    </tr>`;
+  }).join('');
+
   document.getElementById('broker-table-wrap').innerHTML = `
+    <div style="font-size:11px;color:var(--mut);padding:4px 8px 2px">前${brokers.length}大分點 · 共${dates.length}個交易日</div>
     <table style="width:100%;border-collapse:collapse;font-size:12px">
       <thead style="position:sticky;top:0;background:var(--sur)">
         <tr style="border-bottom:1px solid var(--bor)">
-          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">#</th>
-          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">股票代號</th>
-          <th style="text-align:left;padding:7px 8px;color:var(--mut);font-size:10px">類型</th>
-          ${th('buy','買進(張)')}
-          ${th('sell','賣出(張)')}
-          ${th('net','淨買超')}
-          ${th('buy_price','買均價')}
-          ${th('sell_price','賣均價')}
-          ${th('buy_amount','買進金額')}
-          ${th('sell_amount','賣出金額')}
+          <th style="text-align:left;padding:6px 8px;color:var(--mut);font-size:10px">#</th>
+          <th style="text-align:left;padding:6px 8px;color:var(--mut);font-size:10px">代碼</th>
+          <th style="text-align:left;padding:6px 8px;color:var(--mut);font-size:10px">分點名稱</th>
+          <th style="text-align:right;padding:6px 8px;color:var(--mut);font-size:10px">累積買(張)</th>
+          <th style="text-align:right;padding:6px 8px;color:var(--mut);font-size:10px">累積賣(張)</th>
+          <th style="text-align:right;padding:6px 8px;color:var(--mut);font-size:10px">累積淨超</th>
+          <th style="text-align:right;padding:6px 8px;color:var(--mut);font-size:10px">現持倉估</th>
         </tr>
       </thead>
       <tbody>${rows_html}</tbody>
