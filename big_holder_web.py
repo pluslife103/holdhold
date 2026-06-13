@@ -3813,17 +3813,37 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           </div>
         </div>
 
-        <!-- 控制列：券商統計模式（TWSE 今日分點） -->
-        <div id="broker-ctrl-trader" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
-          <input id="trader-stock" class="search" placeholder="股票代號 e.g. 2330" style="width:130px"
-                 onkeydown="if(event.key==='Enter')loadBrokerChipHistory()">
-          <button class="sort-btn" onclick="setTraderStockPreset('2330')" style="font-size:11px;padding:3px 8px">2330</button>
-          <button class="sort-btn" onclick="setTraderStockPreset('2454')" style="font-size:11px;padding:3px 8px">2454</button>
-          <button class="sort-btn" onclick="setTraderStockPreset('2317')" style="font-size:11px;padding:3px 8px">2317</button>
-          <button class="sort-btn" onclick="setTraderStockPreset('2327')" style="font-size:11px;padding:3px 8px">2327</button>
-          <button class="sort-btn" onclick="loadBrokerChipHistory()" style="background:var(--acc);color:#000;font-weight:700">今日查詢</button>
-          <button class="sort-btn" id="trader-force-btn" onclick="loadBrokerChipHistory(true)" style="font-size:11px;padding:3px 10px">重新爬取</button>
-          <span style="font-size:11px;color:var(--mut)">資料來源：台灣證交所 ・ 自動解驗證碼</span>
+        <!-- 控制列：券商統計模式 -->
+        <div id="broker-ctrl-trader" style="display:none;flex-direction:column;gap:8px">
+          <!-- 股票輸入 + 子模式 tab -->
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <input id="trader-stock" class="search" placeholder="股票代號 e.g. 2330" style="width:130px"
+                   onkeydown="if(event.key==='Enter')(_traderSubMode==='today'?loadBrokerChipHistory():loadBrokerHistory())">
+            <button class="sort-btn" onclick="setTraderStockPreset('2330')" style="font-size:11px;padding:3px 8px">2330</button>
+            <button class="sort-btn" onclick="setTraderStockPreset('2454')" style="font-size:11px;padding:3px 8px">2454</button>
+            <button class="sort-btn" onclick="setTraderStockPreset('2317')" style="font-size:11px;padding:3px 8px">2317</button>
+            <button class="sort-btn" onclick="setTraderStockPreset('2327')" style="font-size:11px;padding:3px 8px">2327</button>
+            <button id="trader-sub-btn-today" class="sort-btn" onclick="switchTraderSub('today')"
+                    style="background:var(--acc);color:#000;font-weight:700;font-size:11px">今日即時</button>
+            <button id="trader-sub-btn-hist" class="sort-btn" onclick="switchTraderSub('hist')"
+                    style="font-size:11px">歷史走勢</button>
+          </div>
+          <!-- 今日即時：操作列 -->
+          <div id="trader-today-ctrl" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button class="sort-btn" onclick="loadBrokerChipHistory()" style="background:var(--acc);color:#000;font-weight:700">今日查詢</button>
+            <button class="sort-btn" id="trader-force-btn" onclick="loadBrokerChipHistory(true)" style="font-size:11px;padding:3px 10px">重新爬取</button>
+            <span style="font-size:11px;color:var(--mut)">資料來源：台灣證交所 ・ 自動解驗證碼</span>
+          </div>
+          <!-- 歷史走勢：操作列 -->
+          <div id="trader-hist-ctrl" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+            <select id="trader-hist-days" class="search" style="width:90px;font-size:11px">
+              <option value="20">近20日</option>
+              <option value="40" selected>近40日</option>
+              <option value="60">近60日</option>
+            </select>
+            <button class="sort-btn" onclick="loadBrokerHistory()" style="background:var(--acc);color:#000;font-weight:700">查詢歷史</button>
+            <span style="font-size:11px;color:var(--mut)">資料來源：FinMind ・ 前20大分點累積買賣超</span>
+          </div>
         </div>
 
         <!-- 控制列：時間軸模式 -->
@@ -4743,6 +4763,7 @@ let _brokerData = null;
 let _brokerFilter = 'all';
 let _brokerSort = { col: 'net', asc: false };
 let _brokerMode = 'stock';
+let _traderSubMode = 'today';
 
 function setBrokerMode(mode) {
   _brokerMode = mode;
@@ -5507,7 +5528,26 @@ function jumpToTimeline(stockId) {
 
 function setTraderStockPreset(id) {
   document.getElementById('trader-stock').value = id;
-  loadBrokerChipHistory();
+  if (_traderSubMode === 'today') loadBrokerChipHistory();
+  else loadBrokerHistory();
+}
+
+function switchTraderSub(mode) {
+  _traderSubMode = mode;
+  const isToday = mode === 'today';
+  const btnToday = document.getElementById('trader-sub-btn-today');
+  const btnHist  = document.getElementById('trader-sub-btn-hist');
+  btnToday.style.background  = isToday ? 'var(--acc)' : '';
+  btnToday.style.color       = isToday ? '#000' : '';
+  btnToday.style.fontWeight  = isToday ? '700' : '';
+  btnHist.style.background   = !isToday ? 'var(--acc)' : '';
+  btnHist.style.color        = !isToday ? '#000' : '';
+  btnHist.style.fontWeight   = !isToday ? '700' : '';
+  document.getElementById('trader-today-ctrl').style.display = isToday ? 'flex' : 'none';
+  document.getElementById('trader-hist-ctrl').style.display  = !isToday ? 'flex' : 'none';
+  document.getElementById('broker-summary').style.display = 'none';
+  document.getElementById('broker-chip-chart-wrap').style.display = 'none';
+  document.getElementById('broker-table-wrap').innerHTML = '';
 }
 
 async function loadBrokerChipHistory(force) {
@@ -5613,6 +5653,97 @@ function renderTwseToday(d) {
           <th style="text-align:right;padding:6px 6px;color:var(--mut);font-size:10px">賣出(張)</th>
           <th style="text-align:right;padding:6px 6px;color:var(--mut);font-size:10px">買賣超(張)</th>
           <th style="text-align:left;padding:6px 6px;color:var(--mut);font-size:10px">強弱</th>
+        </tr>
+      </thead>
+      <tbody>${rows_html}</tbody>
+    </table>`;
+}
+
+async function loadBrokerHistory() {
+  const stock = document.getElementById('trader-stock').value.trim().toUpperCase();
+  if (!stock) { document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">請輸入股票代號</div>'; return; }
+  const days = document.getElementById('trader-hist-days').value;
+  document.getElementById('broker-summary').style.display = 'none';
+  document.getElementById('broker-chip-chart-wrap').style.display = 'none';
+  document.getElementById('broker-table-wrap').innerHTML = '<div class="empty" style="color:var(--mut)">載入中，請稍候…</div>';
+  try {
+    const res = await fetch(`/api/broker_chip_history?stock_id=${encodeURIComponent(stock)}&days=${days}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">${err.detail || '載入失敗'}</div>`;
+      return;
+    }
+    const d = await res.json();
+    if (!d.dates || !d.dates.length) {
+      document.getElementById('broker-table-wrap').innerHTML = '<div class="empty">查無資料</div>';
+      return;
+    }
+    renderBrokerChipHistory(d);
+  } catch(e) {
+    document.getElementById('broker-table-wrap').innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function renderBrokerChipHistory(d) {
+  const dates   = d.dates   || [];
+  const brokers = d.brokers || [];
+
+  // Summary
+  const sumEl = document.getElementById('broker-summary');
+  sumEl.style.display = 'flex';
+  const topB = brokers[0];
+  sumEl.innerHTML = `
+    <div class="stat-box"><div class="stat-val">${d.stock_id}</div><div class="stat-sub">股票代號</div></div>
+    <div class="stat-box"><div class="stat-val">${dates.length}</div><div class="stat-sub">交易日數</div></div>
+    <div class="stat-box"><div class="stat-val">${brokers.length}</div><div class="stat-sub">主要分點</div></div>
+    ${topB ? `<div class="stat-box" style="flex:1"><div class="stat-val" style="font-size:12px">${topB.name}</div><div class="stat-sub">最大主力分點</div></div>` : ''}`;
+
+  // Cumulative line chart
+  const traces = brokers.map(b => ({
+    type: 'scatter', mode: 'lines+markers',
+    name: `${b.id} ${b.name}`,
+    x: dates, y: b.cum_net,
+    hovertemplate: '%{fullData.name}<br>%{x}<br>累積買賣超: %{y:+,.0f} 張<extra></extra>',
+    line: { width: 1.5 }, marker: { size: 3 },
+  }));
+
+  document.getElementById('broker-chip-chart-wrap').style.display = 'flex';
+  Plotly.newPlot('broker-chip-chart', traces, {
+    title: { text: `${d.stock_id}${d.stock_name ? ' ' + d.stock_name : ''} 分點累積買賣超（近${dates.length}日）`, font: { size: 12, color: '#c9d1d9' } },
+    paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
+    font: { color: '#c9d1d9', size: 10 },
+    xaxis: { gridcolor: '#21262d', tickformat: '%m/%d' },
+    yaxis: { gridcolor: '#21262d', title: '累積買賣超（張）', zeroline: true, zerolinecolor: '#555', zerolinewidth: 1 },
+    margin: { l: 60, r: 10, t: 36, b: 40 },
+    height: 340,
+    legend: { orientation: 'h', y: -0.3, font: { size: 9 } },
+    showlegend: true,
+  }, { responsive: true, displayModeBar: false });
+
+  // Table: cumulative summary per broker
+  const rows_html = brokers.map((b, i) => {
+    const nc = b.total_net > 0 ? '#ef4444' : b.total_net < 0 ? '#22c55e' : 'var(--mut)';
+    return `<tr>
+      <td style="color:var(--mut);font-size:11px;padding:4px 6px">${i+1}</td>
+      <td style="padding:4px 6px;font-size:11px;color:var(--mut);font-family:monospace">${b.id}</td>
+      <td style="padding:4px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px">${b.name}</td>
+      <td style="text-align:right;color:#ef4444;padding:4px 6px">${b.total_buy > 0 ? b.total_buy.toLocaleString() : '—'}</td>
+      <td style="text-align:right;color:#22c55e;padding:4px 6px">${b.total_sell > 0 ? b.total_sell.toLocaleString() : '—'}</td>
+      <td style="text-align:right;font-weight:700;color:${nc};padding:4px 8px">${b.total_net > 0 ? '+' : ''}${b.total_net.toLocaleString()}</td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('broker-table-wrap').innerHTML = `
+    <div style="font-size:11px;color:var(--mut);padding:4px 8px 2px">前 ${brokers.length} 大分點 · 近 ${dates.length} 交易日 · 來源：FinMind</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead style="position:sticky;top:0;background:var(--sur)">
+        <tr style="border-bottom:1px solid var(--bor)">
+          <th style="text-align:left;padding:6px;color:var(--mut);font-size:10px">#</th>
+          <th style="text-align:left;padding:6px;color:var(--mut);font-size:10px">代碼</th>
+          <th style="text-align:left;padding:6px;color:var(--mut);font-size:10px">分點名稱</th>
+          <th style="text-align:right;padding:6px;color:var(--mut);font-size:10px">累積買進(張)</th>
+          <th style="text-align:right;padding:6px;color:var(--mut);font-size:10px">累積賣出(張)</th>
+          <th style="text-align:right;padding:6px;color:var(--mut);font-size:10px">累積買賣超(張)</th>
         </tr>
       </thead>
       <tbody>${rows_html}</tbody>
