@@ -1194,8 +1194,8 @@ def api_broker_chip_history(
                 continue
             dates_with_data.append(date_str)
             for row in rows:
-                bid   = str(row.get("broker_id", "")).strip()
-                bname = str(row.get("broker_name", "")).strip()
+                bid   = str(row.get("id", row.get("broker_id", ""))).strip()
+                bname = str(row.get("name", row.get("broker_name", ""))).strip()
                 if not bid:
                     continue
                 net = float(row.get("net", 0))
