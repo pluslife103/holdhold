@@ -1154,6 +1154,7 @@ def api_broker_chip_history(
 ):
     import os
     from datetime import date as dt_date, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     stock_id = stock_id.strip().upper()
     if not stock_id:
         raise HTTPException(400, "請輸入股票代號")
@@ -1167,63 +1168,57 @@ def api_broker_chip_history(
     if not token:
         raise HTTPException(500, "未設定 FINMIND_TOKEN")
 
+    # Build candidate weekdays (enough buffer for holidays)
     today = dt_date.today()
-    start_date = (today - timedelta(days=int(days * 1.7))).isoformat()
-    end_date = today.isoformat()
+    candidate_dates: list = []
+    d = today
+    while len(candidate_dates) < days + 15:
+        if d.weekday() < 5:
+            candidate_dates.append(d.isoformat())
+        d -= timedelta(1)
 
-    try:
-        r = requests.get(
-            FINMIND_BASE,
-            params={
-                "dataset":    "TaiwanStockTradingDailyReport",
-                "data_id":    stock_id,
-                "start_date": start_date,
-                "end_date":   end_date,
-                "token":      token,
-            },
-            timeout=60,
-        )
-        j = r.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(502, f"無法連線 FinMind API: {type(e).__name__}")
+    # Fetch each day in parallel; _fetch_broker_day caches per-day results
+    broker_daily: dict = {}
+    broker_names: dict = {}
+    dates_with_data: list = []
 
-    if r.status_code != 200 or j.get("status") not in (200, None):
-        msg = j.get("msg") or j.get("message") or f"HTTP {r.status_code}"
-        raise HTTPException(502, f"FinMind error: {msg}")
+    def fetch_day(date_str: str):
+        rows = _fetch_broker_day(token, stock_id, date_str)
+        return date_str, rows
 
-    rows_raw = j.get("data", [])
-    if not rows_raw:
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(fetch_day, dt): dt for dt in candidate_dates}
+        for fut in as_completed(futs):
+            date_str, rows = fut.result()
+            if not rows:
+                continue
+            dates_with_data.append(date_str)
+            for row in rows:
+                bid   = str(row.get("broker_id", "")).strip()
+                bname = str(row.get("broker_name", "")).strip()
+                if not bid:
+                    continue
+                net = float(row.get("net", 0))
+                if bid not in broker_daily:
+                    broker_daily[bid] = {}
+                broker_daily[bid][date_str] = broker_daily[bid].get(date_str, 0.0) + net
+                broker_names[bid] = bname
+
+    # Keep only the most recent `days` trading dates that have data
+    all_dates = sorted(dates_with_data, reverse=False)
+    if len(all_dates) > days:
+        all_dates = all_dates[-days:]
+
+    if not all_dates:
         result = {"stock_id": stock_id, "stock_name": "", "dates": [], "brokers": []}
         _cset(ckey, result)
         return result
 
-    # Collect trading dates, keep last `days`
-    all_dates = sorted(set(row.get("date", "") for row in rows_raw if row.get("date")))
-    if len(all_dates) > days:
-        all_dates = all_dates[-days:]
-    dates_set = set(all_dates)
-
-    # Aggregate net lots per broker per date
-    broker_daily: dict = {}
-    broker_names: dict = {}
-    for row in rows_raw:
-        date = row.get("date", "")
-        if date not in dates_set:
-            continue
-        bid   = str(row.get("securities_trader_id", "")).strip()
-        bname = str(row.get("securities_trader", "")).strip()
-        if not bid:
-            continue
-        buy_lots  = float(row.get("buy",  0) or 0) / 1000
-        sell_lots = float(row.get("sell", 0) or 0) / 1000
-        net       = buy_lots - sell_lots
-        if bid not in broker_daily:
-            broker_daily[bid] = {}
-        broker_daily[bid][date] = broker_daily[bid].get(date, 0.0) + net
-        broker_names[bid] = bname
-
-    # Rank by absolute cumulative net, take top 20
-    broker_totals = {bid: sum(daily.values()) for bid, daily in broker_daily.items()}
+    # Rank by absolute cumulative net over the selected date window, take top 20
+    broker_totals = {
+        bid: sum(daily.get(d, 0.0) for d in all_dates)
+        for bid, daily in broker_daily.items()
+    }
     top20 = sorted(broker_totals, key=lambda b: abs(broker_totals[b]), reverse=True)[:20]
 
     stock_name = (_GRADING.get(stock_id) or {}).get("stock_name", "")
