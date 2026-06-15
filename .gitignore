@@ -4,3 +4,38 @@ __pycache__/
 *.pyo
 .env
 etf_result*.csv
+
+# SQLite DB（本機資料，不入 git）
+*.db
+*.db-shm
+*.db-wal
+
+# 大型資料檔
+*.csv
+*.zip
+*.json
+!chip_all_stocks.json
+
+# log / debug
+*.log
+*.txt
+fb_debug.png
+sd_after_cookie.png
+
+# 本機工具 / 測試腳本（不需部署）
+.claude/
+claude/
+T4_10142/
+big_holder_charts/
+
+# Node / 前端建置
+node_modules/
+.next/
+dist/
+build/
+
+# sinopac / 券商憑證
+*.env
+sinopac.env
+shioaji.log
+sinopac_debug*.log
