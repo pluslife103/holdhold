@@ -114,17 +114,53 @@ def _get_broker_db() -> "_sqlite3.Connection | None":
     global _BROKER_DB_CONN
     if _BROKER_DB_CONN is not None:
         return _BROKER_DB_CONN
-    if not _BROKER_DB_PATH.exists():
-        return None
     try:
         conn = _sqlite3.connect(str(_BROKER_DB_PATH), check_same_thread=False)
-        conn.execute("PRAGMA query_only = ON")
-        conn.execute("PRAGMA cache_size = -32768")  # 32 MB page cache
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-32768")
+        # 確保 schema 存在（本地大 DB 已有；Railway 全新 DB 自動建立）
+        conn.execute("""CREATE TABLE IF NOT EXISTS broker_info (
+            broker_id TEXT PRIMARY KEY, broker_name TEXT NOT NULL DEFAULT '')""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS broker_chip (
+            date TEXT NOT NULL, stock_id TEXT NOT NULL, broker_id TEXT NOT NULL,
+            buy INTEGER NOT NULL DEFAULT 0, sell INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (date, stock_id, broker_id))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_date ON broker_chip(stock_id, date)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS progress (
+            date TEXT NOT NULL, stock_id TEXT NOT NULL,
+            rows INTEGER NOT NULL DEFAULT 0, done_at TEXT NOT NULL,
+            PRIMARY KEY (date, stock_id))""")
+        conn.commit()
         _BROKER_DB_CONN = conn
-        print(f"[LocalDB] 已連線 {_BROKER_DB_PATH} ({_BROKER_DB_PATH.stat().st_size // 1_048_576} MB)")
+        size_mb = _BROKER_DB_PATH.stat().st_size // 1_048_576
+        print(f"[LocalDB] 已連線 {_BROKER_DB_PATH} ({size_mb} MB)")
     except Exception as exc:
         print(f"[LocalDB] 連線失敗: {exc}")
     return _BROKER_DB_CONN
+
+
+def _write_broker_day_to_db(stock_id: str, date_str: str, agg: dict) -> None:
+    """將 FinMind 抓到的分點資料寫入本地 DB（agg: {broker_id: {name, buy_s, sell_s}}）。
+    Railway 無預載 DB 時，FinMind 抓到的資料會累積在本地，下次查詢直接讀 DB。"""
+    conn = _get_broker_db()
+    if conn is None or not agg:
+        return
+    try:
+        with _BROKER_DB_LOCK:
+            conn.executemany(
+                "INSERT OR IGNORE INTO broker_info (broker_id, broker_name) VALUES (?,?)",
+                [(bid, v["name"]) for bid, v in agg.items()])
+            conn.executemany(
+                "INSERT OR REPLACE INTO broker_chip (date, stock_id, broker_id, buy, sell) VALUES (?,?,?,?,?)",
+                [(date_str, stock_id, bid, int(v["buy_s"]), int(v["sell_s"])) for bid, v in agg.items()])
+            from datetime import date as _dt
+            conn.execute(
+                "INSERT OR REPLACE INTO progress (date, stock_id, rows, done_at) VALUES (?,?,?,?)",
+                (date_str, stock_id, len(agg), _dt.today().isoformat()))
+            conn.commit()
+    except Exception as exc:
+        print(f"[LocalDB] write {stock_id} {date_str}: {exc}")
 
 
 def _fetch_broker_day_from_local_db(stock_id: str, date_str: str) -> list | None:
@@ -1599,6 +1635,7 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
             "is_retail": is_retail,
         })
     _cset(ckey, processed)
+    _write_broker_day_to_db(stock_id, date_str, agg)  # 寫入本地 DB，下次查詢免打 API
     time.sleep(0.35)  # FinMind was called; rate-limit guard
     return processed
 
