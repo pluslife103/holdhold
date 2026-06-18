@@ -1767,6 +1767,14 @@ def _run_auto_scan_once(label: str = "AutoScan"):
         print(f"[{label}] 無已分層股票，跳過")
         return
 
+    # 無本地 DB 時，限制掃描數量以避免耗盡 FinMind free tier 配額
+    # （700+ stocks × 15 days × 0.35s = 1小時超過600次上限）
+    if _get_broker_db() is None:
+        OV_SCAN_CAP = 40
+        if len(stock_ids) > OV_SCAN_CAP:
+            print(f"[{label}] 無本地DB，掃描限制前 {OV_SCAN_CAP} 支（共 {len(stock_ids)} 支）")
+            stock_ids = stock_ids[:OV_SCAN_CAP]
+
     with _OV_SCAN_LOCK:
         if _OV_SCAN["running"]:
             print(f"[{label}] 掃描中，跳過")
