@@ -1571,6 +1571,7 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
     rows_raw = rows_all  # end_date=date_str guarantees all rows are for this date
     if not rows_raw:
         _cset(ckey, [])
+        time.sleep(0.35)  # FinMind was called; rate-limit guard
         return []
     THOLD = _thold_for(stock_id)
     agg: dict = defaultdict(
@@ -1598,6 +1599,7 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
             "is_retail": is_retail,
         })
     _cset(ckey, processed)
+    time.sleep(0.35)  # FinMind was called; rate-limit guard
     return processed
 
 
