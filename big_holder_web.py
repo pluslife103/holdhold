@@ -1566,7 +1566,7 @@ def _fetch_broker_range(token: str, stock_id: str, dates: list, force: bool = Fa
                 rb = requests.get(
                     FINMIND_BASE,
                     params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
-                            "start_date": date_str, "token": token},
+                            "start_date": date_str, "end_date": date_str, "token": token},
                     timeout=30,
                 )
                 j = rb.json()
@@ -2748,86 +2748,11 @@ def api_big_player_timeline(
 
     THRESHOLD = _thold_for(stock_id)
 
-    # ── step 1: check per-day cache ────────────────────────────────────────
-    day_map: dict = {}
-    uncached: list = []
-    for date in dates:
-        ckey = f"broker|{stock_id}|{date}"
-        cached = _cget(ckey, ttl_h=6)
-        if cached is not None:
-            day_map[date] = cached.get("rows", [])
-        else:
-            uncached.append(date)
-
-    # ── step 2: chunked bulk API calls for uncached dates (15-day chunks) ───
-    def _process_bulk_rows(raw_rows: list, dates_chunk: list):
-        raw_by_date: dict = {}
-        for rrow in raw_rows:
-            ds = str(rrow.get("date", ""))[:10]
-            raw_by_date.setdefault(ds, []).append(rrow)
-        for date in dates_chunk:
-            rrows = sorted(raw_by_date.get(date, []),
-                           key=lambda x: x.get("securities_trader", ""))
-            processed: list = []
-            pi = 0
-            while pi < len(rrows):
-                nm = rrows[pi].get("securities_trader", "")
-                bid = rrows[pi].get("securities_trader_id", "")
-                g_bs = g_ss = g_ba = g_sa = 0.0
-                pj = pi
-                while pj < len(rrows) and rrows[pj].get("securities_trader", "") == nm:
-                    rr = rrows[pj]
-                    bs2 = float(rr.get("buy",   0) or 0)
-                    ss2 = float(rr.get("sell",  0) or 0)
-                    px2 = float(rr.get("price", 0) or 0)
-                    g_bs += bs2; g_ss += ss2
-                    g_ba += bs2 * px2; g_sa += ss2 * px2
-                    pj += 1
-                bl = g_bs / 1000; sl = g_ss / 1000
-                processed.append({
-                    "broker_id":   bid,
-                    "broker_name": nm,
-                    "buy":         int(bl),
-                    "sell":        int(sl),
-                    "net":         int(bl - sl),
-                    "buy_price":   round(g_ba / g_bs, 2) if g_bs else 0.0,
-                    "sell_price":  round(g_sa / g_ss, 2) if g_ss else 0.0,
-                    "buy_amount":  round(g_ba),
-                    "sell_amount": round(g_sa),
-                    "is_retail":   g_ba <= 8_000_000 and g_sa <= 8_000_000,
-                })
-                pi = pj
-            ckey = f"broker|{stock_id}|{date}"
-            _cset(ckey, {"stock_id": stock_id, "date": date, "rows": processed, "summary": {}})
-            day_map[date] = processed
-
-    # FinMind TaiwanStockTradingDailyReport only accepts single-day queries (no end_date).
-    if uncached:
-        for date in uncached:
-            try:
-                rb_resp = requests.get(
-                    FINMIND_BASE,
-                    params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
-                            "start_date": date, "token": token},
-                    timeout=30,
-                )
-                rb_json = rb_resp.json()
-                rb_ok = rb_resp.status_code == 200 and rb_json.get("status") in (200, None)
-                print(f"[TL] {stock_id} day {date} "
-                      f"http={rb_resp.status_code} fm={rb_json.get('status')} "
-                      f"rows={len(rb_json.get('data',[]))} ok={rb_ok}")
-            except Exception as exc:
-                rb_ok = False
-                print(f"[TL] {stock_id} day {date} exc={exc}")
-                rb_json = {}
-            if rb_ok:
-                _process_bulk_rows(rb_json.get("data", []), [date])
-            else:
-                if rb_json.get("status") == 402 or (
-                        hasattr(rb_resp, "status_code") and rb_resp.status_code == 402):
-                    raise HTTPException(429, f"FinMind API 每小時配額已用盡（402），請約 1 小時後再試")
-                day_map[date] = []
-            time.sleep(0.35)
+    # ── fetch broker data per day (shared broker_day| cache, end_date pinned) ─
+    try:
+        day_map: dict = _fetch_broker_range(token, stock_id, dates)
+    except _FinMindRateLimit:
+        raise HTTPException(429, "FinMind API 每小時配額已用盡（402），請約 1 小時後再試")
 
     # ── fetch price + volume first so we can use close for broker scoring ──
     pdf = _fm("TaiwanStockPrice", stock_id, start_d.isoformat(), end_d.isoformat())
