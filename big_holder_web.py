@@ -104,6 +104,66 @@ _CLOCK = threading.Lock()
 _TWSE_CACHE: dict = {}
 _TWSE_CLOCK = threading.Lock()
 
+# ── 本地 SQLite 分點歷史 DB（broker_chip_history.db）────────────────────
+import sqlite3 as _sqlite3
+_BROKER_DB_PATH = Path("broker_chip_history.db")
+_BROKER_DB_CONN: "_sqlite3.Connection | None" = None
+_BROKER_DB_LOCK = threading.Lock()
+
+def _get_broker_db() -> "_sqlite3.Connection | None":
+    global _BROKER_DB_CONN
+    if _BROKER_DB_CONN is not None:
+        return _BROKER_DB_CONN
+    if not _BROKER_DB_PATH.exists():
+        return None
+    try:
+        conn = _sqlite3.connect(str(_BROKER_DB_PATH), check_same_thread=False)
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA cache_size = -32768")  # 32 MB page cache
+        _BROKER_DB_CONN = conn
+        print(f"[LocalDB] 已連線 {_BROKER_DB_PATH} ({_BROKER_DB_PATH.stat().st_size // 1_048_576} MB)")
+    except Exception as exc:
+        print(f"[LocalDB] 連線失敗: {exc}")
+    return _BROKER_DB_CONN
+
+
+def _fetch_broker_day_from_local_db(stock_id: str, date_str: str) -> list | None:
+    """從本地 broker_chip_history.db 讀取單日分點資料。
+    回傳與 _fetch_broker_day 相同格式的 list，或 None（DB 無此日資料）。"""
+    conn = _get_broker_db()
+    if conn is None:
+        return None
+    try:
+        with _BROKER_DB_LOCK:
+            rows = conn.execute(
+                "SELECT bc.broker_id, COALESCE(bi.broker_name,''), bc.buy, bc.sell "
+                "FROM broker_chip bc "
+                "LEFT JOIN broker_info bi ON bi.broker_id = bc.broker_id "
+                "WHERE bc.stock_id = ? AND bc.date = ?",
+                (stock_id, date_str),
+            ).fetchall()
+        if not rows:
+            return None  # 此日無資料，讓呼叫端回退至 FinMind
+        THOLD = _thold_for(stock_id)
+        processed = []
+        for broker_id, broker_name, buy_shares, sell_shares in rows:
+            buy_lots  = round(buy_shares  / 1000)
+            sell_lots = round(sell_shares / 1000)
+            processed.append({
+                "id":           broker_id,
+                "name":         broker_name,
+                "buy":          buy_lots,
+                "sell":         sell_lots,
+                "net":          buy_lots - sell_lots,
+                "buy_amount":   0,  # 由呼叫端以收盤價重算
+                "sell_amount":  0,
+                "is_retail":    True,
+            })
+        return processed
+    except Exception as exc:
+        print(f"[LocalDB] {stock_id} {date_str}: {exc}")
+        return None
+
 
 def _cset(key: str, val) -> None:
     with _CLOCK:
@@ -1475,12 +1535,19 @@ def _load_ov_snapshot():
 
 def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
     """Fetch + aggregate broker data for ONE trading day.
-    Returns list of processed broker rows; result cached 12h per day."""
+    Returns list of processed broker rows; result cached 12h per day.
+    Priority: in-memory cache → local SQLite DB → FinMind API."""
     from collections import defaultdict
     ckey = f"broker_day|{stock_id}|{date_str}"
     cached = _cget(ckey, ttl_h=12)
     if cached is not None:
         return cached
+    # ── 優先從本地 DB 讀取 ────────────────────────────────────────────────
+    db_rows = _fetch_broker_day_from_local_db(stock_id, date_str)
+    if db_rows is not None:
+        _cset(ckey, db_rows)
+        return db_rows
+    # ── 回退：FinMind API ─────────────────────────────────────────────────
     try:
         r = requests.get(
             FINMIND_BASE,
@@ -1556,65 +1623,15 @@ def _fetch_broker_range(token: str, stock_id: str, dates: list, force: bool = Fa
         else:
             uncached.append(date_str)
 
-    if uncached:
-        # FinMind TaiwanStockTradingDailyReport only accepts single-day queries (no end_date).
-        THOLD = _thold_for(stock_id)
-        for date_str in uncached:
-            day_ok = False
-            day_data: list = []
-            try:
-                rb = requests.get(
-                    FINMIND_BASE,
-                    params={"dataset": "TaiwanStockTradingDailyReport", "data_id": stock_id,
-                            "start_date": date_str, "end_date": date_str, "token": token},
-                    timeout=30,
-                )
-                j = rb.json()
-                if rb.status_code == 402 or j.get("status") == 402:
-                    raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
-                day_ok = rb.status_code == 200 and j.get("status") in (200, None)
-                if day_ok:
-                    day_data = j.get("data", [])
-            except _FinMindRateLimit:
-                raise
-            except Exception:
-                day_ok = False
-
-            if not day_ok:
-                # 抓取失敗（網路逾時/連線錯誤等）：不快取，留待下次掃描重試，
-                # 避免把「失敗」誤當成「當天無資料」永久快取 12 小時
-                time.sleep(0.35)
-                continue
-
-            agg: dict = defaultdict(
-                lambda: {"name": "", "buy_s": 0.0, "sell_s": 0.0,
-                         "buy_amt": 0.0, "sell_amt": 0.0}
-            )
-            for row in day_data:
-                bid   = row.get("securities_trader_id", "")
-                buy_s = float(row.get("buy",   0) or 0)
-                sel_s = float(row.get("sell",  0) or 0)
-                px    = float(row.get("price", 0) or 0)
-                agg[bid]["name"]     = row.get("securities_trader", "")
-                agg[bid]["buy_s"]   += buy_s
-                agg[bid]["sell_s"]  += sel_s
-                agg[bid]["buy_amt"] += buy_s * px
-                agg[bid]["sell_amt"]+= sel_s * px
-            processed = []
-            for bid, v in agg.items():
-                processed.append({
-                    "name": v["name"], "id": bid,
-                    "buy":  round(v["buy_s"] / 1000),
-                    "sell": round(v["sell_s"] / 1000),
-                    "net":  round((v["buy_s"] - v["sell_s"]) / 1000),
-                    "buy_amount": v["buy_amt"], "sell_amount": v["sell_amt"],
-                    "is_retail": v["buy_amt"] <= THOLD and v["sell_amt"] <= THOLD,
-                })
-            day_ckey = f"broker_day|{stock_id}|{date_str}"
-            _cset(day_ckey, processed)
-            if processed:
-                result[date_str] = processed
-            time.sleep(0.35)
+    for date_str in uncached:
+        try:
+            rows = _fetch_broker_day(token, stock_id, date_str)
+        except _FinMindRateLimit:
+            raise
+        except Exception:
+            rows = []
+        if rows:
+            result[date_str] = rows
 
     return result
 
