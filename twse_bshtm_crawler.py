@@ -173,15 +173,24 @@ def _parse_csv(raw: bytes) -> pd.DataFrame | None:
 # Main public API
 # ---------------------------------------------------------------------------
 
+def _to_roc_date(date_str: str) -> str:
+    """將 'YYYY-MM-DD' 轉換為民國年格式 'YYY/MM/DD'（TWSE 使用）。"""
+    from datetime import datetime
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    roc_year = d.year - 1911
+    return f"{roc_year}/{d.month:02d}/{d.day:02d}"
+
+
 def query_stock(
     stock_id: str,
     trade_type: str = "normal",
     max_retry: int = 8,
     delay: float = 1.2,
     verbose: bool = True,
+    date_str: str | None = None,
 ) -> pd.DataFrame | None:
     """
-    查詢個股當日券商分點買賣紀錄。
+    查詢個股券商分點買賣紀錄。
 
     Args:
         stock_id  : 股票代碼，例如 '2330'
@@ -189,6 +198,7 @@ def query_stock(
         max_retry : 驗證碼失敗最大重試次數
         delay     : 每次重試間隔秒數
         verbose   : 是否印出進度
+        date_str  : 查詢日期 'YYYY-MM-DD'，None 代表今日
 
     Returns:
         DataFrame 含 券商代號/券商名稱/買進股數/賣出股數/買賣超股數（按買賣超降序），
@@ -196,6 +206,7 @@ def query_stock(
     """
     session = requests.Session()
     session.headers.update(HEADERS)
+    roc_date = _to_roc_date(date_str) if date_str else None
 
     for attempt in range(1, max_retry + 1):
         try:
@@ -222,6 +233,8 @@ def query_stock(
             else:
                 payload["RadioButton_Normal"] = "RadioButton_Normal"
             payload["TextBox_Stkno"] = stock_id.strip()
+            if roc_date:
+                payload["TextBox_Date"] = roc_date  # 歷史日期（民國格式 YYY/MM/DD）
             payload["CaptchaControl1"] = captcha
             payload["btnOK"] = "查詢"
 

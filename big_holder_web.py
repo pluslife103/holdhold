@@ -110,6 +110,9 @@ _BROKER_DB_PATH = Path("broker_chip_history.db")
 _BROKER_DB_CONN: "_sqlite3.Connection | None" = None
 _BROKER_DB_LOCK = threading.Lock()
 
+# FinMind 權限不足旗標：收到 "register level" 400 後停止呼叫 FinMind
+_FINMIND_PERMISSION_DENIED = False
+
 def _get_broker_db() -> "_sqlite3.Connection | None":
     global _BROKER_DB_CONN
     if _BROKER_DB_CONN is not None:
@@ -1584,6 +1587,9 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
         _cset(ckey, db_rows)
         return db_rows
     # ── 回退：FinMind API ─────────────────────────────────────────────────
+    global _FINMIND_PERMISSION_DENIED
+    if _FINMIND_PERMISSION_DENIED:
+        return []  # 已知無權限，不浪費請求
     try:
         r = requests.get(
             FINMIND_BASE,
@@ -1598,12 +1604,17 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
         return []
     fm_status = j.get("status")
     rows_all = j.get("data", [])
-    print(f"  [broker_day] {stock_id} {date_str}: http={r.status_code} fm={fm_status} rows={len(rows_all)}")
+    msg = j.get("msg", "")
     if r.status_code == 402 or fm_status == 402:
-        raise _FinMindRateLimit(j.get("msg", "FinMind 402"))
+        raise _FinMindRateLimit(msg or "FinMind 402")
     if r.status_code != 200 or fm_status not in (200, None):
-        print(f"  [broker_day] {stock_id} {date_str}: error msg={j.get('msg','')}")
+        if "register" in msg.lower() or r.status_code == 400:
+            _FINMIND_PERMISSION_DENIED = True
+            print(f"[broker_day] FinMind 權限不足（register level），停止後續 FinMind 呼叫")
+        else:
+            print(f"  [broker_day] {stock_id} {date_str}: error http={r.status_code} msg={msg}")
         return []
+    print(f"  [broker_day] {stock_id} {date_str}: http={r.status_code} rows={len(rows_all)}")
     rows_raw = rows_all  # end_date=date_str guarantees all rows are for this date
     if not rows_raw:
         _cset(ckey, [])
