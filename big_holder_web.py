@@ -2701,7 +2701,9 @@ def api_reload_stocks():
 
 
 def _fetch_price_range(stock_id: str, start: str, end: str) -> dict:
-    """Fetch daily close+volume for one stock over a date range. Returns {date_str: {close, volume}}."""
+    """Fetch daily close+volume for one stock over a date range. Returns {date_str: {close, volume}}.
+    FinMind 失敗時自動 fallback 到 TWSE 公開 API。"""
+    from datetime import date as _d
     df = _fm("TaiwanStockPrice", stock_id, start, end)
     price_map: dict = {}
     if not df.empty:
@@ -2711,6 +2713,15 @@ def _fetch_price_range(stock_id: str, start: str, end: str) -> dict:
                 "close":  float(pr.get("close", 0) or 0),
                 "volume": round(float(pr.get("Trading_Volume", 0) or 0) / 1000),
             }
+    if not price_map:
+        try:
+            start_d = _d.fromisoformat(start)
+            end_d   = _d.fromisoformat(end)
+        except Exception:
+            return price_map
+        twse = _fetch_price_twse(stock_id, start_d, end_d)
+        for d_str, v in twse.items():
+            price_map[d_str] = {"close": v["close"], "volume": v["volume"]}
     return price_map
 
 
