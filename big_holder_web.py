@@ -223,6 +223,57 @@ def _cget(key: str, ttl_h: float = CACHE_TTL_H):
         return val
 
 
+def _fetch_price_twse(stock_id: str, start_d, end_d) -> dict:
+    """TWSE/TPEX 公開 API 取價格，不需要 FinMind token。
+    按月查詢，合併成 {date_str: {open,high,low,close,volume}}。"""
+    from datetime import date as _date, timedelta as _td
+    import calendar
+    result: dict = {}
+    # 產生需查詢的月份清單
+    months = set()
+    d = _date(start_d.year, start_d.month, 1)
+    while d <= end_d:
+        months.add((d.year, d.month))
+        d = _date(d.year + (d.month // 12), (d.month % 12) + 1, 1)
+    for y, m in sorted(months):
+        date_str = f"{y}{m:02d}01"
+        ckey = f"twse_price|{stock_id}|{y}{m:02d}"
+        cached = _cget(ckey, ttl_h=24)
+        if cached is not None:
+            result.update(cached)
+            continue
+        try:
+            r = requests.get(
+                "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
+                params={"response": "json", "date": date_str, "stockNo": stock_id},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+            )
+            j = r.json()
+            if j.get("stat") != "OK":
+                continue
+            month_data: dict = {}
+            for row in j.get("data", []):
+                try:
+                    # row: [民國日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 本益比]
+                    roc = row[0].strip()  # e.g. "115/04/24"
+                    parts = roc.split("/")
+                    iso = f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}"
+                    def _n(s): return float(str(s).replace(",", "") or 0)
+                    month_data[iso] = {
+                        "open":   _n(row[3]), "high": _n(row[4]),
+                        "low":    _n(row[5]), "close": _n(row[6]),
+                        "volume": round(_n(row[1]) / 1000),
+                    }
+                except Exception:
+                    continue
+            _cset(ckey, month_data)
+            result.update(month_data)
+            time.sleep(0.3)
+        except Exception as exc:
+            print(f"[TWSE price] {stock_id} {y}/{m}: {exc}")
+    return result
+
+
 # ── FinMind API ────────────────────────────────────────────────────────────
 def _fm(dataset: str, sid: str = "", start: str = "", end: str = "") -> pd.DataFrame:
     if not end:
@@ -1608,9 +1659,9 @@ def _fetch_broker_day(token: str, stock_id: str, date_str: str) -> list:
     if r.status_code == 402 or fm_status == 402:
         raise _FinMindRateLimit(msg or "FinMind 402")
     if r.status_code != 200 or fm_status not in (200, None):
-        if "register" in msg.lower() or r.status_code == 400:
+        if r.status_code in (400, 403) or "register" in msg.lower() or "banned" in msg.lower():
             _FINMIND_PERMISSION_DENIED = True
-            print(f"[broker_day] FinMind 權限不足（register level），停止後續 FinMind 呼叫")
+            print(f"[broker_day] FinMind 封鎖（{r.status_code} {msg[:60]}），停止後續 FinMind 呼叫")
         else:
             print(f"  [broker_day] {stock_id} {date_str}: error http={r.status_code} msg={msg}")
         return []
@@ -2829,9 +2880,8 @@ def api_big_player_timeline(
     except _FinMindRateLimit:
         raise HTTPException(429, "FinMind API 每小時配額已用盡（402），請約 1 小時後再試")
 
-    # ── fetch price + volume first so we can use close for broker scoring ──
+    # ── fetch price + volume (FinMind → TWSE 公開 API 備援) ─────────────────
     pdf = _fm("TaiwanStockPrice", stock_id, start_d.isoformat(), end_d.isoformat())
-    print(f"[TL] {stock_id} price_rows={len(pdf)} day_map_keys={len(day_map)}")
     price_map: dict = {}
     if not pdf.empty:
         for _, pr in pdf.iterrows():
@@ -2843,6 +2893,10 @@ def api_big_player_timeline(
                 "close":  float(pr.get("close", 0) or 0),
                 "volume": round(float(pr.get("Trading_Volume", 0) or 0) / 1000),
             }
+    # 若 FinMind 失敗，改用 TWSE 公開 API（免 token，按月查詢）
+    if not price_map:
+        price_map = _fetch_price_twse(stock_id, start_d, end_d)
+    print(f"[TL] {stock_id} price_rows={len(price_map)} day_map_keys={len(day_map)}")
 
     # ── compute broker scores per day using close price ───────────────────
     # FinMind TaiwanStockTradingDailyReport has no price field, so buy_amount
