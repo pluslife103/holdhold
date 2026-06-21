@@ -2957,53 +2957,97 @@ def api_big_player_timeline(
     return {"stock_id": stock_id, "stock_name": stock_name, "timeline": timeline, "thold": THRESHOLD}
 
 
+@app.get("/api/broker_win_ranking")
+def api_broker_win_ranking():
+    """回傳分點全能排行（15天+60天合併），從 broker_combined_result.json 讀取。"""
+    import os
+    path = Path("broker_combined_result.json")
+    if not path.exists():
+        raise HTTPException(404, "尚未計算，請先執行 broker_win_rate_screener.py")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # 讀各分點近10日最新動態
+        con = _get_broker_db()
+        all_dates_q = None
+        recent_activity = {}
+        if con:
+            all_d = [r[0] for r in con.execute(
+                "SELECT DISTINCT date FROM broker_chip ORDER BY date DESC LIMIT 10")]
+            if all_d:
+                ph = ",".join("?" * len(all_d))
+                for row in data[:30]:
+                    bid = row["bid"]
+                    rows = con.execute(
+                        f"SELECT stock_id, SUM(buy-sell)/1000 as net "
+                        f"FROM broker_chip WHERE broker_id=? AND date IN ({ph}) "
+                        f"GROUP BY stock_id HAVING net >= 3 ORDER BY net DESC LIMIT 5",
+                        [bid] + all_d).fetchall()
+                    recent_activity[bid] = [{"sid":r[0],"net":round(r[1])} for r in rows]
+        # 加入名稱（可能已在 data 裡）
+        return {"updated": path.stat().st_mtime,
+                "data": data[:30],
+                "recent_activity": recent_activity}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 @app.get("/api/broker_list")
 def api_broker_list():
-    """查詢 2330 最近一個有資料的交易日，回傳所有分點清單 [{broker_id, broker_name}]。"""
-    import os
-    from datetime import date as dt_date, timedelta
-
+    """回傳所有分點清單 [{broker_id, broker_name}]。優先從本地 DB 讀取。"""
     ckey = "broker_list_v2"
     cached = _cget(ckey, ttl_h=6)
     if cached is not None:
         return cached
 
-    token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
-    if not token:
-        raise HTTPException(500, "未設定 FINMIND_TOKEN")
-
-    today = dt_date.today()
     brokers: dict = {}
 
-    # Try the last 5 weekdays on 3 high-volume stocks to collect as many brokers as possible
-    for stock_id in ["2330", "2317", "2454"]:
-        for offset in range(7):
-            d = today - timedelta(days=offset)
-            if d.weekday() >= 5:
-                continue
-            try:
-                resp = requests.get(
-                    FINMIND_BASE,
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={
-                        "dataset":    "TaiwanStockTradingDailyReport",
-                        "data_id":    stock_id,
-                        "start_date": d.isoformat(),
-                        "end_date":   d.isoformat(),
-                    },
-                    timeout=30,
-                )
-                j = resp.json()
-                rows = j.get("data") or []
-                if rows:
-                    for row in rows:
-                        bid   = str(row.get("securities_trader_id", "") or "").strip()
-                        bname = str(row.get("securities_trader",    "") or "").strip()
-                        if bid:
-                            brokers[bid] = bname or bid
-                    break   # got data for this stock; move to next stock
-            except Exception:
-                pass
+    # ── 優先：從本地 broker_info DB 讀取（速度快、不耗 FinMind 配額）────
+    conn = _get_broker_db()
+    if conn is not None:
+        try:
+            with _BROKER_DB_LOCK:
+                rows = conn.execute(
+                    "SELECT broker_id, broker_name FROM broker_info ORDER BY broker_name"
+                ).fetchall()
+            for bid, bname in rows:
+                if bid:
+                    brokers[bid] = bname or bid
+        except Exception as exc:
+            print(f"[broker_list] local DB read error: {exc}")
+
+    # ── 備援：若本地 DB 無資料，從 FinMind 抓最近一天的 2330 分點 ──────
+    if not brokers:
+        import os
+        from datetime import date as dt_date, timedelta
+        token = _TOKEN or os.getenv("FINMIND_TOKEN", "")
+        if token and not _FINMIND_PERMISSION_DENIED:
+            today = dt_date.today()
+            for stock_id in ["2330", "2317", "2454"]:
+                for offset in range(7):
+                    d = today - timedelta(days=offset)
+                    if d.weekday() >= 5:
+                        continue
+                    try:
+                        resp = requests.get(
+                            FINMIND_BASE,
+                            params={"dataset": "TaiwanStockTradingDailyReport",
+                                    "data_id": stock_id,
+                                    "start_date": d.isoformat(),
+                                    "end_date":   d.isoformat(),
+                                    "token":      token},
+                            timeout=30,
+                        )
+                        j = resp.json()
+                        api_rows = j.get("data") or []
+                        if api_rows:
+                            for row in api_rows:
+                                bid   = str(row.get("securities_trader_id", "") or "").strip()
+                                bname = str(row.get("securities_trader",    "") or "").strip()
+                                if bid:
+                                    brokers[bid] = bname or bid
+                            break
+                    except Exception:
+                        pass
 
     if not brokers:
         raise HTTPException(502, "無法取得分點清單，請稍後再試")
@@ -3012,8 +3056,293 @@ def api_broker_list():
         [{"broker_id": k, "broker_name": v} for k, v in brokers.items()],
         key=lambda x: x["broker_name"]
     )
-    _cset(ckey, result)
+    _cset(ckey, {"brokers": result, "total": len(result)})
     return {"brokers": result, "total": len(result)}
+
+
+@app.get("/api/broker_win_rate")
+def api_broker_win_rate(
+    days:        int  = Query(20),
+    min_pos:     int  = Query(5),
+    exclude_etf: int  = Query(0),   # 1 = 排除 ETF（代碼以 00 開頭）
+):
+    """分點勝率排行榜：在指定天數內，淨買超的股票中有多少支最終上漲。
+    勝率 = 淨買超股票中收盤價上漲數 / 淨買超股票總數。
+    使用本地 DB + TWSE 公開 API，不需 FinMind。"""
+    from datetime import date as dt_date, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    days = max(5, min(60, days))
+    min_pos = max(1, min(30, min_pos))
+    ckey = f"broker_win_rate|{days}|{min_pos}|{exclude_etf}"
+    cached = _cget(ckey, ttl_h=6)
+    if cached is not None:
+        return cached
+
+    conn = _get_broker_db()
+    if conn is None:
+        raise HTTPException(503, "本地 DB 未連線")
+
+    today = dt_date.today()
+    # Use actual trading days: go back ~1.5× calendar days to cover weekends/holidays
+    start_date = (today - timedelta(days=round(days * 1.5))).isoformat()
+    end_date   = today.isoformat()
+
+    # Step 1: get all (broker, stock) net positions in period from local DB
+    with _BROKER_DB_LOCK:
+        rows = conn.execute(
+            """SELECT bc.broker_id,
+                      COALESCE(bi.broker_name, bc.broker_id) AS broker_name,
+                      bc.stock_id,
+                      SUM(bc.buy  - bc.sell) AS net_shares,
+                      SUM(bc.buy)            AS total_buy_shares
+               FROM broker_chip bc
+               LEFT JOIN broker_info bi ON bi.broker_id = bc.broker_id
+               WHERE bc.date >= ?
+               GROUP BY bc.broker_id, bc.stock_id""",
+            (start_date,)
+        ).fetchall()
+
+    # Step 2: group by broker; only net-buy positions (net_shares > 0)
+    broker_map: dict = {}
+    for broker_id, broker_name, stock_id, net_shares, buy_shares in rows:
+        net_lots = round((net_shares or 0) / 1000)
+        if net_lots <= 0:
+            continue
+        if exclude_etf and stock_id.startswith("00"):
+            continue  # 排除 ETF（台灣所有 ETF 代碼以 00 開頭）
+        if broker_id not in broker_map:
+            broker_map[broker_id] = {"name": broker_name, "stocks": {}}
+        broker_map[broker_id]["stocks"][stock_id] = net_lots
+
+    # Step 3: filter brokers with enough positions
+    qualified = {bid: v for bid, v in broker_map.items()
+                 if len(v["stocks"]) >= min_pos}
+    if not qualified:
+        result = {"brokers": [], "period_days": days, "total": 0, "stock_count": 0}
+        _cset(ckey, result)
+        return result
+
+    # Step 4: unique stocks across qualified brokers (cap at 600 for performance)
+    stock_lots: dict = {}
+    for v in qualified.values():
+        for sid, lots in v["stocks"].items():
+            stock_lots[sid] = stock_lots.get(sid, 0) + lots
+    top_stocks = sorted(stock_lots, key=lambda s: -stock_lots[s])[:600]
+    target_stocks = set(top_stocks)
+
+    # Step 5: fetch price return (period start → end) per stock via TWSE
+    def get_return(sid: str) -> tuple:
+        try:
+            pm = _fetch_price_range(sid, start_date, end_date)
+            if len(pm) < 2:
+                return sid, None, 0.0
+            dates_sorted = sorted(pm.keys())
+            p0 = pm[dates_sorted[0]]["close"]
+            p1 = pm[dates_sorted[-1]]["close"]
+            if p0 <= 0:
+                return sid, None, 0.0
+            ret = (p1 - p0) / p0
+            return sid, ret > 0, round(ret * 100, 2)
+        except Exception:
+            return sid, None, 0.0
+
+    price_results: dict = {}  # {stock_id: (is_win: bool|None, return_pct)}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        fmap = {ex.submit(get_return, sid): sid for sid in target_stocks}
+        for fut in as_completed(fmap):
+            sid, is_win, ret_pct = fut.result()
+            price_results[sid] = (is_win, ret_pct)
+
+    # Step 6: calculate win rate per broker
+    leaderboard = []
+    for broker_id, v in qualified.items():
+        wins = losses = 0
+        rets = []
+        total_lots = 0
+        for sid, net_lots in v["stocks"].items():
+            if sid not in price_results:
+                continue
+            is_win, ret_pct = price_results[sid]
+            if is_win is None:
+                continue
+            total_lots += net_lots
+            rets.append(ret_pct)
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
+
+        counted = wins + losses
+        if counted < min_pos:
+            continue
+        win_rate  = round(wins / counted * 100, 1)
+        avg_return = round(sum(rets) / len(rets), 2) if rets else 0.0
+        leaderboard.append({
+            "broker_id":   broker_id,
+            "broker_name": v["name"],
+            "win_rate":    win_rate,
+            "wins":        wins,
+            "losses":      losses,
+            "total_pos":   counted,
+            "avg_return":  avg_return,
+            "total_lots":  total_lots,
+        })
+
+    leaderboard.sort(key=lambda x: (-x["win_rate"], -x["total_pos"]))
+
+    result = {
+        "brokers":      leaderboard[:100],
+        "period_days":  days,
+        "total":        len(leaderboard),
+        "stock_count":  len(price_results),
+        "exclude_etf":  bool(exclude_etf),
+    }
+    _cset(ckey, result)
+    return result
+
+
+@app.get("/api/broker_win_rate_composite")
+def api_broker_win_rate_composite(
+    days:        int = Query(20),
+    min_pos:     int = Query(5),
+    exclude_etf: int = Query(0),
+    top_n:       int = Query(100),
+):
+    """勝率前 N 分點的持倉增減走勢彙總。
+    回傳各交易日的聚合淨買超，以及累積走勢與股票明細。"""
+    from datetime import date as dt_date, timedelta
+
+    top_n = max(10, min(200, top_n))
+    ckey  = f"wr_composite|{days}|{min_pos}|{exclude_etf}|{top_n}"
+    cached = _cget(ckey, ttl_h=6)
+    if cached is not None:
+        return cached
+
+    # Step 1: 取得勝率排行（複用已快取的結果）
+    wr = api_broker_win_rate(days=days, min_pos=min_pos, exclude_etf=exclude_etf)
+    top_brokers = [b["broker_id"] for b in wr.get("brokers", [])[:top_n]]
+    if not top_brokers:
+        result = {"dates": [], "daily_net": [], "cum_net": [], "top_stocks": [],
+                  "broker_count": 0, "period_days": days}
+        _cset(ckey, result)
+        return result
+
+    # Step 2: 從 DB 查這些分點的每日 (date, stock_id, net_lots)
+    conn = _get_broker_db()
+    if conn is None:
+        raise HTTPException(503, "本地 DB 未連線")
+
+    start_date = (dt_date.today() - timedelta(days=round(days * 1.5))).isoformat()
+    placeholders = ",".join("?" * len(top_brokers))
+    etf_filter = "AND bc.stock_id NOT LIKE '00%'" if exclude_etf else ""
+
+    with _BROKER_DB_LOCK:
+        rows = conn.execute(
+            f"""SELECT bc.date,
+                       bc.stock_id,
+                       COALESCE(bi.broker_name, bc.broker_id) AS broker_name,
+                       SUM(bc.buy - bc.sell) AS net_shares
+                FROM broker_chip bc
+                LEFT JOIN broker_info bi ON bi.broker_id = bc.broker_id
+                WHERE bc.broker_id IN ({placeholders})
+                  AND bc.date >= ?
+                  {etf_filter}
+                GROUP BY bc.date, bc.stock_id
+                ORDER BY bc.date""",
+            top_brokers + [start_date]
+        ).fetchall()
+
+    # Step 3: 按股票彙整每日淨買超 {stock_id: {date: net_lots}}
+    stock_daily: dict = {}
+    all_dates: set = set()
+
+    for date_str, stock_id, _bname, net_shares in rows:
+        net_lots = round((net_shares or 0) / 1000)
+        all_dates.add(date_str)
+        if stock_id not in stock_daily:
+            stock_daily[stock_id] = {}
+        stock_daily[stock_id][date_str] = stock_daily[stock_id].get(date_str, 0) + net_lots
+
+    # Step 4: 建立每支股票的累積持倉時序
+    sorted_dates = sorted(all_dates)
+    g = _GRADING
+
+    raw_series = []
+    for stock_id, date_map in stock_daily.items():
+        cum, pts = 0, []
+        for d in sorted_dates:
+            cum += date_map.get(d, 0)
+            pts.append(cum)
+        total_abs = abs(pts[-1]) if pts else 0
+        name = (g.get(stock_id) or {}).get("stock_name", stock_id)
+        raw_series.append({
+            "stock_id":   stock_id,
+            "stock_name": name,
+            "cum_net":    pts,
+            "total_abs":  total_abs,
+            "final_net":  pts[-1] if pts else 0,
+        })
+
+    # 按期末持倉絕對值排序，取前 20
+    raw_series.sort(key=lambda x: -x["total_abs"])
+    series = [{k: v for k, v in s.items() if k != "total_abs"} for s in raw_series[:20]]
+
+    result = {
+        "dates":        sorted_dates,
+        "series":       series,
+        "broker_count": len(top_brokers),
+        "period_days":  days,
+        "exclude_etf":  bool(exclude_etf),
+    }
+    _cset(ckey, result)
+    return result
+
+
+def _build_value_timeline(timeline_series: list, sorted_dates: list) -> list:
+    """計算每支股票的持倉金額走勢（cumulative lots × 收盤價 × 1000，單位：萬元），
+    並依總金額絕對值排前15。使用 TWSE 公開 API，無需 FinMind。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _asc
+    if not timeline_series or not sorted_dates:
+        return []
+
+    date_start = sorted_dates[0]
+    date_end   = sorted_dates[-1]
+
+    def _get_price(sid: str) -> tuple:
+        try:
+            pm = _fetch_price_range(sid, date_start, date_end)
+            if pm:
+                latest = max(pm.keys())
+                return sid, float(pm[latest].get("close", 0) or 0)
+        except Exception:
+            pass
+        return sid, 0.0
+
+    rep_prices: dict = {}
+    with ThreadPoolExecutor(max_workers=6) as _pe:
+        fmap = {_pe.submit(_get_price, ts["stock_id"]): ts["stock_id"] for ts in timeline_series}
+        for fut in _asc(fmap):
+            sid, price = fut.result()
+            rep_prices[sid] = price
+
+    result = []
+    for ts in timeline_series:
+        price = rep_prices.get(ts["stock_id"], 0.0)
+        if price <= 0:
+            cum_value = [0] * len(ts["cum_net"])
+        else:
+            cum_value = [round(v * 1000 * price / 10000) for v in ts["cum_net"]]
+        result.append({
+            "stock_id":   ts["stock_id"],
+            "stock_name": ts["stock_name"],
+            "rep_price":  round(price, 1),
+            "cum_value":  cum_value,
+            "total_abs":  abs(cum_value[-1]) if cum_value else 0,
+        })
+
+    result.sort(key=lambda x: x["total_abs"], reverse=True)
+    return result[:15]
 
 
 @app.get("/api/broker_stats")
@@ -3052,6 +3381,38 @@ def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
         hit = _cget(dckey, ttl_h=12)
         if hit is not None:
             return hit
+
+        # ── 優先：本地 DB ─────────────────────────────────────────────
+        db_conn = _get_broker_db()
+        if db_conn is not None:
+            try:
+                with _BROKER_DB_LOCK:
+                    db_rows = db_conn.execute(
+                        "SELECT bc.stock_id, bc.buy, bc.sell, "
+                        "COALESCE(bi.broker_name, ?) AS bname "
+                        "FROM broker_chip bc "
+                        "LEFT JOIN broker_info bi ON bi.broker_id = bc.broker_id "
+                        "WHERE bc.broker_id = ? AND bc.date = ?",
+                        (trader_id, trader_id, date_str),
+                    ).fetchall()
+                if db_rows:
+                    result_day = [
+                        {"stock_id": sid,
+                         "date": date_str,
+                         "buy":  round(buy  / 1000),
+                         "sell": round(sell / 1000),
+                         "trader_name": bname}
+                        for sid, buy, sell, bname in db_rows
+                        if sid
+                    ]
+                    _cset(dckey, result_day)
+                    return result_day
+            except Exception as exc:
+                print(f"[bstats_day] local DB {trader_id} {date_str}: {exc}")
+
+        # ── 備援：FinMind API ─────────────────────────────────────────
+        if _FINMIND_PERMISSION_DENIED:
+            return []
         try:
             resp = requests.get(
                 FINMIND_BROKER_URL,
@@ -3065,7 +3426,6 @@ def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
         if j2.get("status") not in (200, None):
             return []
         raw = j2.get("data", []) or []
-        # Aggregate rows for the same stock_id (multiple price levels → one entry per stock)
         agg: dict = {}
         name_hint = trader_id
         for row in raw:
@@ -3133,15 +3493,42 @@ def api_broker_stats(trader_id: str = Query(""), days: int = Query(20)):
     total_buy  = sum(r["buy"]  for r in result_rows)
     total_sell = sum(r["sell"] for r in result_rows)
 
+    # Build per-stock daily net map for timeline chart
+    daily_net_map: dict = {}
+    for r in all_rows:
+        sid = r["stock_id"]
+        dt  = r["date"]
+        net = r["buy"] - r["sell"]
+        if sid not in daily_net_map:
+            daily_net_map[sid] = {}
+        daily_net_map[sid][dt] = daily_net_map[sid].get(dt, 0) + net
+
+    sorted_dates = sorted(dates_set)
+    timeline_series = []
+    for row in result_rows[:15]:
+        sid = row["stock_id"]
+        cum, pts = 0, []
+        for d in sorted_dates:
+            cum += daily_net_map.get(sid, {}).get(d, 0)
+            pts.append(cum)
+        timeline_series.append({
+            "stock_id":   sid,
+            "stock_name": row["stock_name"],
+            "cum_net":    pts,
+        })
+
     result = {
-        "trader_id":   trader_id,
-        "trader_name": trader_name,
-        "days":        len(dates_set),
-        "total_buy":   total_buy,
-        "total_sell":  total_sell,
-        "total_net":   total_buy - total_sell,
-        "stock_count": len(result_rows),
-        "stocks":      result_rows[:200],
+        "trader_id":      trader_id,
+        "trader_name":    trader_name,
+        "days":           len(dates_set),
+        "total_buy":      total_buy,
+        "total_sell":     total_sell,
+        "total_net":      total_buy - total_sell,
+        "stock_count":    len(result_rows),
+        "stocks":         result_rows[:200],
+        "timeline_dates": sorted_dates,
+        "timeline":       timeline_series,
+        "timeline_value": _build_value_timeline(timeline_series, sorted_dates),
     }
     _cset(ckey, result)
     return result
@@ -3685,6 +4072,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
       <div class="tab" onclick="switchTab('flow')">🔗 傳導鏈</div>
       <div class="tab" onclick="switchTab('indcap')">📊 產業市值</div>
       <div class="tab" onclick="switchTab('deriv')">📉 期權行情</div>
+      <div class="tab" onclick="switchTab('winrank')">🏆 分點全能排行</div>
     </div>
 
     <!-- 個股 pane -->
@@ -3739,6 +4127,16 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
               <div style="font-size:11px;color:#22c55e;padding:2px 6px;font-weight:600">賣超前20（張）</div>
               <div id="bstats-sell-chart" style="flex:1;min-height:0"></div>
             </div>
+          </div>
+          <!-- 持倉累積走勢圖 -->
+          <div id="bstats-timeline-wrap" style="display:none;flex-shrink:0;padding:0 6px 6px;border-bottom:1px solid var(--bor)">
+            <div style="font-size:11px;color:var(--mut);padding:3px 6px">持倉增減走勢（前15支，累積張數）</div>
+            <div id="bstats-timeline-chart" style="height:280px;width:100%"></div>
+          </div>
+          <!-- 每日增減疊加圖 -->
+          <div id="bstats-total-wrap" style="display:none;flex-shrink:0;padding:0 6px 6px;border-bottom:1px solid var(--bor)">
+            <div style="font-size:11px;color:var(--mut);padding:3px 6px">持倉金額走勢（持倉金額前15支，單位：萬元，白色粗線 = 合計）</div>
+            <div id="bstats-total-chart" style="height:280px;width:100%"></div>
           </div>
           <!-- 表格 -->
           <div id="bstats-table-wrap" style="flex:1;overflow-y:auto;min-height:0"></div>
@@ -3856,6 +4254,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
           <button class="gf-btn active" id="bmode-stock"    onclick="setBrokerMode('stock')"    style="font-size:12px;padding:4px 14px">個股查詢</button>
           <button class="gf-btn"        id="bmode-trader"   onclick="setBrokerMode('trader')"   style="font-size:12px;padding:4px 14px">券商統計</button>
           <button class="gf-btn"        id="bmode-timeline" onclick="setBrokerMode('timeline')" style="font-size:12px;padding:4px 14px">大戶時間軸</button>
+          <button class="gf-btn"        id="bmode-winrate"  onclick="setBrokerMode('winrate')"  style="font-size:12px;padding:4px 14px">🏆 勝率排行</button>
         </div>
 
         <!-- 控制列：個股模式 -->
@@ -3929,6 +4328,38 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
             <option value="60">近60交易日</option>
           </select>
         </div>
+
+        <!-- 控制列：勝率排行模式 -->
+        <div id="broker-ctrl-winrate" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--mut)">觀察期：</span>
+          <button class="sort-btn" id="wr-d10" onclick="wrSetDays(10)" style="font-size:11px">10天</button>
+          <button class="sort-btn active" id="wr-d20" onclick="wrSetDays(20)" style="font-size:11px">20天</button>
+          <button class="sort-btn" id="wr-d40" onclick="wrSetDays(40)" style="font-size:11px">40天</button>
+          <button class="sort-btn" id="wr-d60" onclick="wrSetDays(60)" style="font-size:11px">60天</button>
+          <span style="font-size:12px;color:var(--mut);margin-left:8px">最少持股：</span>
+          <select id="wr-min-pos" class="search" style="width:70px;font-size:11px">
+            <option value="3">3支</option>
+            <option value="5" selected>5支</option>
+            <option value="10">10支</option>
+            <option value="20">20支</option>
+          </select>
+          <span style="font-size:12px;color:var(--mut);margin-left:8px">ETF：</span>
+          <button class="sort-btn active" id="wr-etf-all"  onclick="wrSetEtf(0)" style="font-size:11px">含ETF</button>
+          <button class="sort-btn"        id="wr-etf-excl" onclick="wrSetEtf(1)" style="font-size:11px">不含ETF</button>
+          <button class="sort-btn" onclick="winRateLoad()" style="background:var(--acc);color:#000;font-weight:700;padding:4px 14px;margin-left:4px">查詢</button>
+          <button class="sort-btn" id="wr-comp-btn" onclick="winRateCompositeLoad()" style="padding:4px 14px;margin-left:2px">📈 綜合走勢</button>
+          <span id="wr-status" style="font-size:11px;color:var(--mut)"></span>
+        </div>
+
+        <!-- 勝率排行：綜合走勢圖 -->
+        <div id="broker-composite-wrap" style="display:none;flex-direction:column;gap:4px;flex-shrink:0;border-bottom:1px solid var(--bor);padding-bottom:8px">
+          <div style="font-size:11px;color:var(--mut);padding:3px 4px" id="wr-comp-title">勝率前100分點・各股合計持倉走勢（每條線 = 一支股票被這些分點合計持有的累積張數）</div>
+          <div id="broker-composite-chart" style="height:520px;width:100%"></div>
+          <div id="broker-composite-stocks" style="font-size:11px;padding:4px 6px"></div>
+        </div>
+
+        <!-- 勝率排行結果區 -->
+        <div id="broker-winrate-wrap" style="display:none;flex-direction:column;gap:0;flex:1;overflow-y:auto;min-height:0"></div>
 
         <!-- 時間軸圖表區 -->
         <div id="broker-timeline-wrap" style="display:none;flex-direction:column;gap:6px"></div>
@@ -4233,6 +4664,29 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
         <div style="padding:2px 14px;font-size:11px;color:var(--mut);flex-shrink:0" id="deriv-status">選擇股票後點「載入」</div>
         <!-- 整合圖表 -->
         <div id="deriv-chart" style="flex:1;min-height:0;padding:0 6px 6px"></div>
+      </div>
+    </div>
+
+    <!-- ── 分點全能排行 ── -->
+    <div class="pane" id="pane-winrank">
+      <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+        <div style="padding:10px 16px;border-bottom:1px solid var(--bor);flex-shrink:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <span style="font-weight:700;font-size:14px">🏆 分點全能排行</span>
+          <span style="font-size:11px;color:var(--mut)">15天選股力 × 60天大週期報酬合併排名</span>
+          <button class="gf-btn" onclick="winrankLoad()" style="font-size:11px;padding:3px 12px">重新載入</button>
+          <span id="winrank-updated" style="font-size:10px;color:var(--mut)"></span>
+        </div>
+        <!-- 說明列 -->
+        <div style="padding:6px 16px;background:var(--sur2);font-size:11px;color:var(--mut);flex-shrink:0;border-bottom:1px solid var(--bor)">
+          <b style="color:var(--fg)">15天勝率</b>（選股能力）：滾動10天累積+15天觀察，衡量短線選股精準度 ｜
+          <b style="color:var(--fg)">60天報酬</b>（大週期）：首次進場後60個交易日的股價漲幅 ｜
+          <b style="color:var(--fg)">複合分</b>：兩者加權整合
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:0 12px 12px">
+          <div id="winrank-content" style="padding-top:12px">
+            <div class="empty">點選此頁面以載入資料</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -4731,8 +5185,92 @@ function bstatsRender(d) {
     hovertemplate: '%{x}<br>賣出: %{y:,.0f} 張<extra></extra>',
   }], chartLayout('賣超前20'), {responsive:true, displayModeBar:false});
 
+  // Timeline chart (cumulative per stock)
+  bstatsRenderTimeline(d);
+  // Total daily stacked chart
+  bstatsRenderTotalChart(d);
+
   // Table
   bstatsRenderTable();
+}
+
+function bstatsRenderTimeline(d) {
+  const wrap = document.getElementById('bstats-timeline-wrap');
+  if (!d.timeline || !d.timeline.length || !d.timeline_dates || !d.timeline_dates.length) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'block';
+  const colors = ['#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#a855f7',
+                  '#ec4899','#14b8a6','#f43f5e','#84cc16','#0ea5e9','#8b5cf6','#d946ef','#fb923c'];
+  const traces = d.timeline.map((s, i) => ({
+    type: 'scatter', mode: 'lines',
+    name: `${s.stock_id} ${s.stock_name}`,
+    x: d.timeline_dates,
+    y: s.cum_net,
+    line: { color: colors[i % colors.length], width: 1.5 },
+    hovertemplate: `${s.stock_id} ${s.stock_name}<br>%{x}<br>累積: %{y:+,.0f} 張<extra></extra>`,
+  }));
+  Plotly.newPlot('bstats-timeline-chart', traces, {
+    ...PLY,
+    margin: { l: 55, r: 10, t: 8, b: 55 },
+    xaxis: { gridcolor: '#21262d', tickformat: '%m/%d', tickfont: { size: 9 } },
+    yaxis: { gridcolor: '#21262d', zeroline: true, zerolinecolor: '#444', zerolinewidth: 1,
+             title: { text: '累積張數', font: { size: 10 } } },
+    legend: { orientation: 'h', y: -0.3, font: { size: 9 } },
+    showlegend: true, height: 300,
+  }, { responsive: true, displayModeBar: false });
+}
+
+function bstatsRenderTotalChart(d) {
+  const wrap = document.getElementById('bstats-total-wrap');
+  const series = d.timeline_value;
+  if (!series || !series.length || !d.timeline_dates || !d.timeline_dates.length) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'block';
+
+  const dates = d.timeline_dates;
+  const colors = [
+    '#ef4444','#f97316','#eab308','#22c55e','#06b6d4',
+    '#3b82f6','#a855f7','#ec4899','#14b8a6','#84cc16',
+    '#0ea5e9','#8b5cf6','#d946ef','#fb923c','#a3e635',
+  ];
+
+  // Total cumulative value across all value-series stocks
+  const totalCum = dates.map((_, di) =>
+    series.reduce((sum, s) => sum + (s.cum_value[di] || 0), 0)
+  );
+
+  const stockTraces = series.map((s, i) => ({
+    type: 'scatter', mode: 'lines',
+    name: `${s.stock_id} ${s.stock_name}${s.rep_price ? ' @' + s.rep_price : ''}`,
+    x: dates, y: s.cum_value,
+    line: { color: colors[i % colors.length], width: 1.2 },
+    opacity: 0.7,
+    hovertemplate: `${s.stock_id} ${s.stock_name}<br>%{x}<br>持倉金額: %{y:+,.0f} 萬元<extra></extra>`,
+  }));
+
+  const totalLine = {
+    type: 'scatter', mode: 'lines',
+    name: '▶ 持倉合計',
+    x: dates, y: totalCum,
+    line: { color: '#ffffff', width: 3 },
+    hovertemplate: '持倉合計<br>%{x}<br>%{y:+,.0f} 萬元<extra></extra>',
+  };
+
+  Plotly.newPlot('bstats-total-chart', [...stockTraces, totalLine], {
+    ...PLY,
+    margin: { l: 65, r: 10, t: 8, b: 55 },
+    xaxis: { gridcolor: '#21262d', tickformat: '%m/%d', tickfont: { size: 9 } },
+    yaxis: {
+      gridcolor: '#21262d', zeroline: true, zerolinecolor: '#555', zerolinewidth: 1,
+      title: { text: '萬元', font: { size: 10 } },
+    },
+    legend: { orientation: 'h', y: -0.32, font: { size: 9 } },
+    showlegend: true, height: 280,
+  }, { responsive: true, displayModeBar: false });
 }
 
 function bstatsRenderTable() {
@@ -4784,7 +5322,7 @@ function bstatsRenderTable() {
 // ── Tab switch ─────────────────────────────────────────────────────────
 function switchTab(name) {
   // desktop tabs
-  const tabNames = ['single','compare','grade','broker','overview','snapshots','kline','chain','flow','indcap','deriv'];
+  const tabNames = ['single','compare','grade','broker','overview','snapshots','kline','chain','flow','indcap','deriv','winrank'];
   document.querySelectorAll('.tab').forEach((t, i) => {
     t.classList.toggle('active', tabNames[i] === name);
   });
@@ -4820,7 +5358,76 @@ function switchTab(name) {
   if (name === 'flow') flowInit();
   if (name === 'indcap') icapInit();
   if (name === 'deriv') derivInit();
+  if (name === 'winrank') winrankInit();
   setTimeout(() => Plotly.Plots.resize(), 80);
+}
+
+// ── 分點全能排行 ────────────────────────────────────────────────────────
+let _winrankLoaded = false;
+function winrankInit() {
+  if (!_winrankLoaded) winrankLoad();
+}
+async function winrankLoad() {
+  const el = document.getElementById('winrank-content');
+  el.innerHTML = '<div class="empty">載入中…</div>';
+  try {
+    const res = await fetch('/api/broker_win_ranking');
+    if (!res.ok) {
+      const err = await res.json().catch(()=>({}));
+      el.innerHTML = `<div class="empty" style="color:var(--red)">${err.detail||'載入失敗，請先執行 broker_win_rate_screener.py'}</div>`;
+      return;
+    }
+    const d = await res.json();
+    _winrankLoaded = true;
+    const ts = d.updated ? new Date(d.updated*1000).toLocaleString('zh-TW') : '';
+    document.getElementById('winrank-updated').textContent = ts ? `計算時間：${ts}` : '';
+    const ra = d.recent_activity || {};
+
+    const rows = d.data.map((r, i) => {
+      const acts = (ra[r.bid]||[]).map(a=>`<span class="tag" style="cursor:pointer" onclick="goSingleStock('${a.sid}')">${a.sid} +${a.net}張</span>`).join(' ');
+      const wr15Color = r.wr15 >= 80 ? '#f85149' : r.wr15 >= 70 ? '#e3b341' : 'var(--mut)';
+      const wr60Color = r.wr60 >= 85 ? '#f85149' : r.wr60 >= 75 ? '#e3b341' : 'var(--mut)';
+      return `<tr>
+        <td style="color:var(--mut);text-align:center">${i+1}</td>
+        <td><b>${r.bid}</b> <span style="color:var(--mut)">${r.name}</span></td>
+        <td style="text-align:center;color:${wr15Color};font-weight:700">${r.wr15}%</td>
+        <td style="text-align:center;color:#3fb950">${r.avg15>=0?'+':''}${r.avg15}%</td>
+        <td style="text-align:center;color:${wr60Color};font-weight:700">${r.wr60}%</td>
+        <td style="text-align:center;color:#3fb950">${r.avg60>=0?'+':''}${r.avg60}%</td>
+        <td style="text-align:center;font-weight:700;color:var(--acc)">${r.score}</td>
+        <td style="font-size:11px">${acts||'<span style="color:var(--mut)">—</span>'}</td>
+      </tr>`;
+    }).join('');
+
+    el.innerHTML = `
+      <table class="ctable" style="width:100%;min-width:700px">
+        <thead><tr style="position:sticky;top:0;background:var(--sur2)">
+          <th style="width:40px">#</th>
+          <th>分點</th>
+          <th title="滾動10天累積+15天觀察">15天勝率</th>
+          <th>15天報酬</th>
+          <th title="首次進場後60個交易日報酬">60天勝率</th>
+          <th>60天報酬</th>
+          <th>複合分</th>
+          <th>近10日買超股票</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="margin-top:16px;padding:10px 14px;background:var(--sur2);border-radius:8px;font-size:11px;color:var(--mut)">
+        ⚠️ 本排行基於歷史資料回測，<b>不構成投資建議</b>。
+        60天版進場點集中在今年3月低點，高報酬部分受大盤反彈影響。
+        建議觀察「15天勝率高 + 60天報酬高 + 近期仍在買超」的分點。
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function goSingleStock(sid) {
+  document.getElementById('search').value = sid;
+  filterStocks('sidebar');
+  switchTab('single');
+  setTimeout(()=>loadSingleStock(sid), 200);
 }
 
 // ── 分點籌碼 ──────────────────────────────────────────────────────────
@@ -4832,7 +5439,7 @@ let _traderSubMode = 'today';
 
 function setBrokerMode(mode) {
   _brokerMode = mode;
-  ['stock','trader','timeline'].forEach(m => {
+  ['stock','trader','timeline','winrate'].forEach(m => {
     document.getElementById('bmode-'+m).classList.toggle('active', m === mode);
     document.getElementById('broker-ctrl-'+m).style.display = m === mode ? 'flex' : 'none';
   });
@@ -4842,12 +5449,223 @@ function setBrokerMode(mode) {
   document.getElementById('broker-timeline-wrap').style.display = 'none';
   document.getElementById('broker-timeline-wrap').innerHTML = '';
   document.getElementById('broker-chip-chart-wrap').style.display = 'none';
+  document.getElementById('broker-winrate-wrap').style.display = 'none';
+  document.getElementById('broker-composite-wrap').style.display = 'none';
   if (mode === 'timeline') {
     const end = new Date(); end.setDate(end.getDate() - 1);
     const start = new Date(end); start.setDate(start.getDate() - 55);
     document.getElementById('tl-end').value   = end.toISOString().slice(0,10);
     document.getElementById('tl-start').value = start.toISOString().slice(0,10);
   }
+  if (mode === 'winrate') winRateLoad();
+}
+
+// ── 勝率排行 ───────────────────────────────────────────────────────────
+let _wrDays = 20;
+let _wrExcludeEtf = 0;
+
+function wrSetDays(d) {
+  _wrDays = d;
+  [10,20,40,60].forEach(n => {
+    const btn = document.getElementById('wr-d'+n);
+    if (btn) btn.classList.toggle('active', n === d);
+  });
+}
+
+function wrSetEtf(excl) {
+  _wrExcludeEtf = excl;
+  document.getElementById('wr-etf-all') .classList.toggle('active', excl === 0);
+  document.getElementById('wr-etf-excl').classList.toggle('active', excl === 1);
+}
+
+async function winRateLoad() {
+  const minPos = document.getElementById('wr-min-pos').value;
+  const wrap   = document.getElementById('broker-winrate-wrap');
+  wrap.style.display = 'flex';
+  wrap.innerHTML = '<div class="loading" style="padding:30px"><div class="spinner"></div><span>計算中，首次載入需 30–60 秒（抓取收盤價）…</span></div>';
+  document.getElementById('wr-status').textContent = '載入中…';
+  try {
+    const url = `/api/broker_win_rate?days=${_wrDays}&min_pos=${minPos}&exclude_etf=${_wrExcludeEtf}`;
+    const res = await fetch(url);
+    const d   = await res.json();
+    if (!res.ok) { wrap.innerHTML = `<div class="empty" style="color:var(--red)">${d.detail||'載入失敗'}</div>`; return; }
+    const etfTag = d.exclude_etf ? '（不含ETF）' : '（含ETF）';
+    document.getElementById('wr-status').textContent =
+      `共 ${d.total} 個分點 ｜ ${d.stock_count} 支股票 ｜ 觀察期 ${d.period_days} 天 ${etfTag}`;
+    winRateRender(d);
+  } catch(e) {
+    wrap.innerHTML = `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function winRateRender(d) {
+  const wrap = document.getElementById('broker-winrate-wrap');
+  if (!d.brokers || !d.brokers.length) {
+    wrap.innerHTML = '<div class="empty">查無資料，請調低「最少持股數」或增加觀察天數</div>';
+    return;
+  }
+  const rows = d.brokers.map((b, i) => {
+    const wr  = b.win_rate;
+    const wrC = wr >= 60 ? '#22c55e' : wr >= 50 ? '#eab308' : '#ef4444';
+    const retC = b.avg_return > 0 ? '#ef4444' : b.avg_return < 0 ? '#22c55e' : 'var(--mut)';
+    const barW = Math.round(wr);
+    return `<tr style="border-bottom:1px solid var(--bor)">
+      <td style="padding:5px 8px;font-size:11px;color:var(--mut);text-align:center">${i+1}</td>
+      <td style="padding:5px 8px;font-size:11px;font-family:monospace;color:var(--mut)">${b.broker_id}</td>
+      <td style="padding:5px 8px;font-size:12px;font-weight:600">${b.broker_name}</td>
+      <td style="padding:5px 10px;min-width:130px">
+        <div style="display:flex;align-items:center;gap:5px">
+          <div style="flex:1;height:6px;background:var(--bor);border-radius:3px;overflow:hidden">
+            <div style="width:${barW}%;height:100%;background:${wrC};border-radius:3px"></div>
+          </div>
+          <span style="font-size:12px;font-weight:700;color:${wrC};min-width:42px;text-align:right">${wr}%</span>
+        </div>
+      </td>
+      <td style="padding:5px 8px;font-size:11px;text-align:center">
+        <span style="color:#22c55e">${b.wins}</span>
+        <span style="color:var(--mut)"> / </span>
+        <span style="color:#ef4444">${b.losses}</span>
+        <span style="color:var(--mut);font-size:10px"> (${b.total_pos})</span>
+      </td>
+      <td style="padding:5px 8px;font-size:12px;text-align:right;color:${retC};font-weight:600">
+        ${b.avg_return > 0 ? '+' : ''}${b.avg_return}%
+      </td>
+      <td style="padding:5px 8px;font-size:11px;text-align:right;color:var(--mut)">
+        ${b.total_lots.toLocaleString()}
+      </td>
+    </tr>`;
+  }).join('');
+
+  wrap.innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead>
+        <tr style="border-bottom:2px solid var(--bor);background:var(--sur2)">
+          <th style="padding:6px 8px;text-align:center;color:var(--mut);font-size:11px">#</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--mut);font-size:11px">代號</th>
+          <th style="padding:6px 8px;text-align:left">分點名稱</th>
+          <th style="padding:6px 10px;text-align:left">勝率</th>
+          <th style="padding:6px 8px;text-align:center">勝 / 負（總）</th>
+          <th style="padding:6px 8px;text-align:right">平均報酬</th>
+          <th style="padding:6px 8px;text-align:right;color:var(--mut);font-size:11px">持倉張數</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+// ── 勝率排行・綜合走勢 ────────────────────────────────────────────────
+async function winRateCompositeLoad() {
+  const minPos = document.getElementById('wr-min-pos').value;
+  const compWrap = document.getElementById('broker-composite-wrap');
+  compWrap.style.display = 'flex';
+  document.getElementById('broker-composite-chart').innerHTML =
+    '<div class="loading" style="padding:20px"><div class="spinner"></div><span>載入中（已有快取則瞬間完成）…</span></div>';
+  document.getElementById('broker-composite-stocks').innerHTML = '';
+
+  try {
+    const url = `/api/broker_win_rate_composite?days=${_wrDays}&min_pos=${minPos}&exclude_etf=${_wrExcludeEtf}&top_n=100`;
+    const res  = await fetch(url);
+    const d    = await res.json();
+    if (!res.ok) {
+      document.getElementById('broker-composite-chart').innerHTML =
+        `<div class="empty" style="color:var(--red)">${d.detail||'載入失敗'}</div>`;
+      return;
+    }
+    const etfTag = d.exclude_etf ? '（不含ETF）' : '';
+    document.getElementById('wr-comp-title').textContent =
+      `勝率前${d.broker_count}分點 ${etfTag} ・ 每日持倉增減（柱狀）＋ 累積合計（白線）`;
+    winRateCompositeRender(d);
+  } catch(e) {
+    document.getElementById('broker-composite-chart').innerHTML =
+      `<div class="empty" style="color:var(--red)">錯誤：${e.message}</div>`;
+  }
+}
+
+function winRateCompositeRender(d) {
+  if (!d.dates || !d.dates.length || !d.series || !d.series.length) {
+    document.getElementById('broker-composite-chart').innerHTML = '<div class="empty">查無資料</div>';
+    return;
+  }
+
+  const colors = [
+    '#ef4444','#f97316','#eab308','#22c55e','#06b6d4',
+    '#3b82f6','#a855f7','#ec4899','#14b8a6','#84cc16',
+    '#0ea5e9','#8b5cf6','#d946ef','#fb923c','#a3e635',
+    '#f43f5e','#14b8a6','#fbbf24','#34d399','#60a5fa',
+  ];
+
+  // 排名越前的線越粗越不透明，後段線細且半透明
+  const traces = d.series.map((s, i) => {
+    const rank   = i + 1;
+    const width  = rank <= 3 ? 3.5 : rank <= 6 ? 2.5 : rank <= 10 ? 1.8 : 1.0;
+    const opacity= rank <= 3 ? 1.0 : rank <= 6 ? 0.85 : rank <= 10 ? 0.65 : 0.4;
+    const mode   = rank <= 5 ? 'lines+markers' : 'lines';
+    const msize  = rank <= 3 ? 5 : 3;
+    const label  = rank <= 10
+      ? `<b>${rank}. ${s.stock_id} ${s.stock_name}</b>`
+      : `${s.stock_id} ${s.stock_name}`;
+    return {
+      type: 'scatter', mode,
+      name: label,
+      x: d.dates, y: s.cum_net,
+      opacity,
+      line:   { color: colors[i % colors.length], width },
+      marker: { color: colors[i % colors.length], size: msize },
+      hovertemplate: `${s.stock_id} ${s.stock_name}<br>%{x}<br>累積持倉: %{y:+,.0f} 張<extra></extra>`,
+    };
+  });
+
+  // 計算 Y 軸合適步進（讓畫面分成約 10–12 格）
+  const allVals  = d.series.flatMap(s => s.cum_net);
+  const yMax     = Math.max(...allVals, 0);
+  const yMin     = Math.min(...allVals, 0);
+  const yRange   = yMax - yMin || 1;
+  const rawStep  = yRange / 10;
+  // round step to a nice number: 1/2/5 × 10^n
+  const mag      = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const niceStep = rawStep / mag <= 1.5 ? mag
+                 : rawStep / mag <= 3.5 ? 2 * mag
+                 : rawStep / mag <= 7.5 ? 5 * mag : 10 * mag;
+  const pad      = niceStep * 0.5;
+
+  Plotly.newPlot('broker-composite-chart', traces, {
+    ...PLY,
+    margin: { l: 75, r: 10, t: 8, b: 65 },
+    xaxis: {
+      gridcolor: '#21262d', tickformat: '%m/%d', tickfont: { size: 9 },
+      dtick: Math.ceil(d.dates.length / 12) > 1
+             ? `${Math.ceil(d.dates.length / 12)}` : undefined,
+    },
+    yaxis: {
+      gridcolor: '#30363d',
+      zeroline: true, zerolinecolor: '#666', zerolinewidth: 1.5,
+      title: { text: '累積持倉（張）', font: { size: 10 } },
+      dtick:  niceStep,
+      range:  [yMin - pad, yMax + pad],
+      tickformat: ',.0f',
+      tickfont: { size: 9 },
+    },
+    legend: { orientation: 'h', y: -0.22, font: { size: 9 },
+              itemwidth: 90, traceorder: 'normal' },
+    showlegend: true, height: 520,
+  }, { responsive: true, displayModeBar: false });
+
+  // 持股摘要（期末持倉，正=買超/紅，負=賣超/綠）
+  const items = d.series.map(s => {
+    const c    = s.final_net > 0 ? '#ef4444' : s.final_net < 0 ? '#22c55e' : 'var(--mut)';
+    const sign = s.final_net > 0 ? '+' : '';
+    return `<span style="margin:2px 8px 2px 0;display:inline-block;white-space:nowrap">
+      <a href="#" onclick="loadSingle('${s.stock_id}');switchTab('single');return false"
+         style="color:var(--acc);text-decoration:none;font-weight:600">${s.stock_id}</a>
+      <span style="color:var(--txt);font-size:11px">${s.stock_name}</span>
+      <span style="color:${c};font-weight:700">${sign}${s.final_net.toLocaleString()}</span>
+      <span style="color:var(--mut);font-size:10px">張</span>
+    </span>`;
+  }).join('');
+  document.getElementById('broker-composite-stocks').innerHTML =
+    `<div style="margin-top:4px;line-height:1.8">
+       <span style="color:var(--mut);font-size:11px;margin-right:6px">期末持倉前${d.series.length}名：</span>${items}
+     </div>`;
 }
 
 function tlSetPreset(id) {
