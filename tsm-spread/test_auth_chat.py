@@ -17,6 +17,8 @@ os.environ["BOT_WEBHOOK_URL"] = "https://bot.example/hook"
 os.environ["BOT_WEBHOOK_KEY"] = "wh-key"
 os.environ["KV_REST_API_URL"] = "https://kv.example"
 os.environ["KV_REST_API_TOKEN"] = "kv-token"
+os.environ.pop("UPSTASH_REDIS_REST_URL", None)
+os.environ.pop("UPSTASH_REDIS_REST_TOKEN", None)
 os.environ.pop("BOT_WEBHOOK_KEY_HEADER", None)
 os.environ.pop("BOT_WEBHOOK_KEY_TEMPLATE", None)
 
@@ -81,6 +83,8 @@ class AuthChatTests(unittest.TestCase):
         os.environ["BOT_WEBHOOK_KEY"] = "wh-key"
         os.environ["KV_REST_API_URL"] = "https://kv.example"
         os.environ["KV_REST_API_TOKEN"] = "kv-token"
+        os.environ.pop("UPSTASH_REDIS_REST_URL", None)
+        os.environ.pop("UPSTASH_REDIS_REST_TOKEN", None)
         os.environ.pop("BOT_WEBHOOK_KEY_HEADER", None)
         os.environ.pop("BOT_WEBHOOK_KEY_TEMPLATE", None)
         self.redis = MemoryRedis()
@@ -319,13 +323,19 @@ class AuthChatTests(unittest.TestCase):
     def test_missing_redis_or_webhook_does_not_store_or_send(self):
         self._login()
         os.environ["KV_REST_API_URL"] = ""
+        os.environ["KV_REST_API_TOKEN"] = ""
+        os.environ.pop("UPSTASH_REDIS_REST_URL", None)
+        os.environ.pop("UPSTASH_REDIS_REST_TOKEN", None)
         response = self._post("/api/chat/send", json={"text": "hi"})
         self.assertEqual(response.status_code, 503)
-        self.assertIn("KV_REST_API_URL", response.get_json()["error"])
+        error = response.get_json()["error"]
+        self.assertIn("KV_REST_API_URL", error)
+        self.assertIn("UPSTASH_REDIS_REST_URL", error)
         self.assertEqual(self.redis.lists, {})
         self.assertEqual(self.webhooks, [])
 
         os.environ["KV_REST_API_URL"] = "https://kv.example"
+        os.environ["KV_REST_API_TOKEN"] = "kv-token"
         os.environ["BOT_WEBHOOK_URL"] = ""
         response = self._post("/api/chat/send", json={"text": "hi"})
         self.assertEqual(response.status_code, 503)
@@ -432,6 +442,42 @@ class AuthChatTests(unittest.TestCase):
         self.assertEqual(seen["headers"]["Authorization"], "Bearer kv-token")
         self.assertNotIn("kv-token", seen["url"])
         self.assertEqual(seen["json"], [["LRANGE", "chat:sess:" + "d" * 32, 0, -1]])
+
+    def test_redis_falls_back_to_upstash_rest_env(self):
+        seen = {}
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return [{"result": []}]
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            seen["url"] = url
+            seen["headers"] = headers
+            seen["json"] = json
+            return Resp()
+
+        os.environ.pop("KV_REST_API_URL", None)
+        os.environ.pop("KV_REST_API_TOKEN", None)
+        os.environ["UPSTASH_REDIS_REST_URL"] = "https://upstash.example/"
+        os.environ["UPSTASH_REDIS_REST_TOKEN"] = "upstash-token"
+        self.pipeline_patch.stop()
+        try:
+            with patch("chat_store.requests.post", fake_post):
+                self.assertEqual(chat_store.load_messages("e" * 32), [])
+            self.assertEqual(seen["url"], "https://upstash.example/pipeline")
+            self.assertEqual(seen["headers"]["Authorization"], "Bearer upstash-token")
+            self.assertEqual(seen["json"], [["LRANGE", "chat:sess:" + "e" * 32, 0, -1]])
+
+            os.environ["KV_REST_API_URL"] = "https://kv.example"
+            os.environ["KV_REST_API_TOKEN"] = "kv-token"
+            with patch("chat_store.requests.post", fake_post):
+                self.assertEqual(chat_store.load_messages("e" * 32), [])
+            self.assertEqual(seen["url"], "https://kv.example/pipeline")
+            self.assertEqual(seen["headers"]["Authorization"], "Bearer kv-token")
+        finally:
+            self.pipeline_patch.start()
 
     def test_constant_time_compare_and_secure_default(self):
         self.assertTrue(auth.ct_equal("same", "same"))
