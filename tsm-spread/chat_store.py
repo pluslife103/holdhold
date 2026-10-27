@@ -1,13 +1,14 @@
 """Chat transcripts in Upstash Redis (REST) and the outbound bot webhook.
 
 Portfolio snapshots are not read here. deliver_to_bot() is the only function
-that calls the bot webhook, and it forwards only session_id, message_id,
-text, and history.
+that calls the bot webhook, and it forwards session_id, message_id, text,
+history, and the selected target (key plus display label).
 """
 
 import json
 import os
 import re
+import unicodedata
 import uuid
 from urllib.parse import urlparse
 
@@ -18,7 +19,19 @@ HISTORY_LIMIT = 10
 MAX_STORED_MESSAGES = 200
 MAX_USER_TEXT = 4000
 MAX_REPLY_TEXT = 20000
+MAX_FROM_LEN = 30
 KEY_PREFIX = "chat:sess:"
+DEFAULT_TARGET = "bot"
+# Fixed whitelist. The key is stored and forwarded; the value is display-only.
+TARGETS = {
+    "bot": "雞雞人",
+    "media": "自媒體研究社",
+    "industry": "產業研究員",
+    "gubyen": "股癌逐字稿",
+    "holdings": "股市-持股監督者",
+    "advisor": "投顧研究專員",
+    "entry": "股市-進場專員",
+}
 _REDIS_UNSET = (
     "聊天儲存未設定：請設定 KV_REST_API_URL 與 KV_REST_API_TOKEN，"
     "或 UPSTASH_REDIS_REST_URL 與 UPSTASH_REDIS_REST_TOKEN。"
@@ -39,9 +52,36 @@ def valid_id(value) -> bool:
 def _redis_pair(url_name: str, token_name: str):
     url = os.environ.get(url_name, "").strip().rstrip("/")
     token = os.environ.get(token_name, "").strip()
+    if url and "://" not in url:
+        url = "https://" + url
     if url and token:
         return url, token
     return None
+
+
+def resolve_target(value):
+    """Return (key, label). A missing target uses the default; anything else must be a whitelist key."""
+    if value is None:
+        return DEFAULT_TARGET, TARGETS[DEFAULT_TARGET]
+    if not isinstance(value, str) or value not in TARGETS:
+        raise ValueError("target 不正確")
+    return value, TARGETS[value]
+
+
+def clean_from(value):
+    """Optional display name on a bot reply. Not used for authentication.
+
+    Control characters are removed, then the text is cut to MAX_FROM_LEN.
+    Missing or blank values return None.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("from 必須是字串")
+    cleaned = "".join(ch for ch in value if unicodedata.category(ch) != "Cc").strip()
+    if not cleaned:
+        return None
+    return cleaned[:MAX_FROM_LEN]
 
 
 def redis_config():
@@ -80,7 +120,7 @@ def _pipeline(commands: list) -> list:
             timeout=8,
         )
     except requests.RequestException as exc:
-        raise RuntimeError("無法連上 Redis。") from exc
+        raise RuntimeError(f"無法連上 Redis（{type(exc).__name__}）。") from exc
     if resp.status_code >= 400:
         raise RuntimeError(f"Redis HTTP {resp.status_code}")
     try:
@@ -175,6 +215,12 @@ def public_message(message: dict) -> dict:
     reply_to = message.get("reply_to")
     if isinstance(reply_to, str):
         item["reply_to"] = reply_to
+    target = message.get("target")
+    if isinstance(target, str) and target in TARGETS:
+        item["target"] = target
+    sender = message.get("from")
+    if isinstance(sender, str) and sender:
+        item["from"] = sender
     return item
 
 
@@ -229,12 +275,14 @@ def deliver_to_bot(payload: dict) -> None:
     """POST one chat turn to BOT_WEBHOOK_URL.
 
     This is the only webhook call site. The body is rebuilt so only
-    session_id, message_id, text, and the last ~10 history turns are sent.
+    session_id, message_id, text, target, target_label, and the last
+    ~10 history turns are sent. target_label always comes from TARGETS.
     """
     url, headers = _webhook_settings()
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         raise RuntimeError("webhook 缺少 text。")
+    target, target_label = resolve_target(payload.get("target"))
     # Rebuild history so a caller cannot attach extra fields (for example
     # portfolio data) or more than HISTORY_LIMIT turns.
     normalized = []
@@ -251,6 +299,8 @@ def deliver_to_bot(payload: dict) -> None:
         "message_id": payload.get("message_id"),
         "text": text.strip(),
         "history": recent_history(normalized, HISTORY_LIMIT),
+        "target": target,
+        "target_label": target_label,
     }
     try:
         resp = requests.post(

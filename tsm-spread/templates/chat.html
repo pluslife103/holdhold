@@ -103,15 +103,29 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .bubble-wrap {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      max-width: 100%;
+    }
+    .bubble-wrap.user { align-items: flex-end; }
+    .bubble-wrap.assistant { align-items: flex-start; }
     .bubble.user {
-      align-self: flex-end;
       background: rgba(59,130,246,.2);
       border: 1px solid rgba(59,130,246,.35);
     }
     .bubble.assistant {
-      align-self: flex-start;
       background: var(--surface);
       border: 1px solid var(--border);
+    }
+    .tag {
+      font-size: 0.7rem;
+      line-height: 1.35;
+      color: var(--muted);
+      margin: 0 4px 3px;
+      max-width: min(85%, 560px);
+      word-break: break-word;
     }
     .meta { font-size: 0.7rem; color: var(--muted); margin-top: 4px; }
     .typing, .notice {
@@ -145,15 +159,47 @@
     .composer {
       flex: 0 0 auto;
       display: flex;
+      flex-direction: column;
       gap: 8px;
-      align-items: flex-end;
-      padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+      padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
       border-top: 1px solid var(--border);
       background: var(--surface);
       position: sticky;
       bottom: 0;
       z-index: 2;
     }
+    .composer-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+    .target-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .target-label {
+      flex: 0 0 auto;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .target-row select {
+      flex: 1 1 auto;
+      min-width: 0;
+      width: 100%;
+      height: 36px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 0 10px;
+      font-size: 0.92rem;
+      font-family: inherit;
+      outline: none;
+    }
+    .target-row select:focus { border-color: var(--accent); }
     textarea {
       flex: 1;
       resize: none;
@@ -186,7 +232,9 @@
       .subtitle { display: none; }
       .logo-icon { width: 32px; height: 32px; font-size: 16px; }
       .link, .btn-ghost, .btn-send { padding: 7px 10px; }
-      .bubble { max-width: 92%; }
+      .bubble, .tag { max-width: 92%; }
+      .composer { padding: 8px 12px calc(10px + env(safe-area-inset-bottom)); }
+      .target-row select { font-size: 1rem; height: 40px; }
     }
   </style>
 </head>
@@ -213,8 +261,18 @@
       <div class="empty" id="empty">輸入訊息後會轉送給你的 bot。<br>這裡只送出你打的字和最近的對話，不會讀取持倉。</div>
     </div>
     <form class="composer" id="composer">
-      <textarea id="input" rows="1" maxlength="4000" placeholder="輸入訊息，Enter 送出"></textarea>
-      <button class="btn-send" id="sendBtn" type="submit">送出</button>
+      <label class="target-row">
+        <span class="target-label">對象</span>
+        <select id="target">
+          {% for key, label in targets.items() %}
+          <option value="{{ key }}" {% if key == default_target %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="composer-row">
+        <textarea id="input" rows="1" maxlength="4000" placeholder="輸入訊息，Enter 送出"></textarea>
+        <button class="btn-send" id="sendBtn" type="submit">送出</button>
+      </div>
     </form>
   </div>
   <script>
@@ -225,6 +283,36 @@
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('sendBtn');
     const banner = document.getElementById('banner');
+    const targetSelect = document.getElementById('target');
+    const TARGET_STORAGE = 'chat_target';
+
+    function targetLabel(key) {
+      const options = targetSelect.options;
+      for (let i = 0; i < options.length; i++) {
+        if (options[i].value === key) return options[i].textContent;
+      }
+      return options.length ? options[0].textContent : '';
+    }
+
+    function restoreTarget() {
+      let saved = '';
+      try { saved = localStorage.getItem(TARGET_STORAGE) || ''; }
+      catch (e) { saved = ''; }
+      let known = false;
+      for (let i = 0; i < targetSelect.options.length; i++) {
+        if (targetSelect.options[i].value === saved) { known = true; break; }
+      }
+      if (known) targetSelect.value = saved;
+      else if (targetSelect.options.length) targetSelect.value = targetSelect.options[0].value;
+      try { localStorage.setItem(TARGET_STORAGE, targetSelect.value); }
+      catch (e) {}
+    }
+
+    targetSelect.addEventListener('change', () => {
+      try { localStorage.setItem(TARGET_STORAGE, targetSelect.value); }
+      catch (e) {}
+    });
+    restoreTarget();
 
     let sessionId = null;
     let lastId = '';
@@ -259,6 +347,19 @@
       known.add(message.id);
       lastId = message.id;
       hideEmpty();
+      const wrap = document.createElement('div');
+      wrap.className = 'bubble-wrap ' + (message.role === 'user' ? 'user' : 'assistant');
+      if (message.role === 'user') {
+        const tag = document.createElement('div');
+        tag.className = 'tag';
+        tag.textContent = '→ ' + targetLabel(message.target);
+        wrap.appendChild(tag);
+      } else if (message.from) {
+        const tag = document.createElement('div');
+        tag.className = 'tag';
+        tag.textContent = '來自 ' + message.from;
+        wrap.appendChild(tag);
+      }
       const el = document.createElement('div');
       el.className = 'bubble ' + (message.role === 'user' ? 'user' : 'assistant');
       el.dataset.id = message.id;
@@ -269,7 +370,8 @@
         meta.textContent = new Date(message.ts * 1000).toLocaleString('zh-TW', { hour12: false });
         el.appendChild(meta);
       }
-      thread.appendChild(el);
+      wrap.appendChild(el);
+      thread.appendChild(wrap);
       scrollDown(forceScroll);
     }
 
@@ -386,7 +488,8 @@
 
     async function sendText(text) {
       hideBanner();
-      const body = { text: text };
+      const target = targetSelect.value;
+      const body = { text: text, target: target };
       if (sessionId) body.session_id = sessionId;
       const res = await fetch('/api/chat/send', {
         method: 'POST',
@@ -397,7 +500,7 @@
       const data = await readJson(res);
       if (data.session_id) sessionId = data.session_id;
       if (data.message_id) {
-        addBubble({ id: data.message_id, role: 'user', text: text, ts: Math.floor(Date.now() / 1000) }, true);
+        addBubble({ id: data.message_id, role: 'user', text: text, ts: Math.floor(Date.now() / 1000), target: target }, true);
       }
       if (!res.ok) {
         showBanner(data.error || '送出失敗');
