@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>聊天</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #05070f;
+      --surface: #0e1425;
+      --surface2: #151d35;
+      --border: #1e2d50;
+      --text: #e2e8f0;
+      --muted: #7a8ba8;
+      --accent: #3b82f6;
+      --green: #22c55e;
+      --red: #ef4444;
+      --gold: #f59e0b;
+    }
+    html, body { height: 100%; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      height: 100dvh;
+      max-height: 100dvh;
+      max-width: 860px;
+      margin: 0 auto;
+      overflow: hidden;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .logo-icon {
+      width: 36px; height: 36px; flex-shrink: 0;
+      background: linear-gradient(135deg, #a78bfa, #3b82f6);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    h1 { font-size: 1.05rem; font-weight: 700; }
+    .subtitle { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+    .header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .link, .btn-ghost, .btn-send {
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .link {
+      background: rgba(59,130,246,.15);
+      color: #93c5fd;
+      border: 1px solid rgba(59,130,246,.3);
+    }
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    form { margin: 0; }
+    .thread {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 16px 14px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .empty {
+      margin: auto;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.7;
+      max-width: 360px;
+      padding: 24px 8px;
+    }
+    .bubble {
+      max-width: min(85%, 560px);
+      padding: 10px 12px;
+      border-radius: 14px;
+      font-size: 0.92rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: rgba(59,130,246,.2);
+      border: 1px solid rgba(59,130,246,.35);
+    }
+    .bubble.assistant {
+      align-self: flex-start;
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    .meta { font-size: 0.7rem; color: var(--muted); margin-top: 4px; }
+    .typing, .notice {
+      align-self: flex-start;
+      color: var(--muted);
+      font-size: 0.84rem;
+      padding: 4px 2px 8px;
+    }
+    .typing::after {
+      content: "";
+      display: inline-block;
+      width: 8px; height: 8px;
+      margin-left: 6px;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      animation: spin .7s linear infinite;
+      vertical-align: -1px;
+    }
+    .notice { color: var(--gold); }
+    .banner {
+      margin: 8px 14px 0;
+      background: rgba(239,68,68,.12);
+      color: #fca5a5;
+      border: 1px solid rgba(239,68,68,.3);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 0.84rem;
+      line-height: 1.5;
+    }
+    .composer {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+      padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      position: sticky;
+      bottom: 0;
+      z-index: 2;
+    }
+    textarea {
+      flex: 1;
+      resize: none;
+      min-height: 44px;
+      max-height: 140px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 11px 12px;
+      font-size: 1rem;
+      font-family: inherit;
+      line-height: 1.4;
+      outline: none;
+    }
+    textarea:focus { border-color: var(--accent); }
+    .btn-send {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      height: 44px;
+      padding: 0 16px;
+      flex-shrink: 0;
+    }
+    .btn-send:disabled { opacity: 0.5; cursor: wait; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 600px) {
+      header { padding: 10px 12px; }
+      h1 { font-size: 0.95rem; }
+      .subtitle { display: none; }
+      .logo-icon { width: 32px; height: 32px; font-size: 16px; }
+      .link, .btn-ghost, .btn-send { padding: 7px 10px; }
+      .bubble { max-width: 92%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="logo">
+        <div class="logo-icon">💬</div>
+        <div>
+          <h1>聊天</h1>
+          <div class="subtitle">訊息會轉給你的 bot，回覆再顯示在這裡</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <button type="button" class="btn-ghost" id="newBtn">新對話</button>
+        <a class="link" href="/">主頁</a>
+        <form method="post" action="/logout">
+          <button type="submit" class="btn-ghost">登出</button>
+        </form>
+      </div>
+    </header>
+    <div id="banner" class="banner" style="display:none"></div>
+    <div class="thread" id="thread">
+      <div class="empty" id="empty">輸入訊息後會轉送給你的 bot。<br>這裡只送出你打的字和最近的對話，不會讀取持倉。</div>
+    </div>
+    <form class="composer" id="composer">
+      <textarea id="input" rows="1" maxlength="4000" placeholder="輸入訊息，Enter 送出"></textarea>
+      <button class="btn-send" id="sendBtn" type="submit">送出</button>
+    </form>
+  </div>
+  <script>
+    const POLL_MS = 2500;
+    const TIMEOUT_MS = 3 * 60 * 1000;
+
+    const thread = document.getElementById('thread');
+    const input = document.getElementById('input');
+    const sendBtn = document.getElementById('sendBtn');
+    const banner = document.getElementById('banner');
+
+    let sessionId = null;
+    let lastId = '';
+    let known = new Set();
+    let pending = new Map();
+    let pollTimer = null;
+    let sending = false;
+
+    function showBanner(text) {
+      banner.style.display = 'block';
+      banner.textContent = text;
+    }
+    function hideBanner() {
+      banner.style.display = 'none';
+      banner.textContent = '';
+    }
+
+    function nearBottom() {
+      return thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+    }
+    function scrollDown(force) {
+      if (force || nearBottom()) thread.scrollTop = thread.scrollHeight;
+    }
+
+    function hideEmpty() {
+      const el = document.getElementById('empty');
+      if (el) el.remove();
+    }
+
+    function addBubble(message, forceScroll) {
+      if (!message || !message.id || known.has(message.id)) return;
+      known.add(message.id);
+      lastId = message.id;
+      hideEmpty();
+      const el = document.createElement('div');
+      el.className = 'bubble ' + (message.role === 'user' ? 'user' : 'assistant');
+      el.dataset.id = message.id;
+      el.textContent = message.text || '';
+      if (message.ts) {
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = new Date(message.ts * 1000).toLocaleString('zh-TW', { hour12: false });
+        el.appendChild(meta);
+      }
+      thread.appendChild(el);
+      scrollDown(forceScroll);
+    }
+
+    function typingEl(messageId) {
+      return document.getElementById('typing-' + messageId);
+    }
+
+    function showTyping(messageId) {
+      if (typingEl(messageId)) return;
+      hideEmpty();
+      const el = document.createElement('div');
+      el.className = 'typing';
+      el.id = 'typing-' + messageId;
+      el.textContent = '對方輸入中…';
+      thread.appendChild(el);
+      scrollDown(true);
+    }
+
+    function clearTyping(messageId) {
+      const el = typingEl(messageId);
+      if (el) el.remove();
+    }
+
+    function showTimeout(messageId) {
+      clearTyping(messageId);
+      const el = document.createElement('div');
+      el.className = 'notice';
+      el.textContent = '超過 3 分鐘還沒收到回覆。可以再傳一次，或稍後重整頁面。';
+      thread.appendChild(el);
+      scrollDown(true);
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(poll, POLL_MS);
+    }
+    function stopPollingIfIdle() {
+      if (pending.size === 0 && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function expectReply(messageId, waitMs) {
+      if (pending.has(messageId)) return;
+      showTyping(messageId);
+      const timer = setTimeout(() => {
+        if (!pending.has(messageId)) return;
+        pending.delete(messageId);
+        showTimeout(messageId);
+        stopPollingIfIdle();
+      }, waitMs);
+      pending.set(messageId, timer);
+      startPolling();
+    }
+
+    function resolveReply(messageId) {
+      const timer = pending.get(messageId);
+      if (!timer) return;
+      clearTimeout(timer);
+      pending.delete(messageId);
+      clearTyping(messageId);
+      stopPollingIfIdle();
+    }
+
+    async function readJson(res) {
+      try { return await res.json(); }
+      catch (e) { return {}; }
+    }
+
+    function goLogin() {
+      window.location.href = '/login?next=/chat';
+    }
+
+    async function loadHistory() {
+      if (!sessionId) return;
+      const res = await fetch('/api/chat/messages?session_id=' + encodeURIComponent(sessionId), { cache: 'no-store' });
+      if (res.status === 401) return goLogin();
+      const data = await readJson(res);
+      if (!res.ok) {
+        showBanner(data.error || '無法讀取對話');
+        return;
+      }
+      const messages = data.messages || [];
+      const replied = new Set(messages.filter(m => m.reply_to).map(m => m.reply_to));
+      messages.forEach(m => addBubble(m, false));
+      messages.forEach(m => {
+        if (m.role !== 'user' || replied.has(m.id) || !m.ts) return;
+        const age = Date.now() - m.ts * 1000;
+        if (age >= 0 && age < TIMEOUT_MS) expectReply(m.id, TIMEOUT_MS - age);
+      });
+      scrollDown(true);
+    }
+
+    async function poll() {
+      if (!sessionId || pending.size === 0) return;
+      const params = new URLSearchParams({ session_id: sessionId });
+      if (lastId) params.set('after', lastId);
+      let res;
+      try {
+        res = await fetch('/api/chat/messages?' + params.toString(), { cache: 'no-store' });
+      } catch (e) {
+        return;
+      }
+      if (res.status === 401) return goLogin();
+      if (!res.ok) return;
+      const data = await readJson(res);
+      (data.messages || []).forEach(m => {
+        addBubble(m, false);
+        if (m.role === 'assistant' && m.reply_to) resolveReply(m.reply_to);
+      });
+      scrollDown(false);
+    }
+
+    async function sendText(text) {
+      hideBanner();
+      const body = { text: text };
+      if (sessionId) body.session_id = sessionId;
+      const res = await fetch('/api/chat/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 401) return goLogin();
+      const data = await readJson(res);
+      if (data.session_id) sessionId = data.session_id;
+      if (data.message_id) {
+        addBubble({ id: data.message_id, role: 'user', text: text, ts: Math.floor(Date.now() / 1000) }, true);
+      }
+      if (!res.ok) {
+        showBanner(data.error || '送出失敗');
+        return;
+      }
+      expectReply(data.message_id, TIMEOUT_MS);
+    }
+
+    document.getElementById('composer').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text || sending) return;
+      sending = true;
+      sendBtn.disabled = true;
+      input.value = '';
+      try {
+        await sendText(text);
+      } catch (err) {
+        showBanner('網路錯誤，請再試一次');
+        input.value = text;
+      } finally {
+        sending = false;
+        sendBtn.disabled = false;
+        input.focus();
+      }
+    });
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const form = document.getElementById('composer');
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+      }
+    });
+
+    document.getElementById('newBtn').addEventListener('click', async () => {
+      const res = await fetch('/api/chat/new', { method: 'POST' });
+      if (res.status === 401) return goLogin();
+      const data = await readJson(res);
+      if (!res.ok || !data.session_id) {
+        showBanner(data.error || '無法開始新對話');
+        return;
+      }
+      pending.forEach(timer => clearTimeout(timer));
+      pending.clear();
+      stopPollingIfIdle();
+      known = new Set();
+      lastId = '';
+      sessionId = data.session_id;
+      thread.innerHTML = '';
+      const hint = document.createElement('div');
+      hint.className = 'empty';
+      hint.id = 'empty';
+      hint.textContent = '新的對話。輸入訊息後會轉送給你的 bot。';
+      thread.appendChild(hint);
+      hideBanner();
+      input.focus();
+    });
+
+    (async function boot() {
+      const res = await fetch('/api/chat/session', { cache: 'no-store' });
+      if (res.status === 401) return goLogin();
+      const data = await readJson(res);
+      if (data.session_id) {
+        sessionId = data.session_id;
+        await loadHistory();
+      }
+    })();
+  </script>
+</body>
+</html>
