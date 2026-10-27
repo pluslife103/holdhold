@@ -83,6 +83,14 @@
     }
     .tab-btn:hover { color: var(--text); }
     .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    a.tab-btn { text-decoration: none; }
+    .logout-form { margin: 0; }
+    .btn-logout {
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 7px 14px; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+    }
+    .btn-logout:hover { color: var(--text); }
 
     main { max-width: 1160px; margin: 0 auto; padding: 28px 20px 60px; }
 
@@ -197,6 +205,7 @@
       .tab-nav { padding: 0 4px; }
       #timestamp { display: none; }
       .header-right a { display: none; }
+      .header-right a.nav-keep { display: inline-block; }
     }
 
     /* ── POSITIONS TABLE ─────────────────────── */
@@ -479,6 +488,10 @@
   <div class="header-right">
     <a href="/bom" style="background:rgba(99,102,241,.15);color:#a5b4fc;border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:7px 14px;font-size:.82rem;font-weight:600;text-decoration:none;transition:background .15s" onmouseover="this.style.background='rgba(99,102,241,.28)'" onmouseout="this.style.background='rgba(99,102,241,.15)'">⬡ 經濟拆解</a>
     <a href="/ai" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);border-radius:8px;padding:7px 14px;font-size:.82rem;font-weight:600;text-decoration:none;transition:background .15s" onmouseover="this.style.background='rgba(16,185,129,.25)'" onmouseout="this.style.background='rgba(16,185,129,.12)'">🤖 AI 分析</a>
+    <a href="/chat" class="nav-keep" style="background:rgba(167,139,250,.15);color:#c4b5fd;border:1px solid rgba(167,139,250,.35);border-radius:8px;padding:7px 14px;font-size:.82rem;font-weight:600;text-decoration:none;">💬 聊天</a>
+    <form method="post" action="/logout" class="logout-form">
+      <button type="submit" class="btn-logout">登出</button>
+    </form>
     <span id="timestamp">— 載入中 —</span>
     <button class="btn-refresh" id="refreshBtn" onclick="onRefresh()">重新整理</button>
   </div>
@@ -489,6 +502,7 @@
   <button class="tab-btn" id="tab-btn-spread" onclick="switchTab('spread')">📈 折溢價</button>
   <button class="tab-btn" id="tab-btn-ai" onclick="switchTab('ai')">🤖 AI 分析</button>
   <button class="tab-btn" id="tab-btn-history" onclick="switchTab('history')">📋 紀錄</button>
+  <a class="tab-btn" href="/chat">💬 聊天</a>
 </nav>
 
 <main>

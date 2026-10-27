@@ -305,6 +305,9 @@ h1{font-size:1.4rem;font-weight:700}
 <div id="status" class="muted">載入中…</div>
 <div id="url-box" class="url-box" style="display:none"></div>
 <a id="open-btn" class="btn" style="display:none" href="#">開啟遠端桌面</a>
+<form method="post" action="/logout" style="margin:0">
+  <button type="submit" class="btn" style="background:transparent;color:#7a8ba8;border:1px solid #1e2d50">登出</button>
+</form>
 <div id="time" class="muted"></div>
 <script>
 fetch('/api/remote-url')
@@ -450,6 +453,14 @@ def ai_proxy():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# Login gate and chat relay. before_request covers the routes above as well.
+from auth import init_auth
+from chat import init_chat
+
+init_auth(app)
+init_chat(app)
 
 
 if __name__ == "__main__":
