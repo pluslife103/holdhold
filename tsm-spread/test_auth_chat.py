@@ -228,9 +228,14 @@ class AuthChatTests(unittest.TestCase):
         session_id = body["session_id"]
         message_id = body["message_id"]
         self.assertEqual(len(self.webhooks), 1)
-        self.assertEqual(set(self.webhooks[0]), {"session_id", "message_id", "text", "history"})
+        self.assertEqual(
+            set(self.webhooks[0]),
+            {"session_id", "message_id", "text", "history", "target", "target_label"},
+        )
         self.assertEqual(self.webhooks[0]["text"], "你好")
         self.assertEqual(self.webhooks[0]["history"], [])
+        self.assertEqual(self.webhooks[0]["target"], "bot")
+        self.assertEqual(self.webhooks[0]["target_label"], "雞雞人")
 
         outsider = app.test_client()
         missing = outsider.post(
@@ -386,7 +391,12 @@ class AuthChatTests(unittest.TestCase):
             self.assertEqual(captured["headers"]["Content-Type"], "application/json")
             self.assertEqual(captured["timeout"], 8)
             self.assertIs(captured["allow_redirects"], False)
-            self.assertEqual(set(captured["json"]), {"session_id", "message_id", "text", "history"})
+            self.assertEqual(
+                set(captured["json"]),
+                {"session_id", "message_id", "text", "history", "target", "target_label"},
+            )
+            self.assertEqual(captured["json"]["target"], "bot")
+            self.assertEqual(captured["json"]["target_label"], "雞雞人")
             self.assertEqual(captured["json"]["history"], [{
                 "message_id": "c" * 32,
                 "role": "user",
@@ -501,6 +511,216 @@ class AuthChatTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 503)
         self.assertIn("BOT_REPLY_SECRET", response.get_json()["error"])
+
+    def test_chat_target_defaults_rejects_unknown_and_labels_webhook(self):
+        self._login()
+        page = self._get("/chat").get_data(as_text=True)
+        self.assertIn('id="target"', page)
+        self.assertIn("localStorage", page)
+        self.assertIn("chat_target", page)
+        self.assertIn("來自 ", page)
+        for key, label in chat_store.TARGETS.items():
+            self.assertIn(f'value="{key}"', page)
+            self.assertIn(label, page)
+        self.assertEqual(next(iter(chat_store.TARGETS)), "bot")
+
+        sent = self._post("/api/chat/send", json={"text": "預設對象"})
+        self.assertEqual(sent.status_code, 200, sent.get_json())
+        self.assertEqual(self.webhooks[-1]["target"], "bot")
+        self.assertEqual(self.webhooks[-1]["target_label"], "雞雞人")
+        session_id = sent.get_json()["session_id"]
+        stored = json.loads(self.redis.lists["chat:sess:" + session_id][-1])
+        self.assertEqual(stored["target"], "bot")
+        listed = self._get(f"/api/chat/messages?session_id={session_id}")
+        self.assertEqual(listed.get_json()["messages"][0]["target"], "bot")
+
+        blank = self._post(
+            "/api/chat/send",
+            json={"text": "空白也是預設", "target": None, "session_id": session_id},
+        )
+        self.assertEqual(blank.status_code, 200, blank.get_json())
+        self.assertEqual(self.webhooks[-1]["target"], "bot")
+
+        for key, label in chat_store.TARGETS.items():
+            response = self._post(
+                "/api/chat/send",
+                json={"text": "送給" + label, "target": key, "session_id": session_id},
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            hook = self.webhooks[-1]
+            self.assertEqual(hook["target"], key)
+            self.assertEqual(hook["target_label"], label)
+            self.assertEqual(
+                set(hook),
+                {"session_id", "message_id", "text", "history", "target", "target_label"},
+            )
+            self.assertTrue(all(set(item) == {"message_id", "role", "text"} for item in hook["history"]))
+            saved = json.loads(self.redis.lists["chat:sess:" + session_id][-1])
+            self.assertEqual(saved["target"], key)
+            self.assertNotIn("target_label", saved)
+
+        before_hooks = len(self.webhooks)
+        before_len = len(self.redis.lists["chat:sess:" + session_id])
+        for bad in ("", "  ", "nope", "BOT", "bot ", 1, ["media"], {"key": "media"}):
+            response = self._post(
+                "/api/chat/send",
+                json={"text": "不該送出", "target": bad, "session_id": session_id},
+            )
+            self.assertEqual(response.status_code, 400, bad)
+            self.assertEqual(response.get_json()["error"], "target 不正確")
+        self.assertEqual(len(self.webhooks), before_hooks)
+        self.assertEqual(len(self.redis.lists["chat:sess:" + session_id]), before_len)
+
+        captured = {}
+
+        class Resp:
+            status_code = 200
+
+        def fake_post(url, headers=None, json=None, timeout=None, allow_redirects=None):
+            captured["json"] = json
+            return Resp()
+
+        payload = {
+            "session_id": session_id,
+            "message_id": "b" * 32,
+            "text": "轉給產業",
+            "history": [{"message_id": "c" * 32, "role": "user", "text": "old", "target": "media"}],
+            "target": "industry",
+            "target_label": "假的名稱",
+        }
+        self.webhook_patch.stop()
+        try:
+            with patch("chat_store.requests.post", fake_post):
+                chat_store.deliver_to_bot(payload)
+        finally:
+            self.webhook_patch.start()
+        self.assertEqual(captured["json"]["target"], "industry")
+        self.assertEqual(captured["json"]["target_label"], "產業研究員")
+        self.assertEqual(captured["json"]["history"], [{
+            "message_id": "c" * 32,
+            "role": "user",
+            "text": "old",
+        }])
+        self.assertNotIn("假的名稱", json.dumps(captured["json"], ensure_ascii=False))
+
+    def test_bot_reply_from_is_stored_and_truncated(self):
+        self._login()
+        sent = self._post("/api/chat/send", json={"text": "問一下", "target": "advisor"})
+        self.assertEqual(sent.status_code, 200, sent.get_json())
+        session_id = sent.get_json()["session_id"]
+        message_id = sent.get_json()["message_id"]
+
+        short = self._post(
+            "/api/bot-reply",
+            json={
+                "session_id": session_id,
+                "message_id": message_id,
+                "text": "短名稱",
+                "from": "投顧研究專員",
+            },
+            headers={"X-Bot-Secret": "reply-secret-value"},
+        )
+        self.assertEqual(short.status_code, 200, short.get_json())
+
+        raw = "行\n業\x00研究員" + ("甲" * 40)
+        visible = ("行業研究員" + ("甲" * 40))[:chat_store.MAX_FROM_LEN]
+        self.assertEqual(len(visible), 30)
+        second = self._post("/api/chat/send", json={"text": "再問", "session_id": session_id, "target": "industry"})
+        second_id = second.get_json()["message_id"]
+        long = self._post(
+            "/api/bot-reply",
+            json={
+                "session_id": session_id,
+                "message_id": second_id,
+                "text": "長名稱",
+                "from": raw,
+            },
+            headers={"X-Bot-Secret": "reply-secret-value"},
+        )
+        self.assertEqual(long.status_code, 200, long.get_json())
+
+        messages = self._get(f"/api/chat/messages?session_id={session_id}").get_json()["messages"]
+        by_text = {item["text"]: item for item in messages}
+        self.assertEqual(by_text["短名稱"]["from"], "投顧研究專員")
+        self.assertEqual(by_text["長名稱"]["from"], visible)
+        self.assertNotIn("\n", by_text["長名稱"]["from"])
+        self.assertNotIn("\x00", by_text["長名稱"]["from"])
+        stored = [json.loads(item) for item in self.redis.lists["chat:sess:" + session_id]]
+        stored_by_text = {item["text"]: item for item in stored}
+        self.assertEqual(stored_by_text["長名稱"]["from"], visible)
+
+        before = len(self.redis.lists["chat:sess:" + session_id])
+        bad = self._post(
+            "/api/bot-reply",
+            json={
+                "session_id": session_id,
+                "message_id": second_id,
+                "text": "不該寫入",
+                "from": 12,
+            },
+            headers={"X-Bot-Secret": "reply-secret-value"},
+        )
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(bad.get_json()["error"], "from 必須是字串")
+        self.assertEqual(len(self.redis.lists["chat:sess:" + session_id]), before)
+
+        third = self._post("/api/chat/send", json={"text": "第三問", "session_id": session_id})
+        third_id = third.get_json()["message_id"]
+        blank = self._post(
+            "/api/bot-reply",
+            json={
+                "session_id": session_id,
+                "message_id": third_id,
+                "text": "沒有來源",
+                "from": "\n\x00   ",
+            },
+            headers={"X-Bot-Secret": "reply-secret-value"},
+        )
+        self.assertEqual(blank.status_code, 200, blank.get_json())
+        again = self._get(f"/api/chat/messages?session_id={session_id}").get_json()["messages"]
+        plain = next(item for item in again if item["text"] == "沒有來源")
+        self.assertNotIn("from", plain)
+        self.assertNotIn("from", json.loads(self.redis.lists["chat:sess:" + session_id][-1]))
+
+        outsider = app.test_client()
+        denied = outsider.post(
+            "/api/bot-reply",
+            json={"session_id": session_id, "message_id": third_id, "text": "偷", "from": "外人"},
+            base_url=BASE,
+        )
+        self.assertEqual(denied.status_code, 401)
+
+    def test_redis_url_without_scheme_and_connection_error_name(self):
+        seen = {}
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return [{"result": []}]
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            seen["url"] = url
+            return Resp()
+
+        os.environ["KV_REST_API_URL"] = "kv.example"
+        self.pipeline_patch.stop()
+        try:
+            with patch("chat_store.requests.post", fake_post):
+                self.assertEqual(chat_store.load_messages("f" * 32), [])
+            self.assertEqual(seen["url"], "https://kv.example/pipeline")
+
+            os.environ["KV_REST_API_URL"] = "https://already.example"
+            with patch("chat_store.requests.post", fake_post):
+                self.assertEqual(chat_store.load_messages("f" * 32), [])
+            self.assertEqual(seen["url"], "https://already.example/pipeline")
+
+            with patch("chat_store.requests.post", side_effect=chat_store.requests.ConnectionError("down")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    chat_store.load_messages("f" * 32)
+            self.assertEqual(str(ctx.exception), "無法連上 Redis（ConnectionError）。")
+        finally:
+            self.pipeline_patch.start()
 
     def test_chat_sources_do_not_reference_positions(self):
         root = os.path.dirname(__file__)

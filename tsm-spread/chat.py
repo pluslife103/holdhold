@@ -1,7 +1,8 @@
 """Chat page and relay routes. Login is enforced by auth.py.
 
 Portfolio snapshots are not read here. The webhook body is built in
-chat_store.deliver_to_bot and contains only the user's text and chat history.
+chat_store.deliver_to_bot and contains the user's text, chat history,
+and the selected target (key plus display label).
 """
 
 import time
@@ -44,7 +45,11 @@ def _current() -> str | None:
 def init_chat(app: Flask) -> None:
     @app.route("/chat")
     def chat_page():
-        return render_template("chat.html")
+        return render_template(
+            "chat.html",
+            targets=chat_store.TARGETS,
+            default_target=chat_store.DEFAULT_TARGET,
+        )
 
     @app.route("/api/chat/session", methods=["GET"])
     def chat_session():
@@ -67,6 +72,10 @@ def init_chat(app: Flask) -> None:
         text = text.strip()
         if len(text) > chat_store.MAX_USER_TEXT:
             return jsonify({"error": f"訊息過長（上限 {chat_store.MAX_USER_TEXT} 字）"}), 400
+        try:
+            target, target_label = chat_store.resolve_target(data.get("target"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
         raw_sid = data.get("session_id")
         if raw_sid in (None, ""):
@@ -91,6 +100,7 @@ def init_chat(app: Flask) -> None:
             "role": "user",
             "text": text,
             "ts": int(time.time()),
+            "target": target,
         }
         try:
             prior = chat_store.load_messages(session_id)
@@ -106,6 +116,8 @@ def init_chat(app: Flask) -> None:
                 "message_id": message_id,
                 "text": text,
                 "history": history,
+                "target": target,
+                "target_label": target_label,
             })
         except RuntimeError as exc:
             return jsonify({
@@ -172,6 +184,10 @@ def init_chat(app: Flask) -> None:
         text = text.strip()
         if len(text) > chat_store.MAX_REPLY_TEXT:
             return jsonify({"error": "回覆過長"}), 400
+        try:
+            sender = chat_store.clean_from(data.get("from"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
         storage_error = chat_store.redis_config_error()
         if storage_error:
@@ -191,6 +207,8 @@ def init_chat(app: Flask) -> None:
             "ts": int(time.time()),
             "reply_to": message_id,
         }
+        if sender:
+            reply["from"] = sender
         try:
             chat_store.append_message(session_id, reply)
         except RuntimeError as exc:
