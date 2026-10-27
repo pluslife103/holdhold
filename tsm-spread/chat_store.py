@@ -19,6 +19,10 @@ MAX_STORED_MESSAGES = 200
 MAX_USER_TEXT = 4000
 MAX_REPLY_TEXT = 20000
 KEY_PREFIX = "chat:sess:"
+_REDIS_UNSET = (
+    "聊天儲存未設定：請設定 KV_REST_API_URL 與 KV_REST_API_TOKEN，"
+    "或 UPSTASH_REDIS_REST_URL 與 UPSTASH_REDIS_REST_TOKEN。"
+)
 
 _SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
@@ -32,24 +36,38 @@ def valid_id(value) -> bool:
     return isinstance(value, str) and _SESSION_RE.fullmatch(value) is not None
 
 
+def _redis_pair(url_name: str, token_name: str):
+    url = os.environ.get(url_name, "").strip().rstrip("/")
+    token = os.environ.get(token_name, "").strip()
+    if url and token:
+        return url, token
+    return None
+
+
 def redis_config():
-    url = os.environ.get("KV_REST_API_URL", "").strip().rstrip("/")
-    token = os.environ.get("KV_REST_API_TOKEN", "").strip()
-    if not url or not token:
-        return None
-    return url, token
+    """REST credentials for chat transcripts.
+
+    KV_REST_API_URL / KV_REST_API_TOKEN are used when both are set.
+    If that pair is missing, UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN
+    are used instead. Chat keys stay under chat:sess: and are separate from
+    the AI history key read by app.py.
+    """
+    return (
+        _redis_pair("KV_REST_API_URL", "KV_REST_API_TOKEN")
+        or _redis_pair("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN")
+    )
 
 
 def redis_config_error() -> str | None:
     if redis_config() is None:
-        return "聊天儲存未設定：請設定 KV_REST_API_URL 與 KV_REST_API_TOKEN。"
+        return _REDIS_UNSET
     return None
 
 
 def _pipeline(commands: list) -> list:
     cfg = redis_config()
     if cfg is None:
-        raise RuntimeError("聊天儲存未設定：請設定 KV_REST_API_URL 與 KV_REST_API_TOKEN。")
+        raise RuntimeError(_REDIS_UNSET)
     url, token = cfg
     try:
         resp = requests.post(
